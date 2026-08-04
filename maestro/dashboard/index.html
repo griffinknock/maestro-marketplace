@@ -1,0 +1,935 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Maestro — agent board</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon.png">
+<link rel="icon" href="/icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Maestro">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="#fafafa">
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0c0e12">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<style>
+  /* Palette borrowed from docs/flow: Tailwind emerald / amber / red / blue / zinc,
+     status carried by a coloured border + 15% tint + a dot, exactly as there. */
+  :root{
+    --emerald:#00bb7f; --amber:#f99c00; --red:#fb2c36; --blue:#3080ff; --violet:#8e51ff;
+    --bg:#fafafa; --panel:#ffffff; --panel2:#f8f8f8; --line:#e4e4e7; --line2:#f4f4f5;
+    --ink:#141414; --ink2:#52525b; --ink3:#a1a1aa;
+    --dots:#d4d4d8;
+    --radius:10px; --mono:ui-monospace,Menlo,Monaco,Consolas,"Liberation Mono",monospace;
+    --tempo:2.4s;
+  }
+  html[data-theme="dark"]{
+    --bg:#0c0e12; --panel:#14171d; --panel2:#191d25; --line:#262b35; --line2:#1e232b;
+    --ink:#e9ecf1; --ink2:#a2abbd; --ink3:#6c7689; --dots:#2a303b;
+    --emerald:#34d399; --amber:#fbbf24; --red:#fb7185; --blue:#60a5fa; --violet:#c084fc;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:14px/1.5 ui-sans-serif,-apple-system,"Segoe UI",Inter,system-ui,sans-serif;
+    -webkit-font-smoothing:antialiased}
+  a{color:var(--blue);text-decoration:none} a:hover{text-decoration:underline}
+  code{font-family:var(--mono);font-size:12.5px}
+  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+
+  /* ── chrome ─────────────────────────────────────────────── */
+  header{position:sticky;top:0;z-index:30;display:flex;align-items:center;gap:12px;
+    padding:10px 20px;background:color-mix(in srgb,var(--bg) 88%,transparent);
+    backdrop-filter:blur(14px);border-bottom:1px solid var(--line)}
+  .title{font-weight:700;font-size:15px;letter-spacing:-.01em}
+  .sub{color:var(--ink3);font-size:12px;margin-top:-2px}
+  .spacer{flex:1}
+  .pill{display:inline-flex;align-items:center;gap:5px;padding:2px 9px;border-radius:999px;
+    border:1px solid var(--line);background:var(--panel);font-size:11.5px;
+    font-family:var(--mono);white-space:nowrap;color:var(--ink2)}
+  .pill.blue{border-color:var(--blue);color:var(--blue)}
+  .pill.emerald{border-color:var(--emerald);color:var(--emerald)}
+  .pill.violet{border-color:var(--violet);color:var(--violet)}
+  .pill.amber{border-color:var(--amber);color:var(--amber)}
+  .pill.red{border-color:var(--red);color:var(--red)}
+  .dot{width:7px;height:7px;border-radius:50%;flex:none;background:var(--ink3)}
+  .dot.running{background:var(--amber)} .dot.spawning{background:var(--amber);opacity:.5}
+  .dot.done{background:var(--emerald)} .dot.failed{background:var(--red)}
+  button{font:inherit;color:var(--ink2);background:var(--panel);border:1px solid var(--line);
+    padding:5px 11px;border-radius:8px;cursor:pointer;transition:.12s}
+  button:hover{color:var(--ink);border-color:var(--ink3)}
+  .seg{display:inline-flex;background:var(--panel2);border:1px solid var(--line);
+    border-radius:9px;padding:2px;gap:2px}
+  .seg button{border:none;background:transparent;padding:3px 11px;border-radius:7px;font-size:12.5px}
+  .seg button.on{background:var(--panel);color:var(--ink);
+    box-shadow:0 1px 2px rgba(0,0,0,.07);font-weight:600}
+
+  /* ── mascot ─────────────────────────────────────────────── */
+  #maestro{width:34px;height:34px;flex:none;cursor:pointer;overflow:visible}
+  #maestro .body{transform-origin:16px 30px}
+  #maestro .arm{transform-origin:19px 17px}
+  #maestro .zzz{opacity:0}
+  [data-mood="conducting"] .arm{animation:conduct var(--tempo) ease-in-out infinite}
+  [data-mood="conducting"] .body{animation:sway calc(var(--tempo)*2) ease-in-out infinite}
+  [data-mood="idle"] .body{animation:breathe 4s ease-in-out infinite}
+  [data-mood="idle"] .zzz{opacity:1;animation:drift 3s linear infinite}
+  [data-mood="idle"] .eye{transform:scaleY(.12);transform-box:fill-box;transform-origin:center}
+  [data-mood="alert"] .body{animation:hop .5s ease-in-out infinite}
+  [data-mood="alert"] .arm{animation:wave .45s ease-in-out infinite}
+  [data-mood="worried"] .body{animation:shiver .18s ease-in-out infinite}
+  [data-mood="bow"] .body{animation:bow 2s ease-out}
+  @keyframes conduct{0%,100%{transform:rotate(-34deg)}50%{transform:rotate(26deg)}}
+  @keyframes sway{0%,100%{transform:rotate(-2.5deg)}50%{transform:rotate(2.5deg)}}
+  @keyframes breathe{0%,100%{transform:translateY(0) scale(1)}50%{transform:translateY(1px) scale(.985)}}
+  @keyframes drift{0%{opacity:0;transform:translate(0,0)}30%{opacity:.85}100%{opacity:0;transform:translate(5px,-9px)}}
+  @keyframes hop{0%,100%{transform:translateY(0)}50%{transform:translateY(-4px)}}
+  @keyframes wave{0%,100%{transform:rotate(-58deg)}50%{transform:rotate(-96deg)}}
+  @keyframes shiver{0%,100%{transform:translateX(-.7px)}50%{transform:translateX(.7px)}}
+  @keyframes bow{0%{transform:rotate(0)}30%{transform:rotate(24deg)}100%{transform:rotate(0)}}
+
+  /* ── music ──────────────────────────────────────────────── */
+  #music{display:none;align-items:center;gap:4px;padding:3px 6px 3px 11px;border-radius:999px;
+    border:1px solid var(--line);background:var(--panel)}
+  #music.up{display:flex}
+  #music .np{font-size:11.5px;color:var(--ink2);white-space:nowrap;overflow:hidden;
+    text-overflow:ellipsis;max-width:190px;font-family:var(--mono)}
+  #music .np b{color:var(--ink);font-weight:600}
+  #music button{padding:2px 6px;border:none;background:transparent;font-size:12px}
+  #music button:hover{color:var(--emerald)}
+  .eq{display:inline-flex;align-items:flex-end;gap:1.5px;height:11px;flex:none}
+  .eq i{width:2.5px;background:var(--emerald);border-radius:1px;height:30%}
+  .eq.on i:nth-child(1){animation:eq .7s ease-in-out infinite}
+  .eq.on i:nth-child(2){animation:eq .9s ease-in-out .1s infinite}
+  .eq.on i:nth-child(3){animation:eq .6s ease-in-out .2s infinite}
+  @keyframes eq{0%,100%{height:25%}50%{height:100%}}
+
+  /* ── question takeover ──────────────────────────────────── */
+  #ask{display:none;margin:16px auto 0;max-width:1800px;padding:0 20px}
+  #ask.up{display:block}
+  #ask .card{border:1px solid var(--amber);border-left-width:4px;border-radius:12px;
+    background:color-mix(in srgb,var(--amber) 8%,var(--panel));
+    animation:appear .28s ease-out}
+  @keyframes appear{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}
+  #ask .top{display:flex;align-items:center;gap:9px;padding:11px 16px 0}
+  #ask .top h3{margin:0;font-size:11.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--amber)}
+  #ask .q{padding:8px 16px 2px;font-size:16.5px;font-weight:650;line-height:1.4}
+  #ask .why{padding:0 16px 12px;color:var(--ink3);font-size:12.5px}
+  #ask .opts{display:flex;flex-wrap:wrap;gap:9px;padding:0 16px 16px}
+  #ask .opt{display:flex;flex-direction:column;align-items:flex-start;gap:2px;
+    padding:9px 13px;border-radius:9px;border:1px solid var(--line);background:var(--panel);
+    cursor:pointer;text-align:left;min-width:160px;max-width:340px}
+  #ask .opt:hover{border-color:var(--amber)}
+  #ask .opt .n{font-family:var(--mono);font-size:11px;color:var(--ink3)}
+  #ask .opt .l{font-weight:650;color:var(--ink)}
+  #ask .opt .d{font-size:11.5px;color:var(--ink3);white-space:normal;line-height:1.4}
+  #ask .opt.pick{border-color:var(--emerald)}
+  #ask .opt.pick .n::after{content:" ← pick";color:var(--emerald)}
+
+  /* ── layout ─────────────────────────────────────────────── */
+  main{display:grid;grid-template-columns:minmax(430px,1.1fr) minmax(400px,1fr);
+    gap:16px;padding:16px 20px 60px;max-width:1800px;margin:0 auto}
+  @media(max-width:1120px){main{grid-template-columns:1fr}}
+  /* Grid and flex children default to min-width:auto, so one long command line
+     drags the whole page wider than the phone. Pin them all to 0. */
+  main>.col,section,.body,.cmd code,.neturl code,#netUrls,.desc{min-width:0}
+  section{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+    overflow:hidden}
+  .head{display:flex;align-items:center;gap:10px;padding:11px 14px;border-bottom:1px solid var(--line)}
+  .head h2{margin:0;font-size:13px;font-weight:700}
+  .head .cover{color:var(--ink3);font-size:11.5px;font-family:var(--mono)}
+  .body{padding:11px 12px}
+  .col{display:flex;flex-direction:column;gap:16px}
+
+  /* ── lane cards — their card motif ──────────────────────── */
+  .lane{border:1px solid var(--line);border-left-width:4px;border-radius:9px;
+    padding:9px 12px;margin-bottom:8px;cursor:pointer;transition:.12s;background:var(--panel)}
+  .lane:last-child{margin-bottom:0}
+  .lane:hover{box-shadow:0 1px 5px rgba(0,0,0,.07)}
+  .lane.running{border-left-color:var(--amber);background:color-mix(in srgb,var(--amber) 7%,var(--panel))}
+  .lane.done{border-left-color:var(--emerald);background:color-mix(in srgb,var(--emerald) 6%,var(--panel))}
+  .lane.failed{border-left-color:var(--red);background:color-mix(in srgb,var(--red) 7%,var(--panel))}
+  .lane.idle{border-left-color:var(--line)}
+  .lane .r1{display:flex;align-items:center;gap:8px}
+  .lane .nm{font-weight:650;font-size:13px}
+  .lane .r2{color:var(--ink3);font-size:11.5px;font-family:var(--mono);margin-top:2px}
+  .lane .track{height:5px;border-radius:3px;background:var(--line2);overflow:hidden;
+    display:flex;margin-top:7px}
+  .lane .track i{display:block;height:100%}
+  .lane .track i.run{background:var(--amber)}
+  .lane .track i.done{background:var(--emerald)}
+  .lane .track i.fail{background:var(--red)}
+
+  /* ── agent tree ─────────────────────────────────────────── */
+  .tree{font-size:13px}
+  details.node{margin:2px 0}
+  details.node>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:8px;
+    padding:6px 9px;border-radius:8px;user-select:none;border:1px solid transparent}
+  details.node>summary::-webkit-details-marker{display:none}
+  details.node>summary:hover{background:var(--panel2);border-color:var(--line)}
+  .tw{width:11px;color:var(--ink3);flex:none;transition:transform .15s;font-size:10px}
+  details[open]>summary .tw{transform:rotate(90deg)}
+  .tw.leaf{opacity:.2}
+  summary .nm{font-weight:650;flex:none}
+  .desc{color:var(--ink2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    flex:1;min-width:0;font-size:12.5px}
+  .tm{color:var(--ink3);flex:none;font-size:11px;font-family:var(--mono)}
+  .kids{margin-left:16px;padding-left:10px;border-left:1px solid var(--line)}
+  .detail{margin:2px 0 8px 38px;padding:9px 11px;background:var(--panel2);
+    border:1px solid var(--line);border-radius:8px;font-size:12px;color:var(--ink2)}
+  .detail dl{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;margin:0}
+  .detail dt{color:var(--ink3);font-family:var(--mono);font-size:11px}
+  .detail dd{margin:0;min-width:0;word-break:break-all}
+  .files a{display:block;padding:1px 0;font-family:var(--mono);font-size:11.5px}
+
+  .cmd{display:flex;align-items:center;gap:8px;margin:6px 0;background:var(--panel2);
+    border:1px solid var(--line);border-radius:8px;padding:7px 10px}
+  .cmd code{flex:1;color:var(--ink);white-space:pre;overflow-x:auto;scrollbar-width:none}
+  .cmd code::-webkit-scrollbar{display:none}
+  .cp{flex:none;font-size:11px;padding:3px 9px}
+  .cp.ok{color:var(--emerald);border-color:var(--emerald)}
+
+  .empty{padding:26px 14px;text-align:center;color:var(--ink3);font-size:13px}
+  /* ReactFlow-style dotted canvas, same as your flow maps */
+  #graph{padding:10px;overflow:auto;min-height:120px;
+    background-image:radial-gradient(var(--dots) 1px,transparent 0);
+    background-size:16px 16px;background-position:-8px -8px}
+  #graph svg{max-width:100%;height:auto}
+  .shots{display:grid;grid-template-columns:repeat(auto-fill,minmax(148px,1fr));gap:9px}
+  .shots figure{margin:0;border:1px solid var(--line);border-radius:9px;overflow:hidden;
+    background:var(--panel2);cursor:zoom-in;transition:.12s}
+  .shots figure:hover{box-shadow:0 2px 8px rgba(0,0,0,.1)}
+  .shots img{display:block;width:100%;height:94px;object-fit:cover;object-position:top}
+  .shots figcaption{padding:5px 8px;font-size:10.5px;color:var(--ink3);font-family:var(--mono);
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  dialog{border:1px solid var(--line);background:var(--panel);border-radius:12px;padding:0;max-width:94vw}
+  dialog img{display:block;max-width:92vw;max-height:84vh}
+  dialog::backdrop{background:rgba(0,0,0,.6)}
+  .wt{display:flex;align-items:center;gap:8px;padding:7px 2px;font-size:12.5px}
+  .legend{display:flex;gap:12px;flex-wrap:wrap;padding:9px 14px;border-top:1px solid var(--line);
+    color:var(--ink3);font-size:11px;font-family:var(--mono);align-items:center}
+  .legend span{display:inline-flex;align-items:center;gap:5px}
+  .toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%) translateY(20px);
+    background:var(--ink);color:var(--panel);padding:9px 17px;border-radius:999px;
+    font-size:12.5px;opacity:0;pointer-events:none;transition:.2s;z-index:99}
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+
+  /* ── connect a device ───────────────────────────────────── */
+  #net{display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap}
+  #qr{width:132px;height:132px;flex:none;padding:8px;background:#fff;border-radius:9px;
+    border:1px solid var(--line)}
+  #qr img,#qr canvas{display:block;width:100%;height:100%}
+  #netUrls{flex:1;min-width:210px}
+  .neturl{display:flex;align-items:center;gap:8px;padding:7px 9px;margin-bottom:6px;
+    border:1px solid var(--line);border-radius:8px;background:var(--panel2)}
+  .neturl code{flex:1;font-size:12px;overflow-x:auto;white-space:nowrap;scrollbar-width:none}
+  .neturl code::-webkit-scrollbar{display:none}
+  .neturl .k{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--ink3);
+    font-family:var(--mono)}
+
+  /* ── left rail ──────────────────────────────────────────── */
+  .shell{display:flex;align-items:stretch;min-height:calc(100vh - 57px)}
+  #rail{width:246px;flex:none;border-right:1px solid var(--line);background:var(--panel);
+    display:flex;flex-direction:column;position:sticky;top:57px;
+    height:calc(100vh - 57px)}
+  #rail .rhead{display:flex;align-items:center;gap:8px;padding:11px 12px;
+    border-bottom:1px solid var(--line)}
+  #rail .rhead h2{margin:0;font-size:12px;font-weight:700;letter-spacing:.04em}
+  #railList{flex:1;overflow-y:auto;padding:8px}
+  .orc{display:block;width:100%;text-align:left;border:1px solid var(--line);
+    border-left-width:4px;border-radius:9px;background:var(--panel);padding:8px 10px;
+    margin-bottom:7px;cursor:pointer;transition:.12s}
+  .orc:hover{box-shadow:0 1px 5px rgba(0,0,0,.08)}
+  .orc.sel{border-color:var(--ink3);background:var(--panel2)}
+  .orc .n{display:flex;align-items:center;gap:7px;font-weight:650;font-size:13px;
+    color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .orc .r{color:var(--ink3);font-size:11px;font-family:var(--mono);margin-top:2px;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .orc .s{color:var(--ink2);font-size:11px;font-family:var(--mono);margin-top:4px;
+    display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+  .orc.c-blue{border-left-color:var(--blue)} .orc.c-emerald{border-left-color:var(--emerald)}
+  .orc.c-amber{border-left-color:var(--amber)} .orc.c-red{border-left-color:var(--red)}
+  .orc.c-violet{border-left-color:var(--violet)} .orc.c-zinc{border-left-color:var(--ink3)}
+  .orc .ask{color:var(--amber);font-weight:700}
+  #newOrc{width:calc(100% - 16px);margin:0 8px 8px;padding:9px;border-style:dashed;
+    font-weight:600}
+  #newOrc:hover{border-color:var(--emerald);color:var(--emerald)}
+  .railEmpty{padding:18px 10px;color:var(--ink3);font-size:12px;line-height:1.5}
+
+  /* ── spawn modal ────────────────────────────────────────── */
+  #spawn{border:1px solid var(--line);border-radius:14px;padding:0;width:min(560px,94vw);
+    background:var(--panel);color:var(--ink)}
+  #spawn::backdrop{background:rgba(0,0,0,.5);backdrop-filter:blur(3px)}
+  #spawn .sh{padding:15px 18px 0;font-weight:700;font-size:15px}
+  #spawn .sb{padding:12px 18px 18px;display:flex;flex-direction:column;gap:12px}
+  #spawn label{display:block;font-size:11.5px;color:var(--ink3);margin-bottom:5px;
+    text-transform:uppercase;letter-spacing:.06em;font-family:var(--mono)}
+  #spawn input[type=text],#spawn select,#spawn textarea{width:100%;font:inherit;
+    color:var(--ink);background:var(--panel2);border:1px solid var(--line);
+    border-radius:9px;padding:9px 11px}
+  #spawn textarea{min-height:96px;resize:vertical;font-size:13.5px;line-height:1.5}
+  #spawn input:focus,#spawn select:focus,#spawn textarea:focus{outline:none;
+    border-color:var(--blue)}
+  .swatches{display:flex;gap:7px}
+  .sw{width:26px;height:26px;border-radius:50%;border:2px solid transparent;cursor:pointer;
+    padding:0}
+  .sw.on{border-color:var(--ink)}
+  .sw[data-c=blue]{background:var(--blue)} .sw[data-c=emerald]{background:var(--emerald)}
+  .sw[data-c=amber]{background:var(--amber)} .sw[data-c=violet]{background:var(--violet)}
+  .sw[data-c=red]{background:var(--red)} .sw[data-c=zinc]{background:var(--ink3)}
+  .srow{display:flex;gap:10px} .srow>div{flex:1;min-width:0}
+  #spawn .actions{display:flex;gap:9px;justify-content:flex-end;align-items:center}
+  #spawn .go{background:var(--ink);color:var(--panel);border-color:var(--ink);font-weight:650}
+  #spawnErr{color:var(--red);font-size:12px;white-space:pre-wrap;display:none}
+
+  /* ── phone / tablet ─────────────────────────────────────── */
+  @media(max-width:1000px){
+    .shell{display:block}
+    #rail{width:auto;height:auto;position:static;border-right:none;
+      border-bottom:1px solid var(--line)}
+    #railList{max-height:210px}
+  }
+  @media(max-width:760px){
+    header{padding:8px 14px;padding-top:max(8px,env(safe-area-inset-top));gap:9px;flex-wrap:nowrap}
+    header>div:nth-of-type(1){min-width:0;flex:1}
+    .title{font-size:14px}
+    .sub{font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    #music,#collapseSeg{display:none!important}
+    main{padding:12px 12px calc(48px + env(safe-area-inset-bottom));gap:12px}
+    #ask{padding:0 12px}
+    #ask .q{font-size:15px} #ask .opt{min-width:100%;max-width:100%}
+    /* Fingers need bigger targets than a cursor does. */
+    details.node>summary{padding:9px 8px;flex-wrap:wrap;row-gap:3px}
+    details.node>summary .tm{margin-left:auto}
+    button{padding:8px 13px} .cp{padding:6px 11px}
+    .lane{padding:11px 12px}
+    .shots{grid-template-columns:repeat(auto-fill,minmax(120px,1fr))}
+    .detail{margin-left:16px}
+    .kids{margin-left:9px;padding-left:8px}
+    .desc{display:none}
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <svg id="maestro" data-mood="idle" viewBox="0 0 32 34" aria-label="Maestro">
+    <g class="body">
+      <path class="arm" d="M19 17 L27 9" stroke="var(--ink2)" stroke-width="2" stroke-linecap="round" fill="none"/>
+      <circle cx="27.4" cy="8.6" r="1.8" fill="var(--amber)"/>
+      <path d="M16 15 C11 15 9 19 9 30 L23 30 C23 19 21 15 16 15 Z" fill="var(--ink2)"/>
+      <circle cx="16" cy="9" r="6" fill="var(--ink)"/>
+      <circle class="eye" cx="13.7" cy="8.6" r="1.05" fill="var(--panel)"/>
+      <circle class="eye" cx="18.3" cy="8.6" r="1.05" fill="var(--panel)"/>
+    </g>
+    <text class="zzz" x="24" y="4" font-size="6" fill="var(--ink3)">z</text>
+  </svg>
+  <div>
+    <div class="title">Maestro</div>
+    <div class="sub" id="sub">no session</div>
+  </div>
+  <div class="spacer"></div>
+  <div id="music">
+    <span class="eq" id="eq"><i></i><i></i><i></i></span>
+    <span class="np" id="np"></span>
+    <button id="mPrev" title="previous">⏮</button>
+    <button id="mPlay" title="play / pause">⏯</button>
+    <button id="mNext" title="next">⏭</button>
+  </div>
+  <div class="seg" id="collapseSeg">
+    <button data-c="auto" class="on">auto-collapse</button>
+    <button data-c="all">expand all</button>
+  </div>
+  <button id="theme" title="light / dark">◐</button>
+</header>
+
+<div id="ask"><div class="card">
+  <div class="top"><h3>Needs your call</h3><span class="spacer"></span>
+    <button id="askDismiss">answered</button></div>
+  <div class="q" id="askQ"></div>
+  <div class="why" id="askWhy"></div>
+  <div class="opts" id="askOpts"></div>
+</div></div>
+
+<div class="shell">
+<nav id="rail">
+  <div class="rhead"><h2>Orchestrations</h2><span class="spacer"></span>
+    <span class="pill" id="railCount"></span></div>
+  <div id="railList"></div>
+  <button id="newOrc">+ New orchestration</button>
+</nav>
+<main>
+  <div class="col">
+    <section>
+      <div class="head"><h2>Lanes</h2><span class="cover" id="laneCover"></span></div>
+      <div class="body" id="lanes"><div class="empty">no lanes open</div></div>
+    </section>
+
+    <section>
+      <div class="head"><h2>Agents</h2><span class="cover" id="census"></span></div>
+      <div class="body tree" id="tree"><div class="empty">waiting for a session…</div></div>
+      <div class="legend">
+        <span><i class="dot running"></i>running</span>
+        <span><i class="dot done"></i>done</span>
+        <span><i class="dot failed"></i>failed</span>
+        <span class="pill blue">haiku</span>
+        <span class="pill emerald">sonnet</span>
+        <span class="pill violet">opus</span>
+      </div>
+    </section>
+
+    <section>
+      <div class="head"><h2>Worktrees</h2><span class="cover" id="wtCover"></span></div>
+      <div class="body" id="worktrees"><div class="empty">no worktrees yet</div></div>
+    </section>
+  </div>
+
+  <div class="col">
+    <section>
+      <div class="head"><h2>Fan-out</h2><span class="cover" id="graphCover"></span>
+        <span class="spacer"></span><button id="copyMermaid">copy mermaid</button></div>
+      <div id="graph"><div class="empty">the graph draws itself once agents start</div></div>
+    </section>
+
+    <section>
+      <div class="head"><h2>Visual review</h2><span class="cover" id="shotCount"></span></div>
+      <div class="body"><div class="shots" id="shots"></div>
+        <div class="empty" id="shotsEmpty">no screenshots captured yet</div></div>
+    </section>
+
+    <section>
+      <div class="head"><h2>Commands</h2></div>
+      <div class="body" id="commands"></div>
+    </section>
+
+    <section id="netSection" style="display:none">
+      <div class="head"><h2>Connect a device</h2><span class="cover" id="netCover"></span></div>
+      <div class="body">
+        <div id="net">
+          <div id="qr"></div>
+          <div id="netUrls"></div>
+        </div>
+      </div>
+    </section>
+  </div>
+</main>
+</div>
+
+<dialog id="lightbox"><img id="lightboxImg" alt=""></dialog>
+<dialog id="spawn">
+  <div class="sh">New orchestration</div>
+  <div class="sb">
+    <div class="srow">
+      <div><label for="spName">Name</label>
+        <input type="text" id="spName" placeholder="auth refactor" autocomplete="off"></div>
+      <div style="flex:0 0 auto"><label>Colour</label>
+        <div class="swatches" id="spColors">
+          <button class="sw on" data-c="blue"></button>
+          <button class="sw" data-c="emerald"></button>
+          <button class="sw" data-c="amber"></button>
+          <button class="sw" data-c="violet"></button>
+          <button class="sw" data-c="red"></button>
+          <button class="sw" data-c="zinc"></button>
+        </div></div>
+    </div>
+    <div><label for="spRepo">Repo</label><select id="spRepo"></select></div>
+    <div><label for="spPrompt">What should it do</label>
+      <textarea id="spPrompt" placeholder="Refactor the token refresh path so it survives two concurrent callers. Plan it as waves first."></textarea></div>
+    <div id="spawnErr"></div>
+    <div class="actions">
+      <span id="spWhere" style="flex:1;color:var(--ink3);font-size:11.5px">Opens a terminal tab, named and coloured to match.</span>
+      <button id="spCancel">Cancel</button>
+      <button id="spGo" class="go">Open tab</button>
+    </div>
+  </div>
+</dialog>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const TIERS = ['haiku','sonnet','opus'];
+const TIERPILL = {haiku:'blue', sonnet:'emerald', opus:'violet'};
+let STATE=null, AUTO=true, MERMAID_SRC='', QUESTION=null, MOOD='idle';
+let ORCS=[], REPOS=[], CURRENT=null, ES=null;
+
+/* Preferences persist across reloads, restarts, and model changes. */
+const prefs={ get(k,d){try{const v=localStorage.getItem('maestro.'+k);return v===null?d:JSON.parse(v);}catch(e){return d;}},
+              set(k,v){try{localStorage.setItem('maestro.'+k,JSON.stringify(v));}catch(e){}} };
+
+/* Theme cycles auto → light → dark. `auto` follows the OS, so the board
+   matches your terminal and your editor without you touching anything. */
+const sysDark = window.matchMedia('(prefers-color-scheme: dark)');
+let THEME = prefs.get('theme','auto');
+function paintTheme(){
+  const t = THEME==='auto' ? (sysDark.matches?'dark':'light') : THEME;
+  document.documentElement.dataset.theme = t;
+  const btn=document.getElementById('theme');
+  if(btn) btn.textContent = THEME==='auto'?'auto':THEME;
+}
+sysDark.addEventListener('change',()=>{ if(THEME==='auto'){paintTheme();
+  if(HAS_MERMAID) applyMermaidTheme(); drawGraph(true);} });
+paintTheme();
+AUTO = prefs.get('autoCollapse', true);
+[...$('#collapseSeg').children].forEach(b=>b.classList.toggle('on', (b.dataset.c==='auto')===AUTO));
+
+const HAS_MERMAID = typeof mermaid !== 'undefined';
+function applyMermaidTheme(){
+  const dark = document.documentElement.dataset.theme==='dark';
+  const ink = dark?'#e9ecf1':'#141414', line = dark?'#262b35':'#e4e4e7';
+  mermaid.initialize({ startOnLoad:false, securityLevel:'loose', theme:'base',
+    flowchart:{curve:'basis',padding:14,nodeSpacing:24,rankSpacing:50},
+    themeVariables:{ background:'transparent', primaryColor: dark?'#14171d':'#ffffff',
+      primaryTextColor:ink, primaryBorderColor:line, nodeTextColor:ink, textColor:ink,
+      titleColor: dark?'#a2abbd':'#52525b', lineColor: dark?'#4a5468':'#b1b1b7',
+      clusterBkg:'transparent', clusterBorder:line,
+      edgeLabelBackground: dark?'#14171d':'#ffffff',
+      fontFamily:'ui-monospace,Menlo,monospace', fontSize:'12px' }});
+}
+if(HAS_MERMAID) applyMermaidTheme();
+
+$('#theme').onclick=()=>{
+  THEME = {auto:'light', light:'dark', dark:'auto'}[THEME];
+  prefs.set('theme',THEME); paintTheme();
+  if(HAS_MERMAID) applyMermaidTheme(); drawGraph(true);
+};
+paintTheme();
+$('#collapseSeg').onclick=e=>{
+  const b=e.target.closest('button'); if(!b) return;
+  AUTO = b.dataset.c==='auto'; prefs.set('autoCollapse',AUTO);
+  [...$('#collapseSeg').children].forEach(x=>x.classList.toggle('on',x===b));
+  if(!AUTO) document.querySelectorAll('details.node').forEach(d=>d.open=true);
+  else render(STATE,true);
+};
+
+/* ── helpers ────────────────────────────────────────────────── */
+function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('show');
+  clearTimeout(t._x);t._x=setTimeout(()=>t.classList.remove('show'),1500);}
+function copy(text,btn){navigator.clipboard.writeText(text).then(()=>{
+  if(btn){const o=btn.textContent;btn.textContent='copied';btn.classList.add('ok');
+    setTimeout(()=>{btn.textContent=o;btn.classList.remove('ok');},1200);}
+  else toast('copied — paste it in the terminal');}).catch(()=>toast('copy failed'));}
+function cmdBlock(text){const d=document.createElement('div');d.className='cmd';
+  const c=document.createElement('code');c.textContent=text;
+  const b=document.createElement('button');b.className='cp';b.textContent='copy';
+  b.onclick=()=>copy(text,b);d.append(c,b);return d;}
+function ago(t){if(!t)return'';const s=Math.max(0,Math.round(Date.now()/1000-t));
+  return s<60?`${s}s`:s<3600?`${Math.floor(s/60)}m${String(s%60).padStart(2,'0')}s`
+    :`${Math.floor(s/3600)}h${String(Math.floor(s%3600/60)).padStart(2,'0')}m`;}
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+const bare=s=>String(s??'').split(':').pop();
+const TIERMAP={scout:'haiku',scribe:'haiku',surgeon:'opus'};
+function tierOf(n){const m=(n.model||'').toLowerCase();
+  return TIERS.find(t=>m.includes(t))||TIERMAP[bare(n.type)]||'sonnet';}
+
+/* ── mascot ─────────────────────────────────────────────────── */
+function setMood(mood,live){
+  if(mood!==MOOD){MOOD=mood;$('#maestro').dataset.mood=mood;}
+  const tempo=Math.max(.75, 2.6-Math.min(live||0,6)*.28);
+  document.documentElement.style.setProperty('--tempo',tempo.toFixed(2)+'s');
+}
+$('#maestro').onclick=()=>{
+  const m=$('#maestro'),was=m.dataset.mood;
+  m.dataset.mood='bow';
+  toast(['tempo giusto.','the orchestra thanks you.','molto bene.','da capo.','bravo.'][Math.floor(Math.random()*5)]);
+  setTimeout(()=>{m.dataset.mood=was;MOOD=was;},2000);
+};
+
+/* ── music ──────────────────────────────────────────────────── */
+async function music(action){
+  try{
+    const m=await (await fetch('/api/music'+(action?`?a=${action}`:''))).json();
+    const bar=$('#music');
+    if(!m||!m.available){bar.classList.remove('up');return;}
+    bar.classList.add('up');
+    $('#eq').classList.toggle('on',!!m.playing);
+    $('#np').innerHTML=m.track?`<b>${esc(m.track)}</b>${m.artist?' · '+esc(m.artist):''}`
+      :`<span style="color:var(--ink3)">${esc(m.app||'')} paused</span>`;
+  }catch(e){$('#music').classList.remove('up');}
+}
+$('#mPrev').onclick=()=>music('prev');
+$('#mNext').onclick=()=>music('next');
+$('#mPlay').onclick=()=>music('playpause');
+music(); setInterval(()=>music(),6000);
+
+/* ── question takeover ──────────────────────────────────────── */
+let notified=null;
+async function pollQuestion(){
+  try{const q=await (await fetch('/api/question')).json(); QUESTION=q&&q.question?q:null;}
+  catch(e){QUESTION=null;}
+  const box=$('#ask');
+  if(!QUESTION){box.classList.remove('up');notified=null;
+    if(document.title!=='Maestro — agent board')document.title='Maestro — agent board';return;}
+  box.classList.add('up');
+  $('#askQ').textContent=QUESTION.question;
+  $('#askWhy').textContent=QUESTION.why||'';
+  const opts=$('#askOpts');opts.innerHTML='';
+  (QUESTION.options||[]).forEach((o,i)=>{
+    const label=typeof o==='string'?o:(o.label||'');
+    const note =typeof o==='string'?'':(o.note||o.description||'');
+    const b=document.createElement('button');
+    b.className='opt'+((o&&o.pick)?' pick':'');
+    b.innerHTML=`<span class="n">${i+1}</span><span class="l">${esc(label)}</span>`+
+                (note?`<span class="d">${esc(note)}</span>`:'');
+    b.onclick=()=>copy(String(i+1));
+    opts.append(b);
+  });
+  if(!(QUESTION.options||[]).length){
+    const b=document.createElement('button');b.className='opt';
+    b.innerHTML='<span class="l">copy the question</span>';
+    b.onclick=()=>copy(QUESTION.question);opts.append(b);
+  }
+  if(notified!==QUESTION.question){
+    notified=QUESTION.question;
+    try{
+      if(Notification.permission==='granted')
+        new Notification('Maestro needs your call',{body:QUESTION.question,tag:'maestro-q'});
+      else if(Notification.permission!=='denied') Notification.requestPermission();
+    }catch(e){}
+    document.title='✋ Maestro — needs you';
+  }
+}
+$('#askDismiss').onclick=async()=>{
+  $('#ask').classList.remove('up');QUESTION=null;notified=null;
+  document.title='Maestro — agent board';
+  try{await fetch('/api/dismiss'+(CURRENT?'?id='+encodeURIComponent(CURRENT):''));}catch(e){}
+};
+pollQuestion(); setInterval(pollQuestion,2500);
+
+/* ── tree ───────────────────────────────────────────────────── */
+function buildTree(nodes){
+  const byId={},roots=[];
+  Object.values(nodes||{}).forEach(n=>byId[n.id]={...n,kids:[]});
+  Object.values(byId).forEach(n=>{if(n.parent&&byId[n.parent])byId[n.parent].kids.push(n);else roots.push(n);});
+  const sort=a=>{a.sort((x,y)=>(x.started||0)-(y.started||0));a.forEach(n=>sort(n.kids));};
+  sort(roots);return roots;
+}
+function nodeEl(n,openSet){
+  const tier=tierOf(n),st=n.status||'running';
+  const d=document.createElement('details');d.className='node';d.id='agent-'+n.id;
+  d.open=n.kids.length?(openSet.has(n.id)||(AUTO?(st==='running'||st==='spawning'):true)):false;
+  const s=document.createElement('summary');
+  s.innerHTML=
+    `<span class="tw ${n.kids.length?'':'leaf'}">▶</span>`+
+    `<i class="dot ${st}"></i>`+
+    `<span class="nm">${esc(bare(n.type)||'agent')}</span>`+
+    `<span class="pill ${TIERPILL[tier]}">${tier}</span>`+
+    (n.worktree?`<span class="pill blue">⑂ ${esc(n.worktree)}</span>`:'')+
+    `<span class="desc">${esc(n.description||n.last_tool||'')}</span>`+
+    `<span class="tm">${ago(n.started)}${n.ended?' ⏹':''}</span>`;
+  s.onclick=()=>{setTimeout(()=>{const o=new Set(prefs.get('open',[]));
+    d.open?o.add(n.id):o.delete(n.id);prefs.set('open',[...o]);},0);};
+  d.append(s);
+  const tools=Object.entries(n.tools||{}).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`${k}×${v}`).join('  ');
+  const files=(n.files||[]).slice(-8).map(f=>
+    `<a href="vscode://file/${encodeURI(f)}" title="${esc(f)}">${esc(f.split('/').slice(-2).join('/'))}</a>`).join('');
+  const rows=[];
+  if(tools)rows.push(`<dt>tools</dt><dd>${esc(tools)}</dd>`);
+  if(files)rows.push(`<dt>files</dt><dd class="files">${files}</dd>`);
+  if(n.result)rows.push(`<dt>return</dt><dd style="white-space:pre-wrap">${esc(n.result.slice(0,600))}</dd>`);
+  if(rows.length){const b=document.createElement('div');b.className='detail';
+    b.innerHTML=`<dl>${rows.join('')}</dl>`;d.append(b);}
+  if(n.kids.length){const k=document.createElement('div');k.className='kids';
+    n.kids.forEach(c=>k.append(nodeEl(c,openSet)));d.append(k);}
+  return d;
+}
+
+/* ── graph ──────────────────────────────────────────────────── */
+function mermaidFor(nodes){
+  const vals=Object.values(nodes||{});
+  if(vals.length<=1)return'';
+  const id=s=>'n'+String(s).replace(/[^a-zA-Z0-9]/g,'');
+  const L=['flowchart LR'],waves={};
+  vals.forEach(n=>{if(n.id!=='root')(waves[n.depth||1] ||= []).push(n);});
+  L.push(`  ${id('root')}(["Conductor"]):::lead`);
+  Object.keys(waves).sort().forEach(d=>{
+    L.push(`  subgraph d${d}["depth ${d}"]`);L.push('  direction TB');
+    waves[d].forEach(n=>{
+      const wt=n.worktree?`<br/><i>⑂ ${n.worktree}</i>`:'';
+      L.push(`    ${id(n.id)}["${bare(n.type)} · ${tierOf(n)}${wt}"]:::s_${n.status||'running'}`);
+    });
+    L.push('  end');
+  });
+  vals.forEach(n=>{if(n.parent)L.push(`  ${id(n.parent)} --> ${id(n.id)}`);});
+  const dark=document.documentElement.dataset.theme==='dark';
+  const bg=dark?'#14171d':'#ffffff', ink=dark?'#e9ecf1':'#141414';
+  const C={running:dark?'#fbbf24':'#f99c00', done:dark?'#34d399':'#00bb7f',
+           failed:dark?'#fb7185':'#fb2c36', idle:'#a1a1aa', orphaned:'#a1a1aa',
+           spawning:dark?'#fbbf24':'#f99c00'};
+  L.push(`  classDef lead fill:${bg},stroke:#3080ff,color:${ink},stroke-width:2px;`);
+  Object.entries(C).forEach(([k,c])=>
+    L.push(`  classDef s_${k} fill:${bg},stroke:${c},color:${ink},stroke-width:2px;`));
+  return L.join('\n');
+}
+let graphSeq=0;
+async function drawGraph(force){
+  const src=mermaidFor(STATE?.nodes);
+  if(!src){$('#graph').innerHTML='<div class="empty">the graph draws itself once agents start</div>';return;}
+  if(src===MERMAID_SRC&&!force)return;
+  MERMAID_SRC=src;
+  if(!HAS_MERMAID){
+    $('#graph').innerHTML='<div class="empty" style="padding:8px 4px">mermaid could not load — here is the source.</div>';
+    $('#graph').append(cmdBlock(src));return;
+  }
+  try{const {svg}=await mermaid.render('g'+(graphSeq++),src);$('#graph').innerHTML=svg;}
+  catch(e){$('#graph').innerHTML=`<div class="empty">graph error: ${esc(e.message)}</div>`;
+    $('#graph').append(cmdBlock(src));}
+}
+$('#copyMermaid').onclick=e=>copy('```mermaid\n'+MERMAID_SRC+'\n```',e.target);
+
+/* ── render ─────────────────────────────────────────────────── */
+function render(s,force){
+  STATE=s;
+  if(!s||s.empty){
+    $('#tree').innerHTML='<div class="empty">No session yet. Start Claude Code in this project and the tree appears here.</div>';
+    $('#sub').textContent=(s&&s.root)||'no session';setMood('idle',0);return;
+  }
+  const nodes=s.nodes||{},all=Object.values(nodes).filter(n=>n.id!=='root');
+  const live=all.filter(n=>n.status==='running'||n.status==='spawning');
+  const done=all.filter(n=>n.status==='done').length;
+  const failed=all.filter(n=>n.status==='failed').length;
+  const deep=live.reduce((m,n)=>Math.max(m,n.depth||0),0);
+
+  setMood(s.needs_input||QUESTION?'alert':failed&&!live.length?'worried'
+        :live.length?'conducting':'idle', live.length);
+
+  $('#sub').textContent =
+    `${(s.root||'').split('/').pop()} · ${all.length} agents: ${live.length} running, `+
+    `${done} done, ${failed} failed · depth ${deep}/5`;
+  $('#census').innerHTML =
+    TIERS.map(t=>{const c=live.filter(n=>tierOf(n)===t).length;
+      return c?`<span class="pill ${TIERPILL[t]}">${c} ${t}</span> `:'';}).join('')||
+    `${all.length} total`;
+
+  // lanes
+  const byLane={};
+  all.forEach(n=>{const k=n.lane||n.id;(byLane[k] ||= []).push(n);});
+  const keys=Object.keys(byLane),box=$('#lanes');box.innerHTML='';
+  $('#laneCover').textContent = keys.length
+    ? `${keys.filter(k=>byLane[k].some(n=>n.status==='running')).length} active of ${keys.length}` : '';
+  if(!keys.length) box.innerHTML='<div class="empty">no lanes open</div>';
+  keys.forEach(k=>{
+    const set=byLane[k],head=nodes[k]||set[0],total=set.length||1;
+    const r=set.filter(n=>n.status==='running'||n.status==='spawning').length;
+    const dn=set.filter(n=>n.status==='done').length;
+    const fl=set.filter(n=>n.status==='failed').length;
+    const st=r?'running':fl?'failed':dn===total?'done':'idle';
+    // Name the lane after the work, not the agent that happens to own it.
+    const name=(head.description||'').replace(/^(own|handle|take)\s+(the\s+)?/i,'')
+                 .replace(/\s+(workstream|lane)$/i,'').trim() || bare(head.type);
+    const el=document.createElement('div');el.className='lane '+st;
+    el.innerHTML=
+      `<div class="r1"><i class="dot ${st}"></i>`+
+      `<span class="nm">${esc(name.slice(0,52))}</span>`+
+      `<span class="pill">${esc(bare(head.type))}</span>`+
+      (head.worktree?`<span class="pill blue">⑂ ${esc(head.worktree)}</span>`:'')+
+      `<span style="flex:1"></span>`+
+      `<span class="tm">${set.length} agent${set.length>1?'s':''}</span></div>`+
+      `<div class="r2">${dn} done · ${r} running${fl?` · ${fl} failed`:''}`+
+      `${set.some(n=>n.depth>1)?` · depth ${Math.max(...set.map(n=>n.depth||1))}`:''}</div>`+
+      `<div class="track"><i class="done" style="width:${dn/total*100}%"></i>`+
+      `<i class="run" style="width:${r/total*100}%"></i>`+
+      `<i class="fail" style="width:${fl/total*100}%"></i></div>`;
+    el.onclick=()=>{const t=document.getElementById('agent-'+k);
+      if(t){t.open=true;t.scrollIntoView({behavior:'smooth',block:'center'});}};
+    box.append(el);
+  });
+
+  const openSet=new Set(prefs.get('open',[]));
+  const tree=$('#tree');tree.innerHTML='';
+  const roots=buildTree(nodes);
+  if(!roots.length||(roots.length===1&&!roots[0].kids.length))
+    tree.innerHTML='<div class="empty">Conductor is idle — no subagents in flight.</div>';
+  else roots.forEach(r=>tree.append(nodeEl(r,openSet)));
+
+  const wts=Object.values(s.worktrees||{}),w=$('#worktrees');
+  $('#wtCover').textContent = wts.length?`${wts.length} isolated`:'';
+  if(!wts.length) w.innerHTML='<div class="empty">no worktrees yet</div>';
+  else{
+    w.innerHTML='';
+    wts.forEach(t=>{
+      const owner=nodes[t.owner],row=document.createElement('div');row.className='wt';
+      row.innerHTML=`<span class="pill blue">⑂ ${esc(t.name)}</span>`+
+        `<span style="color:var(--ink3);font-size:12px">${esc(owner?bare(owner.type):(t.owner||''))}</span>`;
+      w.append(row);
+      w.append(cmdBlock(`git -C .claude/worktrees/${t.name} diff --stat main`));
+    });
+    w.append(cmdBlock('git worktree list'));
+  }
+
+  const shots=s.shots||[];
+  $('#shotCount').textContent=shots.length?`${shots.length} captured`:'';
+  $('#shotsEmpty').style.display=shots.length?'none':'';
+  const g=$('#shots');g.innerHTML='';
+  shots.forEach(p=>{
+    const f=document.createElement('figure'),url='/api/shot?p='+encodeURIComponent(p);
+    f.innerHTML=`<img src="${url}" loading="lazy" alt=""><figcaption>${esc(p.split('/').pop())}</figcaption>`;
+    f.onclick=()=>{$('#lightboxImg').src=url;$('#lightbox').showModal();};
+    g.append(f);
+  });
+
+  $('#graphCover').textContent = all.length?`${all.length} nodes · ${deep+1} levels`:'';
+  const c=$('#commands');c.innerHTML='';
+  ['claude agents','git worktree list','/tree','/look http://localhost:3000']
+    .forEach(x=>c.append(cmdBlock(x)));
+  drawGraph(force);
+}
+$('#lightbox').onclick=()=>$('#lightbox').close();
+
+/* ── connect a device ───────────────────────────────────────── */
+async function loadNet(){
+  let n;
+  try{ n = await (await fetch('/api/net')).json(); }catch(e){ return; }
+  const sec=$('#netSection');
+  if(!n || !n.urls || !n.urls.length || n.localOnly){
+    // Bound to loopback: nothing to hand a phone yet. Say how to change that.
+    sec.style.display='';
+    $('#netCover').textContent='local only';
+    $('#qr').style.display='none';
+    $('#netUrls').innerHTML='';
+    $('#netUrls').append(document.createTextNode(''));
+    const p=document.createElement('div');
+    p.style.cssText='color:var(--ink3);font-size:12.5px;margin-bottom:8px';
+    p.textContent='The board is only listening on this machine. Restart it with --lan '+
+                  'and a QR code for your phone appears here.';
+    $('#netUrls').append(p, cmdBlock('/board --lan'));
+    return;
+  }
+  sec.style.display='';
+  $('#qr').style.display='';
+  $('#netCover').textContent = n.urls.length+' address'+(n.urls.length>1?'es':'');
+  const box=$('#netUrls'); box.innerHTML='';
+  n.urls.forEach(u=>{
+    const d=document.createElement('div'); d.className='neturl';
+    d.innerHTML=`<span class="k">${esc(u.kind)}</span><code>${esc(u.url)}</code>`;
+    const b=document.createElement('button'); b.className='cp'; b.textContent='copy';
+    b.onclick=()=>copy(u.url,b); d.append(b); box.append(d);
+    const note=document.createElement('div');
+    note.style.cssText='color:var(--ink3);font-size:11.5px;margin:-2px 0 9px 2px';
+    note.textContent=u.note||''; box.append(note);
+  });
+  const tip=document.createElement('div');
+  tip.style.cssText='color:var(--ink3);font-size:11.5px';
+  tip.textContent='On iPad or iPhone: open the address, then Share → Add to Home Screen. '+
+                  'It installs as an app with its own icon.';
+  box.append(tip);
+  const qr=$('#qr'); qr.innerHTML='';
+  if(typeof QRCode!=='undefined'){
+    try{ new QRCode(qr,{text:n.urls[0].url,width:116,height:116,
+      colorDark:'#141414',colorLight:'#ffffff'}); }
+    catch(e){ qr.style.display='none'; }
+  } else qr.style.display='none';
+}
+loadNet();
+
+/* ── the rail: one item per orchestration, your name and colour ─── */
+const COLORS=['blue','emerald','amber','violet','red','zinc'];
+
+async function loadRail(){
+  let d;
+  try{ d = await (await fetch('/api/orchestrations')).json(); }catch(e){ return; }
+  ORCS = d.orchestrations||[]; REPOS = d.repos||[];
+  const list=$('#railList'); list.innerHTML='';
+  $('#railCount').textContent = ORCS.length || '';
+  if(!ORCS.length){
+    list.innerHTML='<div class="railEmpty">Nothing running yet.<br><br>'+
+      'Start one below, or run <code>claude</code> in any repo under your '+
+      'watched roots and it appears here.</div>';
+  }
+  // Auto-select the one that needs you, else the busiest, else the first.
+  if(!CURRENT || !ORCS.some(o=>o.id===CURRENT)) CURRENT = ORCS.length?ORCS[0].id:null;
+  ORCS.forEach(o=>{
+    const b=document.createElement('button');
+    b.className=`orc c-${o.color}`+(o.id===CURRENT?' sel':'');
+    const st=o.failed&&!o.live?'failed':o.live?'running':o.agents?'done':'idle';
+    b.innerHTML=
+      `<div class="n"><i class="dot ${st}"></i>${esc(o.name)}`+
+      (o.needsInput?'<span class="ask">✋</span>':'')+`</div>`+
+      `<div class="r">${esc(o.repoName)}</div>`+
+      `<div class="s">${o.live?`${o.live} running`:o.agents?`${o.done} done`:'idle'}`+
+      (o.lanes>1?` · ${o.lanes} lanes`:'')+(o.depth?` · d${o.depth}`:'')+`</div>`;
+    b.onclick=()=>select(o.id);
+    b.ondblclick=e=>{ e.preventDefault(); renameOrc(o); };
+    b.title='Double-click to rename';
+    list.append(b);
+  });
+  const sel=document.getElementById('spRepo');
+  if(sel && sel.options.length!==REPOS.length){
+    sel.innerHTML='';
+    REPOS.forEach(r=>{const o=document.createElement('option');
+      o.value=r.path;o.textContent=r.name;sel.append(o);});
+  }
+}
+
+async function renameOrc(o){
+  const name=prompt('Name this orchestration', o.name);
+  if(name===null) return;
+  const ci=COLORS.indexOf(o.color);
+  const color=COLORS[(ci+1)%COLORS.length];
+  await fetch('/api/meta',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({id:o.id,name:name||o.name,color})});
+  loadRail();
+}
+
+function select(id){
+  if(CURRENT===id) return;
+  CURRENT=id; loadRail(); connect(); pollQuestion();
+  fetch('/api/state?id='+encodeURIComponent(id)).then(r=>r.json()).then(s=>render(s,true));
+}
+
+/* ── spawning a new orchestration ───────────────────────────────── */
+let SPAWN_COLOR='blue';
+$('#newOrc').onclick=()=>{
+  $('#spawnErr').style.display='none';
+  $('#spName').value=''; $('#spPrompt').value='';
+  loadRail().then(()=>$('#spawn').showModal());
+  setTimeout(()=>$('#spName').focus(),80);
+};
+$('#spCancel').onclick=()=>$('#spawn').close();
+$('#spColors').onclick=e=>{
+  const b=e.target.closest('.sw'); if(!b) return;
+  SPAWN_COLOR=b.dataset.c;
+  [...$('#spColors').children].forEach(x=>x.classList.toggle('on',x===b));
+};
+$('#spGo').onclick=async()=>{
+  const body={ name:$('#spName').value.trim(), color:SPAWN_COLOR,
+               repo:$('#spRepo').value, prompt:$('#spPrompt').value };
+  if(!body.repo){ return showSpawnErr('Pick a repo.'); }
+  $('#spGo').disabled=true; $('#spGo').textContent='opening…';
+  try{
+    const r=await fetch('/api/spawn',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const d=await r.json();
+    if(!d.ok) throw new Error(d.error||'spawn failed');
+    $('#spawn').close();
+    toast(d.terminal==='warp' ? 'Warp tab opened' : 'Ghostty tab opened — press enter');
+    if(d.note) console.warn(d.note);
+    setTimeout(loadRail,1500); setTimeout(loadRail,5000);
+  }catch(e){ showSpawnErr(e.message); }
+  finally{ $('#spGo').disabled=false; $('#spGo').textContent='Open tab'; }
+};
+function showSpawnErr(m){
+  const el=$('#spawnErr'); el.style.display='block';
+  el.textContent=m+(/loopback/.test(m)
+    ? '\n\nSpawning only works from the Mac itself, not over --lan.' : '');
+}
+$('#spPrompt')&&$('#spPrompt').addEventListener('keydown',e=>{
+  if((e.metaKey||e.ctrlKey)&&e.key==='Enter') $('#spGo').click();
+});
+
+loadRail(); setInterval(loadRail, 3000);
+
+/* ── live feed ──────────────────────────────────────────────── */
+function connect(){
+  if(ES){ try{ES.close();}catch(e){} }
+  const q = CURRENT ? '?id='+encodeURIComponent(CURRENT) : '';
+  ES = new EventSource('/api/stream'+q);
+  ES.onmessage=e=>{try{render(JSON.parse(e.data));}catch(err){}};
+  ES.onerror=()=>{try{ES.close();}catch(e){} setTimeout(connect,2500);};
+}
+fetch('/api/state').then(r=>r.json()).then(render).catch(()=>render({empty:true}));
+connect();
+setInterval(()=>{if(STATE&&!STATE.empty)render(STATE);},5000);
+</script>
+</body>
+</html>

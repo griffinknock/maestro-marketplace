@@ -1,0 +1,60 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "timeout": 10,
+        "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/ledger.py\"" } ] }
+    ],
+    "PreToolUse": [
+      { "matcher": "*", "hooks": [ { "type": "command", "timeout": 10,
+        "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/ledger.py\"" } ] }
+    ],
+    "PostToolUse": [
+      { "matcher": "*", "hooks": [ { "type": "command", "timeout": 10,
+        "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/ledger.py\"" } ] }
+    ],
+    "PostToolUseFailure": [
+      { "matcher": "*", "hooks": [ { "type": "command", "timeout": 10,
+        "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/ledger.py\"" } ] }
+    ],
+    "SubagentStart": [
+      { "hooks": [ { "type": "command", "timeout": 10,
+        "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/ledger.py\"" } ] }
+    ],
+    "SubagentStop": [
+      { "hooks": [
+        { "type": "command", "timeout": 10,
+          "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/ledger.py\"" },
+        { "type": "command", "timeout": 15,
+          "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/reorchestrate.py\"" }
+      ] }
+    ],
+    "TaskCreated": [
+      { "hooks": [ { "type": "command", "timeout": 10,
+        "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/ledger.py\"" } ] }
+    ],
+    "TaskCompleted": [
+      { "hooks": [
+        { "type": "command", "timeout": 10,
+          "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/ledger.py\"" },
+        { "type": "command", "timeout": 15,
+          "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/reorchestrate.py\"" }
+      ] }
+    ],
+    "Notification": [
+      { "hooks": [
+        { "type": "command", "timeout": 10,
+          "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/ledger.py\"" },
+        { "type": "command", "timeout": 12,
+          "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/notify.py\"" }
+      ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "timeout": 10,
+        "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/ledger.py\"" } ] }
+    ],
+    "SessionEnd": [
+      { "hooks": [ { "type": "command", "timeout": 10,
+        "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/ledger.py\"" } ] }
+    ]
+  }
+}

@@ -1,0 +1,9 @@
+# Maestro's own ledger, written into whatever repo it runs in — including this
+# one while developing the plugin. Session state, not source.
+.claude/maestro/
+
+# Python bytecode from running the hook scripts directly.
+__pycache__/
+*.py[cod]
+
+.DS_Store

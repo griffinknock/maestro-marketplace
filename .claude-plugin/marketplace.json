@@ -1,0 +1,12 @@
+{
+  "name": "maestro-marketplace",
+  "owner": { "name": "Griffin" },
+  "description": "Orchestration and visualization tooling for Claude Code.",
+  "plugins": [
+    {
+      "name": "maestro",
+      "source": "./maestro",
+      "description": "Orchestra-style Claude Code: a conductor that fans work out to model-tiered subagents up to depth 5, with a live agent tree in the terminal and a browser board showing the fan-out DAG, worktrees, and screenshots."
+    }
+  ]
+}
