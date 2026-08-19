@@ -153,11 +153,20 @@ deepest live level.
 
 ## Re-orchestration check
 
-On task completion, `reorchestrate.py` audits the shape and pushes findings
-into the conductor's context. It reports: a single agent in flight, an agent
+Each time an `Agent`/`Task` tool call returns to its caller (and on
+`TaskCompleted`), `reorchestrate.py` audits the shape and pushes findings into
+the conductor's context. It reports: a single agent in flight, an agent
 idle for 5 minutes, most lanes idle while one works, two live agents on the
 same file, depth 4 or 5 reached, an opus agent only reading, and the same agent
 type failing twice. Silent when nothing trips and when nothing has run yet.
+
+It must never be wired to `SubagentStop`: context injected there is delivered
+to the *stopping subagent*, which spends its final message answering the
+re-check instead of returning its report — the conductor then receives
+"nothing further to do" while the findings sit unread in the subagent's
+transcript. The script also guards against this wiring internally. As a second
+layer, every agent's definition ends with a resend rule: any message that
+arrives after it has reported gets the same `RETURN:` block again, verbatim.
 
 When the rules cannot judge, it spawns a detached Haiku call whose opinion
 arrives on the *next* completion, so the hook never blocks. That child runs with
@@ -218,7 +227,8 @@ so one orphaned by a deleted session dir dies on its own.
   current                  pointer to the newest session dir
   <session-id>/
     events.jsonl           every hook payload, appended
-    state.json             the reconstructed agent tree
+    state.json             the reconstructed agent tree; each finished node
+                           keeps the tail of the agent's final reply (`result`)
     caffeinate.pid         sleep assertion held while agents run
     question.json          pending blocking question
   shots/                   visual-reviewer screenshots

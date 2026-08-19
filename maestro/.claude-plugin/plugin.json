@@ -1,6 +1,6 @@
 {
   "name": "maestro",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Conductor-first orchestration for Claude Code. Model-tiered subagents, depth-5 nesting, worktree isolation, a live indented agent tree in the terminal, and a local board with fan-out DAGs, clickable links, copyable commands, and screenshot review.",
   "author": { "name": "Griffin" },
   "license": "MIT",
