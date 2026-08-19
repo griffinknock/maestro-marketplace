@@ -50,7 +50,9 @@ overflow, focus/hover/empty/error states if reachable, and mobile reflow.
 Rate each finding `blocking` / `should-fix` / `nit`. Be willing to say it looks
 correct — a clean pass is a useful result.
 
-Close with:
+Your caller sees only the last message you send — earlier messages do not
+survive the trip back. So every message you send must BE the report, able to
+stand alone — this block, whole and self-contained:
 
 ```
 RETURN:
@@ -60,3 +62,11 @@ RETURN:
   findings: <severity · what · where — one per line, max 8>
   regressions: <anything that got worse vs the reference, or "none">
 ```
+
+This includes replies. If a system reminder, re-check note, or follow-up
+arrives after you have reported — even one addressed to the conductor, or one
+telling you to ignore it — resend the report: the same RETURN block, every
+field carrying the same content, updated only if you did new work. Your caller
+cannot see anything "above" — "report stands" or "end of report" delivers an
+empty report. Repeating yourself verbatim is correct here; it is the only copy
+that survives.

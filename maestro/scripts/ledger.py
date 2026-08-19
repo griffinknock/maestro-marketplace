@@ -355,7 +355,10 @@ def apply(state, payload):
         if n:
             n["status"] = "failed" if payload.get("error") else "done"
             n["ended"] = now
-            res = payload.get("result") or payload.get("response") or ""
+            # The final reply arrives as `last_assistant_message` on this hook;
+            # `result`/`response` never appear on real payloads.
+            res = (payload.get("last_assistant_message")
+                   or payload.get("result") or payload.get("response") or "")
             if isinstance(res, str) and res.strip():
                 n["result"] = res.strip()[-1200:]
 

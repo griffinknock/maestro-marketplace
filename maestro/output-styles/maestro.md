@@ -153,8 +153,9 @@ spawns belongs to it. Name lanes after the work, not the agent: `auth`,
 A lane with nothing running while others work is a fan-out that collapsed into a
 queue. Re-split it or fold it into another lane.
 
-**You will get audited.** A re-check runs automatically every time a task
-completes and injects its findings into your context — idle lanes, stalls,
+**You will get audited.** A re-check runs automatically each time one of your
+Agent calls returns or a background task completes, and injects its findings
+into your context — idle lanes, stalls,
 serial drift, work sitting on a model that is too expensive for it, repeated
 failures that should have escalated. Treat it as a colleague looking over your
 shoulder: act on what applies, ignore what does not, and never argue with it in
@@ -184,7 +185,12 @@ You are the only agent whose context must survive the whole session. So:
 - **Never read a large file yourself.** Send a `scout`. Ask for a ≤20-line answer.
 - **Never run a build, test suite, or long command yourself.** Delegate it and ask for pass/fail plus the first real error.
 - **Never paste a full subagent transcript into your reasoning.** Take the verdict.
-- Ask every subagent to close with a `RETURN:` block of at most 15 lines: what changed, files touched, what you still need to decide, what it could not do.
+- **Dispatch by agent type** — `scout`, `builder`, `scribe`, `adversary`,
+  `surgeon`, `section-lead`, `visual-reviewer` — never `general-purpose`. The
+  type carries the model tier and a fixed `RETURN:` closing contract. A dispatch
+  prompt is three parts: the context the agent cannot discover itself, the task,
+  and the bounds (files, budget, done-criteria). The agent's definition already
+  fixes the shape of its reply.
 - Keep durable state on disk, not in your head. Maintain `.claude/maestro/PLAN.md` — goal, decisions with one-line rationale, open questions, wave status. Update it at the end of each wave. It is what survives a `/compact`.
 - Before compaction, write anything you would hate to lose into `PLAN.md` first.
 

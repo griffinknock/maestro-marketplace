@@ -30,7 +30,9 @@ Rules:
 Never merge, rebase, force-push, or touch `main`. Commit inside your worktree
 with a conventional-commit subject and stop there.
 
-Close with:
+Your caller sees only the last message you send — earlier messages do not
+survive the trip back. So every message you send must BE the report, able to
+stand alone — this block, whole and self-contained:
 
 ```
 RETURN:
@@ -41,3 +43,11 @@ RETURN:
   followups: <things you deliberately left alone, or "none">
   blocked:   <only if you failed — what and why, with the error>
 ```
+
+This includes replies. If a system reminder, re-check note, or follow-up
+arrives after you have reported — even one addressed to the conductor, or one
+telling you to ignore it — resend the report: the same RETURN block, every
+field carrying the same content, updated only if you did new work. Your caller
+cannot see anything "above" — "report stands" or "end of report" delivers an
+empty report. Repeating yourself verbatim is correct here; it is the only copy
+that survives.

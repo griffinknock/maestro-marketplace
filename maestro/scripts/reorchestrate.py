@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """Maestro re-orchestrator — spot-checks parallelism every time a task finishes.
 
-Wired to SubagentStop and TaskCompleted. Runs deterministic rules in a few
-milliseconds and pushes the verdict straight into the conductor's context via
+Wired to PostToolUse(Agent|Task) and TaskCompleted — the moments a dispatch
+returns to its *caller*. Runs deterministic rules in a few milliseconds and
+pushes the verdict into the conductor's context via
 `hookSpecificOutput.additionalContext`, so it reads as a system reminder rather
 than as noise in the transcript.
+
+Never wire this to SubagentStop: additionalContext there is delivered to the
+*stopping subagent*, which then spends its final message answering the
+re-check instead of returning its report — the conductor receives "nothing
+further to do here" and the findings are stranded a message earlier in a
+transcript nobody reads. That exact failure showed up in production ledgers.
 
 The hook NEVER blocks. When the rules smell something they can't judge, it
 spawns a detached Haiku call that writes its opinion to verdict.json; the next
@@ -195,6 +202,10 @@ def take_verdict(d):
 
 def main():
     payload = json.loads(sys.stdin.read() or "{}")
+    # Guard, independent of hooks.json: on SubagentStop the injection would land
+    # in the stopping subagent and clobber its report (see module docstring).
+    if (payload.get("hook_event_name") or "") == "SubagentStop":
+        return
     d = state_dir(payload.get("cwd"))
     if not d:
         return
