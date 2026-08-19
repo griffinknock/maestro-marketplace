@@ -72,7 +72,7 @@ declare `isolation: worktree` and run in their own checkout.
 | Command | Does |
 |---|---|
 | `/orchestrate <task>` | Plans waves — agent, model, worktree, dependencies, cost — then stops and asks |
-| `/brainstorm <topic>` | No code, no edits. Alternatives with trade-offs |
+| `/brainstorm <topic>` | No code, no edits. Prior-art recon (web + repo), then one numbered question per message, then alternatives with trade-offs, ending in an `/orchestrate` score |
 | `/board` | Starts the board, returns the link. `--lan` also binds to the network |
 | `/tree` | Prints the tree, waves, worktrees and a mermaid diagram as text |
 | `/look <url>` | Screenshot pass across viewports, compared against a mock or baseline |
