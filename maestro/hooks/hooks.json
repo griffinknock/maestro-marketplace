@@ -9,20 +9,30 @@
         "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/ledger.py\"" } ] }
     ],
     "PostToolUse": [
-      { "matcher": "*", "hooks": [ { "type": "command", "timeout": 10,
-        "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/ledger.py\"" } ] },
-      { "matcher": "Agent|Task", "hooks": [ { "type": "command", "timeout": 15,
-        "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/reorchestrate.py\"" } ] }
+      { "matcher": "*", "hooks": [
+        { "type": "command", "timeout": 10,
+          "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/ledger.py\"" },
+        { "type": "command", "timeout": 15,
+          "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/reorchestrate.py\"" }
+      ] }
     ],
     "PostToolUseFailure": [
-      { "matcher": "*", "hooks": [ { "type": "command", "timeout": 10,
-        "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/ledger.py\"" } ] }
+      { "matcher": "*", "hooks": [
+        { "type": "command", "timeout": 10,
+          "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/ledger.py\"" },
+        { "type": "command", "timeout": 15,
+          "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/reorchestrate.py\"" }
+      ] }
     ],
     "SubagentStart": [
       { "hooks": [ { "type": "command", "timeout": 10,
         "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/ledger.py\"" } ] }
     ],
     "SubagentStop": [
+      { "hooks": [ { "type": "command", "timeout": 10,
+        "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/ledger.py\"" } ] }
+    ],
+    "TeammateIdle": [
       { "hooks": [ { "type": "command", "timeout": 10,
         "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/ledger.py\"" } ] }
     ],

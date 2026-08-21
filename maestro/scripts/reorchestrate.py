@@ -1,28 +1,59 @@
 #!/usr/bin/env python3
-"""Maestro re-orchestrator — spot-checks parallelism every time a task finishes.
+"""Maestro re-orchestrator — at most one message per dispatch batch, or silence.
 
-Wired to PostToolUse(Agent|Task) and TaskCompleted — the moments a dispatch
-returns to its *caller*. Runs deterministic rules in a few milliseconds and
-pushes the verdict into the conductor's context via
-`hookSpecificOutput.additionalContext`, so it reads as a system reminder rather
-than as noise in the transcript.
+Wired to PostToolUse (every tool), PostToolUseFailure and TaskCompleted. It
+never speaks while a dispatch batch is still landing, and it never speaks
+inside a subagent.
 
-Never wire this to SubagentStop: additionalContext there is delivered to the
-*stopping subagent*, which then spends its final message answering the
-re-check instead of returning its report — the conductor receives "nothing
-further to do here" and the findings are stranded a message earlier in a
-transcript nobody reads. That exact failure showed up in production ledgers.
+Why every tool and not just `Agent|Task`
+----------------------------------------
+One assistant message that dispatches five agents fires PostToolUse(Agent)
+five times, and each of those fires before the other four subagents have
+emitted SubagentStart — so each sees a different partial count. That is where
+"only 1 agent in flight, launch more" arrived *during* a five-agent launch,
+and "0 agents in flight, the wave is done" arrived right after a two-agent
+one. A count taken at that instant is not wrong by a little, it is
+meaningless. So an Agent call now only *records* the batch; the verdict is
+computed later, on the first ordinary tool call after the batch has settled,
+when the census is real. If the count changed inside a single assistant
+message, that is one event, not N.
 
-The hook NEVER blocks. When the rules smell something they can't judge, it
-spawns a detached Haiku call that writes its opinion to verdict.json; the next
-completion picks that up and injects it. So the expensive check is always one
-task behind, and never in the critical path.
+Two rules keep the census honest:
+  - a dispatch seen at PreToolUse but not yet matched to a SubagentStart is
+    still in flight (`state["pending"]`, within MAESTRO_DISPATCH_GRACE);
+  - nothing is emitted while the batch that produced the count is still open.
+
+Session scoping
+---------------
+The state dir is resolved from this payload's own `session_id`, never from the
+workspace-global `.claude/maestro/current` pointer. That pointer is rewritten
+by whichever session last fired a hook, so reading it made a conductor inherit
+a concurrent session's agents — reporting lanes it never opened and file
+collisions on files it never dispatched against. The board still uses
+`current` to find the newest session; a re-check must not.
+
+Never wire this to SubagentStop, and never let it run inside a subagent:
+additionalContext delivered there lands in the *stopping subagent*, which then
+spends its final message answering the re-check instead of returning its
+report. The conductor receives "nothing further to do here" and the findings
+are stranded. Both guards are enforced in main(), independent of hooks.json.
+
+It also carries the one message class that is always worth a turn: a subagent
+report the harness failed to deliver. `ledger.py` keeps every report it sees;
+when the copy that reached the conductor was empty or was a bare protocol
+frame, the report is re-delivered here in full, so recovery costs no round
+trip and loss is never silent.
 
 Env:
-  MAESTRO_REORCH_LLM=0     rules only, never spend a Haiku call
-  MAESTRO_REORCH_COOLDOWN  seconds between Haiku calls (default 90)
-  MAESTRO_DEBUG=1          errors to stderr
+  MAESTRO_REORCH=0          disable entirely
+  MAESTRO_REORCH_LLM=1      enable the detached second opinion (default OFF)
+  MAESTRO_REORCH_COOLDOWN   seconds between second opinions (default 90)
+  MAESTRO_REORCH_SETTLE     seconds a batch must be quiet before judging (2)
+  MAESTRO_DISPATCH_GRACE    seconds an unstarted dispatch still counts (60)
+  MAESTRO_REPORT_GRACE      seconds to let a resend land before crying loss (5)
+  MAESTRO_DEBUG=1           errors to stderr
 """
+import fcntl
 import json
 import os
 import subprocess
@@ -31,24 +62,72 @@ import time
 from pathlib import Path
 
 DEBUG = os.environ.get("MAESTRO_DEBUG") == "1"
-USE_LLM = os.environ.get("MAESTRO_REORCH_LLM", "1") != "0"
+OFF = os.environ.get("MAESTRO_REORCH") == "0"
+# Default OFF. Every verdict this ever produced in the field was confidently
+# wrong and argued for downgrading a tier that was carrying real difficulty.
+# The attribution bug behind that is fixed below, but a model recommendation
+# has to earn its way back on: a wrong one costs the conductor more reasoning
+# than silence does.
+USE_LLM = os.environ.get("MAESTRO_REORCH_LLM", "0") == "1"
 COOLDOWN = float(os.environ.get("MAESTRO_REORCH_COOLDOWN", "90"))
+SETTLE = float(os.environ.get("MAESTRO_REORCH_SETTLE", "2"))
+GRACE = float(os.environ.get("MAESTRO_DISPATCH_GRACE", "60"))
+REPORT_GRACE = float(os.environ.get("MAESTRO_REPORT_GRACE", "5"))
 STALL_SECONDS = 300          # no tool activity this long = probably stuck
 VERDICT_TTL = 240            # ignore an LLM opinion older than this
+INLINE_CALLS = 8             # conductor tool calls after a wave = doing it itself
+LIVE = ("running", "spawning")
+ROOT = "root"
+
+BLANK = {
+    "open": False,            # a dispatch batch is landing right now
+    "size": 0,                # agents dispatched in the open batch
+    "last_dispatch_at": 0.0,
+    "sizes": [],              # settled batch sizes, oldest first
+    "calls_since_dispatch": 0,
+    "wave": 0,
+    "said": [],               # finding fingerprints already delivered
+    "verdict_subjects": [],
+}
 
 
-def state_dir(cwd):
-    p = Path(cwd or ".").resolve()
+def state_dir(payload):
+    """This session's ledger dir, resolved from its own session_id.
+
+    Deliberately does not consult `.claude/maestro/current`: that pointer is
+    workspace-global and the newest session owns it, so a concurrent session in
+    the same repo would hand this conductor someone else's agent tree.
+    """
+    sid = (payload.get("session_id") or "")[:8]
+    if not sid:
+        return None
+    p = Path(payload.get("cwd") or ".").resolve()
     for parent in [p, *p.parents]:
-        ptr = parent / ".claude" / "maestro" / "current"
-        if ptr.is_file():
-            try:
-                d = Path(ptr.read_text().strip())
-                if (d / "state.json").is_file():
-                    return d
-            except OSError:
-                return None
+        d = parent / ".claude" / "maestro" / sid
+        if (d / "state.json").is_file():
+            return d
     return None
+
+
+def load_batch(d):
+    try:
+        b = json.loads((d / "recheck.json").read_text())
+        if isinstance(b, dict):
+            return {**BLANK, **b}
+    except (OSError, json.JSONDecodeError):
+        pass
+    return dict(BLANK)
+
+
+def save_batch(d, b):
+    b["said"] = list(b.get("said") or [])[-300:]
+    b["sizes"] = list(b.get("sizes") or [])[-12:]
+    try:
+        tmp = d / "recheck.tmp"
+        tmp.write_text(json.dumps(b))
+        tmp.replace(d / "recheck.json")
+    except OSError:
+        pass
 
 
 def lanes(state):
@@ -56,100 +135,182 @@ def lanes(state):
     nodes = state.get("nodes", {})
     out = {}
     for n in nodes.values():
-        if n["id"] == "root":
+        if n.get("id") == ROOT:
             continue
         cur, guard = n, 0
-        while cur.get("parent") and cur["parent"] != "root" and guard < 8:
+        while cur.get("parent") and cur["parent"] != ROOT and guard < 8:
             cur = nodes.get(cur["parent"], {})
             guard += 1
             if not cur:
                 break
-        head = (cur or n).get("id", n["id"])
+        head = (cur or n).get("id", n.get("id"))
         out.setdefault(head, []).append(n)
     return out
 
 
-def check(state):
-    """Deterministic rules. Returns (findings, suspicious)."""
-    nodes = [n for n in state.get("nodes", {}).values() if n["id"] != "root"]
-    live = [n for n in nodes if n.get("status") in ("running", "spawning")]
-    now = time.time()
+def census(state, now):
+    """Agents this conductor actually has out, including ones still starting.
+
+    `pending` holds dispatches seen at PreToolUse that have not yet matched a
+    SubagentStart. Counting only started nodes is what produced "0 agents in
+    flight" one beat after two agents were launched.
+    """
+    nodes = [n for n in state.get("nodes", {}).values() if n.get("id") != ROOT]
+    live = [n for n in nodes if n.get("status") in LIVE]
+    starting = [p for p in (state.get("pending") or [])
+                if now - float(p.get("at") or 0) <= GRACE]
+    return nodes, live, starting
+
+
+def who(n):
+    return n.get("name") or n.get("type") or "agent"
+
+
+def where(state, n):
+    """` (lane x)` — only when the lane is something other than the agent."""
+    lane = n.get("lane")
+    if not lane or lane == n.get("id"):
+        return ""
+    return f" (lane {who(state.get('nodes', {}).get(lane, {'type': lane}))})"
+
+
+def read_report(n, limit=1600):
+    """The recovered report text, preferring the full copy on disk."""
+    p = n.get("report_path")
+    if p:
+        try:
+            txt = Path(p).read_text()[:limit]
+            if txt.strip():
+                return txt.strip()
+        except OSError:
+            pass
+    return (n.get("result") or "").strip()[:limit]
+
+
+def delivery_findings(state, now):
+    """Reports the harness did not hand to the conductor.
+
+    This is the only class that always earns a turn: without it a swallowed
+    report and a clean finish are the same frame, and the conductor has to
+    spend a round trip asking to tell them apart.
+    """
+    out = []
+    for n in state.get("nodes", {}).values():
+        if n.get("id") == ROOT:
+            continue
+        st = n.get("report_status")
+        if st not in ("recovered", "missing"):
+            continue
+        # Stops repeat, and an agent that was interrupted mid-resend will send
+        # the report again a beat later. Do not cry loss inside that window.
+        if now - float(n.get("last_stop_at") or 0) < REPORT_GRACE:
+            continue
+        if st == "recovered":
+            out.append((
+                f"report:{n.get('id')}:recovered",
+                f"REPORT RECOVERED — {who(n)} finished, but the copy delivered to you "
+                f"was empty or a bare protocol frame. Its real report, from its own "
+                f"transcript, is below. Do not ask it to resend.\n"
+                f"{read_report(n)}"))
+        else:
+            out.append((
+                f"report:{n.get('id')}:missing",
+                f"REPORT NOT DELIVERED — {who(n)} finished and no report was "
+                f"recoverable from its transcript. Ask it to resend, or redo the work; "
+                f"do not assume it reported."))
+    return out
+
+
+def check(state, batch, settled, now):
+    """Deterministic rules. Returns [(fingerprint, text)], suspicious."""
+    nodes, live, starting = census(state, now)
     f, suspicious = [], False
 
-    # 1. Serial drift — the failure mode Griffin actually complained about.
-    if len(live) == 1:
-        f.append(f"Only 1 agent in flight ({live[0]['type']}). If anything else on the "
-                 f"plan does not consume its output, launch it now in the same message.")
-        suspicious = True
-    elif not live and nodes:
-        # `and nodes` matters: on a tree where nothing has run yet there is no
-        # wave to nudge about, and firing here made every session open with a
-        # re-check nag before the conductor had dispatched anything.
-        f.append("No agents in flight. Either the wave is genuinely done and you should "
-                 "merge, or the next wave should already be launching.")
-
-    # 2. Stalled agents.
+    # Stalled agents.
     for n in live:
         since = now - float(n.get("last_activity") or n.get("started") or now)
         if since > STALL_SECONDS:
-            f.append(f"{n['type']} (lane {n.get('lane', '?')}) has had no tool activity "
-                     f"for {int(since/60)}m — check it or stop it.")
+            f.append((f"stall:{n.get('id')}:{int(since // STALL_SECONDS)}",
+                      f"{who(n)}{where(state, n)} has had no tool activity for "
+                      f"{int(since / 60)}m — check it or stop it."))
             suspicious = True
 
-    # 3. Lane balance.
-    ls = lanes(state)
-    busy = {k: [n for n in v if n.get("status") in ("running", "spawning")]
-            for k, v in ls.items()}
-    idle_lanes = [k for k, v in busy.items() if not v]
-    if len(ls) > 1 and len(idle_lanes) == len(ls) - 1 and live:
-        f.append(f"{len(idle_lanes)} of {len(ls)} lanes are idle while one keeps working. "
-                 f"That is a fan-out that collapsed into a queue — re-split it.")
-        suspicious = True
+    # Repeated failures of the same tier.
+    repeat = {}
+    for n in nodes:
+        if n.get("status") == "failed":
+            repeat[n.get("type")] = repeat.get(n.get("type"), 0) + 1
+    for t, c in sorted(repeat.items()):
+        if c >= 2:
+            f.append((f"fail:{t}:{c}",
+                      f"{t} has failed {c} times. Escalate to surgeon with both failure "
+                      f"transcripts rather than retrying the same tier."))
+            suspicious = True
 
-    # 4. Worktree collisions — two live agents editing the same file.
+    # Worktree collisions — two live agents editing the same file. Fingerprinted
+    # by path, so three agents on one file is one line, not three identical ones.
     seen = {}
     for n in live:
-        for path in n.get("files", []):
-            if path in seen and seen[path] != n["id"]:
-                f.append(f"Two live agents touched {path.split('/')[-1]} — serialize them "
-                         f"or the merge will conflict.")
+        for path in (n.get("files") or []):
+            owner = seen.get(path)
+            if owner and owner != n.get("id"):
+                f.append((f"collide:{path}",
+                          f"{owner} and {who(n)} are both live on "
+                          f"{path.split('/')[-1]} — serialize them or the merge conflicts."))
                 suspicious = True
-                break
-            seen[path] = n["id"]
+            seen.setdefault(path, who(n))
 
-    # 5. Depth budget.
-    deepest = max((n.get("depth", 0) for n in live), default=0)
-    if deepest >= 5:
-        f.append("Depth 5 reached — nothing below this level may delegate further.")
-    elif deepest == 4:
-        f.append("Depth 4 in flight. One more level is all you have.")
+    # Depth ceiling. Depth 4 is not a problem, it is a budget the conductor
+    # already prints in every section-lead prompt; only the hard stop is news.
+    if max((n.get("depth", 0) for n in live), default=0) >= 5:
+        f.append(("depth5",
+                  "Depth 5 reached — nothing below this level may delegate further."))
 
-    # 6. Cheap-work-on-expensive-model.
-    for n in live:
-        tools = n.get("tools") or {}
-        reads = sum(v for k, v in tools.items() if k in ("Read", "Grep", "Glob"))
-        if n.get("model") == "opus" and reads > 6 and not any(
-                k in tools for k in ("Edit", "Write", "MultiEdit")):
-            f.append(f"{n['type']} is on opus but has only been reading "
-                     f"({reads} calls). That is scout work — consider handing it to haiku.")
-            suspicious = True
+    if not settled:
+        # The wave finished and the conductor kept going by hand.
+        if (not live and not starting and nodes
+                and batch.get("calls_since_dispatch", 0) >= INLINE_CALLS):
+            f.append((f"inline:{batch.get('wave')}",
+                      f"No agents in flight and {batch['calls_since_dispatch']} tool calls "
+                      f"since the last dispatch. If what is left splits, dispatch it."))
+        return f, suspicious
 
-    # 7. Failures worth escalating.
-    failed = [n for n in nodes if n.get("status") == "failed"]
-    repeat = {}
-    for n in failed:
-        repeat[n["type"]] = repeat.get(n["type"], 0) + 1
-    for t, c in repeat.items():
-        if c >= 2:
-            f.append(f"{t} has failed {c} times. Escalate to surgeon with both failure "
-                     f"transcripts rather than retrying the same tier.")
-            suspicious = True
+    # --- shape rules: only meaningful once a batch has actually landed ---
+
+    # Serial drift. One deliberate solo dispatch is not drift; three in a row is.
+    sizes = list(batch.get("sizes") or [])
+    if len(sizes) >= 3 and all(s == 1 for s in sizes[-3:]):
+        f.append((f"serial:{len(sizes)}",
+                  "Three dispatches in a row of one agent each. If those tasks did not "
+                  "consume each other's output, they should have gone out together."))
+        suspicious = True
+
+    # Lane balance is deliberately not a rule. A lane whose agents have all
+    # finished is *complete*, not idle, so "N of M lanes are idle while one
+    # keeps working" fires on ordinary sequential progress — it fired on a
+    # deliberate two-agent dispatch in the field. Excluding complete lanes
+    # leaves a rule that can almost never fire honestly, so the doctrine it was
+    # protecting is carried by the serial-drift rule above instead, which is
+    # measured on dispatch batches and is true when it fires.
 
     return f, suspicious
 
 
-def spawn_llm(d, state):
-    """Detached Haiku second opinion. Its answer lands on the next completion."""
+def spawn_llm(d, state, live, now):
+    """Detached second opinion, judged on the dispatch prompt and attributed.
+
+    The old version handed the model a tool signature and a model name and
+    nothing else, then printed whatever came back against whichever dispatch
+    finished next. It called a 14,000-line attribution trace "trivial lookups"
+    and an opus builder writing pagination tests "a read operation", because
+    from a list of Grep counts that is exactly what they look like.
+
+    So: it now gets the dispatch prompt it is judging, it must clear a
+    confidence bar, and the ids it judged are written alongside the verdict.
+    `take_verdict` throws the answer away if any of those agents is no longer
+    live, which is what "attributed" has to mean — a verdict about a dispatch
+    that has already finished cannot change anything.
+    """
     stamp = d / ".llm-last"
     try:
         if stamp.is_file() and time.time() - stamp.stat().st_mtime < COOLDOWN:
@@ -158,22 +319,38 @@ def spawn_llm(d, state):
     except OSError:
         return
 
-    live = [{k: n.get(k) for k in ("type", "model", "status", "depth", "description")}
-            for n in state.get("nodes", {}).values() if n["id"] != "root"]
-    brief = json.dumps(live[:40])
+    subjects = [n.get("id") for n in live][:8]
+    brief = json.dumps([{
+        "id": n.get("id"),
+        "agent_type": n.get("type"),
+        "model": n.get("model"),
+        "running_for_s": int(now - float(n.get("started") or now)),
+        "tool_calls": n.get("tools") or {},
+        "dispatch_prompt": (n.get("prompt") or n.get("description") or "")[:700],
+    } for n in live[:8]])[:12000]
+
     prompt = (
-        "You are auditing an agent orchestration for wasted parallelism. Here is the "
-        f"current agent tree as JSON:\n{brief}\n\n"
-        "Answer in at most 3 short lines, no preamble. Name only concrete, actionable "
-        "problems: work that is running in sequence but has no dependency between the "
-        "pieces, a task assigned to a more expensive model than it needs, or a lane that "
-        "should have been split further. If the shape looks efficient, reply exactly: OK. "
-        "Do not speculate about code correctness — only about the orchestration shape."
+        "You audit the SHAPE of an agent orchestration — never code correctness.\n"
+        f"Agents currently in flight:\n{brief}\n\n"
+        "Judge each agent from its dispatch_prompt and nothing else. tool_calls is "
+        "context, not evidence: hard work often looks like a pile of Greps, and an "
+        "expensive model reading a lot before it writes is normal, not waste. Never "
+        "recommend a cheaper model unless the dispatch_prompt itself shows the task "
+        "is mechanical — a single known fact, a rename, a file listing.\n\n"
+        "Report only: work running in sequence with no dependency between the pieces, "
+        "a task whose dispatch_prompt proves it is over-tiered, or a lane that should "
+        "have been split. Answer in exactly this form and nothing else:\n"
+        "CONFIDENCE: high|low\n"
+        "FINDING: <one line, or NONE>\n"
+        "Use high only when the dispatch_prompt alone proves it. If you are inferring "
+        "from tool counts, elapsed time, or the agent's name, that is low."
     )
     try:
+        (d / "verdict.subjects.json").write_text(
+            json.dumps({"at": now, "subjects": subjects}))
         # MAESTRO_LEDGER_OFF stops this audit session from writing its own
-        # ledger; MAESTRO_REORCH_LLM=0 stops it recursing into another audit.
-        env = {**os.environ, "MAESTRO_REORCH_LLM": "0",
+        # ledger; MAESTRO_REORCH=0 stops it recursing into another audit.
+        env = {**os.environ, "MAESTRO_REORCH": "0", "MAESTRO_REORCH_LLM": "0",
                "MAESTRO_LEDGER_OFF": "1", "MAESTRO_QUIET": "1"}
         subprocess.Popen(
             ["bash", "-lc",
@@ -186,59 +363,129 @@ def spawn_llm(d, state):
         pass
 
 
-def take_verdict(d):
+def take_verdict(d, state, now):
+    """Read the detached opinion, and discard it unless it still applies."""
     f = d / "verdict.txt"
     try:
-        if not f.is_file() or time.time() - f.stat().st_mtime > VERDICT_TTL:
+        if not f.is_file() or now - f.stat().st_mtime > VERDICT_TTL:
             return None
         txt = f.read_text().strip()
         f.unlink()
-        if not txt or txt.upper().startswith("OK"):
-            return None
-        return txt[:600]
     except OSError:
         return None
+    if not txt:
+        return None
+
+    conf, finding = "", ""
+    for line in txt.splitlines():
+        head, _, rest = line.partition(":")
+        if head.strip().upper() == "CONFIDENCE":
+            conf = rest.strip().lower()
+        elif head.strip().upper() == "FINDING":
+            finding = rest.strip()
+    if conf != "high" or not finding or finding.upper() == "NONE":
+        return None
+
+    # Attribution: the agents it judged must still be the agents in flight.
+    try:
+        meta = json.loads((d / "verdict.subjects.json").read_text())
+        subjects = meta.get("subjects") or []
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not subjects:
+        return None
+    for sid in subjects:
+        n = state.get("nodes", {}).get(sid)
+        if not n or n.get("status") not in LIVE:
+            return None      # it judged a dispatch that is already over
+    return finding[:400]
 
 
 def main():
-    payload = json.loads(sys.stdin.read() or "{}")
-    # Guard, independent of hooks.json: on SubagentStop the injection would land
-    # in the stopping subagent and clobber its report (see module docstring).
-    if (payload.get("hook_event_name") or "") == "SubagentStop":
+    if OFF:
         return
-    d = state_dir(payload.get("cwd"))
+    payload = json.loads(sys.stdin.read() or "{}")
+    ev = payload.get("hook_event_name") or ""
+    # Guards, independent of hooks.json. On SubagentStop — or on any event that
+    # fired inside a subagent — the injection lands in that subagent and clobbers
+    # its report (see the module docstring).
+    if ev == "SubagentStop" or payload.get("agent_id"):
+        return
+    d = state_dir(payload)
     if not d:
         return
-    try:
-        state = json.loads((d / "state.json").read_text())
-    except (OSError, json.JSONDecodeError):
-        return
 
-    findings, suspicious = check(state)
-    verdict = take_verdict(d)
-    if suspicious and USE_LLM:
-        spawn_llm(d, state)
+    tool = payload.get("tool_name") or ""
+    now = time.time()
+    out = None
 
-    if not findings and not verdict:
-        return
+    with open(d / ".recheck.lock", "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        b = load_batch(d)
 
-    live = sum(1 for n in state.get("nodes", {}).values()
-               if n["id"] != "root" and n.get("status") in ("running", "spawning"))
-    lines = [f"MAESTRO RE-CHECK — {live} agent(s) in flight, "
-             f"{len(lanes(state))} lane(s) open."]
-    lines += [f"- {x}" for x in findings[:6]]
-    if verdict:
-        lines.append(f"- second opinion: {verdict}")
-    lines.append("Act on anything above before starting the next wave. If none of it "
-                 "applies, ignore this and continue.")
+        if tool in ("Agent", "Task"):
+            # Record only. Judging here is judging a batch mid-flight.
+            if not b["open"]:
+                b.update(open=True, size=0, wave=b.get("wave", 0) + 1)
+            b["size"] += 1
+            b["last_dispatch_at"] = now
+            b["calls_since_dispatch"] = 0
+            save_batch(d, b)
+            return
 
-    print(json.dumps({
-        "hookSpecificOutput": {
-            "hookEventName": payload.get("hook_event_name") or "SubagentStop",
-            "additionalContext": "\n".join(lines),
-        },
-        "suppressOutput": True,
-    }))
+        b["calls_since_dispatch"] = b.get("calls_since_dispatch", 0) + 1
+        settled = b["open"] and now - float(b["last_dispatch_at"]) >= SETTLE
+        if settled:
+            b["sizes"] = list(b.get("sizes") or []) + [b["size"]]
+            b["open"] = False
+
+        try:
+            state = json.loads((d / "state.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            save_batch(d, b)
+            return
+
+        findings, suspicious = check(state, b, settled, now)
+        reports = delivery_findings(state, now)
+        verdict = take_verdict(d, state, now)
+
+        said = set(b.get("said") or [])
+        fresh, seen = [], set()
+        for fp, text in reports + findings:
+            if fp in said or fp in seen:
+                continue
+            seen.add(fp)
+            fresh.append((fp, text, fp.startswith("report:")))
+
+        if fresh or verdict:
+            _, live, starting = census(state, now)
+            lines = [t for _, t, is_report in fresh if is_report]
+            shape = [t for _, t, is_report in fresh if not is_report]
+            if shape or verdict:
+                head = f"MAESTRO — {len(live) + len(starting)} agent(s) in flight"
+                if starting:
+                    head += f" ({len(starting)} still starting)"
+                lines.append(f"{head}, {len(lanes(state))} lane(s).")
+                lines += [f"- {t}" for t in shape[:5]]
+                if verdict:
+                    lines.append(f"- second opinion (high confidence): {verdict}")
+            b["said"] = list(said | seen)
+            out = "\n".join(lines)
+
+        if suspicious and USE_LLM and settled:
+            _, live, _ = census(state, now)
+            if live:
+                spawn_llm(d, state, live, now)
+        save_batch(d, b)
+
+    if out:
+        print(json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": ev or "PostToolUse",
+                "additionalContext": out,
+            },
+            "suppressOutput": True,
+        }))
 
 
 if __name__ == "__main__":

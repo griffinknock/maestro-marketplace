@@ -41,6 +41,344 @@ REAP_SECONDS = float(os.environ.get("MAESTRO_REAP_SECONDS", "900"))
 # a ceiling, a worktree created now can adopt a dispatch from half an hour ago
 # and inherit the wrong type entirely.
 PENDING_TTL = float(os.environ.get("MAESTRO_PENDING_TTL", "600"))
+# A report is the RETURN block every agent definition mandates. Keep the whole
+# thing on disk, not just the tail the board shows.
+RETURN_BLOCK = re.compile(r"(?:^|\n)\s*RETURN:\s*(?:\n|$)")
+REPORT_MAX = int(os.environ.get("MAESTRO_REPORT_MAX", "40000"))
+REPORT_TAIL_BYTES = 512_000
+SAFE_ID = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def is_protocol_frame(txt):
+    """A machine envelope — an idle ping, a status frame — not prose.
+
+    What a swallowed report looks like from the conductor's side is exactly
+    this: `{"type":"idle_notification","from":...,"idleReason":"available"}`
+    where a report should have been. Any bare JSON object carrying a `type` is
+    a frame no agent composed, and must never be mistaken for its answer.
+    """
+    t = (txt or "").strip()
+    if not (t.startswith("{") and t.endswith("}")):
+        return False
+    try:
+        obj = json.loads(t)
+    except ValueError:
+        return False
+    return isinstance(obj, dict) and isinstance(obj.get("type"), str)
+
+
+def substantive(txt):
+    """Something an agent actually wrote, as opposed to nothing or a frame."""
+    return bool((txt or "").strip()) and not is_protocol_frame(txt)
+
+
+def looks_like_report(txt):
+    return substantive(txt) and bool(RETURN_BLOCK.search(txt))
+
+
+def transcript_texts(path, limit=12):
+    """Assistant prose from a subagent's own transcript, newest first.
+
+    `last_assistant_message` is absent on roughly one SubagentStop in twelve
+    (146 of 1804 across the ledgers this was built against), and when it is
+    present it is only whatever the agent said *last* — which, after an idle
+    ping or a follow-up, is not the report. The transcript still holds it, so
+    a lost report is recoverable rather than gone.
+    """
+    out = []
+    if not path:
+        return out
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - REPORT_TAIL_BYTES))
+            blob = fh.read()
+    except OSError:
+        return out
+    lines = blob.decode("utf-8", "replace").splitlines()
+    if size > REPORT_TAIL_BYTES and len(lines) > 1:
+        del lines[0]                      # sliced mid-line by the seek
+    for line in reversed(lines):
+        if len(out) >= limit:
+            break
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if rec.get("type") != "assistant":
+            continue
+        msg = rec.get("message")
+        if not isinstance(msg, dict):
+            continue
+        body = msg.get("content")
+        if isinstance(body, str):
+            text = body
+        elif isinstance(body, list):
+            text = "\n".join(b.get("text", "") for b in body
+                             if isinstance(b, dict) and b.get("type") == "text")
+        else:
+            continue
+        if text.strip():
+            out.append(text.strip())
+    return out
+
+
+def write_report(d, n, text):
+    """Durable copy of a report, so delivery failure is recoverable offline."""
+    if not d:
+        return n.get("report_path")
+    try:
+        rd = d / "reports"
+        rd.mkdir(parents=True, exist_ok=True)
+        f = rd / (SAFE_ID.sub("_", str(n.get("id") or "agent"))[:64] + ".md")
+        f.write_text(text[:REPORT_MAX])
+        return str(f)
+    except OSError:
+        return n.get("report_path")
+
+
+def record_stop(n, payload, d, now):
+    """Fold one SubagentStop into the node, keeping the best report seen.
+
+    SubagentStop is not once per agent: it re-fires on every stop of the
+    subagent's loop — 18 times for a single agent in the ledgers this was built
+    against, `stop_hook_active` set on the repeats. So the message the harness
+    finally hands the conductor can be an idle frame or a bare "report stands"
+    long after the real report went past. Keeping only the newest message threw
+    the report away; keeping only the first missed genuine updates.
+
+    Keep the best copy, write it somewhere durable, and record separately
+    whether the copy the *conductor* received was the report — that difference
+    is the whole of "a swallowed report looks exactly like a clean finish".
+    """
+    n["stops"] = int(n.get("stops") or 0) + 1
+    n["last_stop_at"] = now
+    if n.get("status") not in ("done", "failed"):
+        n["status"] = "failed" if payload.get("error") else "done"
+        n["ended"] = now
+    elif payload.get("error"):
+        n["status"] = "failed"
+
+    msg = (payload.get("last_assistant_message")
+           or payload.get("result") or payload.get("response") or "")
+    msg = msg.strip() if isinstance(msg, str) else ""
+    delivered = substantive(msg)
+
+    prior = n.get("result") or ""
+    best = msg if delivered and (looks_like_report(msg)
+                                 or not looks_like_report(prior)) else prior
+    # Go to the transcript only when we still have no report frame — and only
+    # once per size of it. Stops re-fire up to 18 times, and an agent that
+    # never uses a RETURN block (a plain `general-purpose` one) would otherwise
+    # re-read half a megabyte inside the ledger lock on every one of them.
+    tpath = payload.get("agent_transcript_path")
+    if not looks_like_report(best) and tpath:
+        try:
+            size = os.path.getsize(tpath)
+        except OSError:
+            size = -1
+        if size != n.get("scanned_size"):
+            n["scanned_size"] = size
+            texts = transcript_texts(tpath)
+            pick = next((t for t in texts if looks_like_report(t)), None)
+            if pick is None and not substantive(best):
+                pick = next((t for t in texts if substantive(t)), None)
+            if pick:
+                best = pick
+
+    if substantive(best):
+        n["result"] = best[-1200:]
+        n["report_path"] = write_report(d, n, best)
+        n["reported_at"] = n.get("reported_at") or now
+
+    if delivered and (looks_like_report(msg) or not looks_like_report(best)):
+        n["report_status"] = "delivered"
+    elif substantive(best):
+        # A report exists but the conductor did not get it. Say so out loud;
+        # `reorchestrate.py` re-delivers it on the conductor's next turn.
+        n["report_status"] = "recovered"
+    else:
+        n["report_status"] = "missing"
+
+
+TEAMS = Path.home() / ".claude" / "teams"
+PRUNE = os.environ.get("MAESTRO_INBOX_PRUNE", "1") != "0"
+# proper-lockfile's default mechanism is an atomically-created *directory*
+# beside the file. Match it exactly, or two writers can interleave.
+LOCK_STALE = 10.0
+# Only ever removed from a mailbox. Every other frame — permission requests,
+# plan approvals, shutdown handshakes, task assignments, and all human-written
+# prose — is load-bearing protocol and must be left exactly where it is.
+PRUNABLE = ("idle_notification",)
+# On TeammateIdle, maestro's hook and the harness's own idle-notification hook
+# are two entries in the same Stop chain, in no guaranteed order. If ours runs
+# first the frame is not written yet. Rather than lose the race, wait for it —
+# bounded, and only when the agent is already retired so there is definitely
+# something to take back out.
+IDLE_CATCH = float(os.environ.get("MAESTRO_IDLE_CATCH", "1.5"))
+
+
+def team_dir(payload):
+    """`~/.claude/teams/session-<sid8>` — a teammate shares its lead's id."""
+    sid = (payload.get("session_id") or "")[:8]
+    d = TEAMS / f"session-{sid}"
+    return d if sid and d.is_dir() else None
+
+
+def lead_inbox(d):
+    """The lead's mailbox path, from the team's own config."""
+    try:
+        cfg = json.loads((d / "config.json").read_text())
+        lead = cfg.get("leadAgentId")
+        name = next((m.get("name") for m in cfg.get("members") or []
+                     if m.get("agentId") == lead), None) or "team-lead"
+    except (OSError, json.JSONDecodeError, TypeError):
+        name = "team-lead"
+    f = d / "inboxes" / f"{name}.json"
+    return f if f.is_file() else None
+
+
+class _Lock:
+    """proper-lockfile-compatible: mkdir to acquire, rmdir to release."""
+
+    def __init__(self, target):
+        self.p = Path(str(target) + ".lock")
+        self.held = False
+
+    def __enter__(self):
+        for _ in range(3):
+            try:
+                self.p.mkdir()
+                self.held = True
+                return self
+            except FileExistsError:
+                try:
+                    if time.time() - self.p.stat().st_mtime > LOCK_STALE:
+                        self.p.rmdir()
+                        continue
+                except OSError:
+                    pass
+                time.sleep(0.02)
+            except OSError:
+                break
+        return self
+
+    def __exit__(self, *_):
+        if self.held:
+            self.held = False       # released once; a re-entry must not rmdir twice
+            try:
+                self.p.rmdir()
+            except OSError:
+                pass
+        return False
+
+
+def retired(n):
+    """Has this agent already said what it came to say, or already stopped?"""
+    if not n:
+        return False
+    if n.get("report_status") in ("delivered", "recovered"):
+        return True
+    return n.get("status") in ("done", "failed", "orphaned")
+
+
+def prune_inbox(state, payload, deadline=0.0):
+    """Drop stale idle pings out of the lead's mailbox before it reads them.
+
+    An idle notification is written by a `Stop` hook running inside the
+    *teammate's* session, straight into the lead's inbox file. By the time the
+    lead reads it, the same agent's report has usually already arrived and the
+    conductor may already have stopped it — so the frame is stale by
+    definition, and it is the most expensive thing in the queue: four fields of
+    JSON that no human wrote, wrapped in the ~120-word cross-session security
+    preamble that exists for peer prose, costing a whole main-loop turn on a
+    very large context to read nothing.
+
+    The ledger already knows which agents have delivered and which have
+    stopped, so it can answer the only question that matters: would this ping
+    tell the conductor something it does not already know? If not, it never
+    reaches the model.
+
+    Removals are restricted to unread `idle_notification` frames from agents
+    this session dispatched and that are already retired. Anything unexpected
+    about the file — not a list, an entry that is not a dict, a frame type not
+    on the allow-list — and the whole pass is abandoned untouched.
+    """
+    if not PRUNE:
+        return
+    d = team_dir(payload)
+    if not d:
+        return
+    f = lead_inbox(d)
+    if not f:
+        return
+    by_name = {}
+    for n in state.get("nodes", {}).values():
+        if n.get("name"):
+            by_name.setdefault(n["name"], n)
+    # Cheap gate. Hooks fire on every tool call, and the harness holds this same
+    # lock whenever a teammate writes; taking it thousands of times to find
+    # nothing to do is pure contention. Two things can create work: a frame
+    # arriving (the file's mtime moves) or an agent retiring, which makes a
+    # frame already sitting there droppable without the file changing at all.
+    # Gate on both — the first version watched only the mtime and let every
+    # ping from an agent that retired after its ping landed straight through.
+    # Skipped while waiting on TeammateIdle, where the point is that the frame
+    # has not been written yet.
+    try:
+        gate = (f.stat().st_mtime_ns, sum(1 for n in by_name.values() if retired(n)))
+    except OSError:
+        return
+    if not deadline and state.get("inbox_seen") == list(gate):
+        return
+    state["inbox_seen"] = list(gate)
+    with _Lock(f) as lk:
+        if not lk.held:
+            return                      # someone else owns it; try again next event
+        try:
+            msgs = json.loads(f.read_text())
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(msgs, list) or not all(isinstance(m, dict) for m in msgs):
+            return
+        keep, dropped = [], []
+        for m in msgs:
+            if m.get("read"):
+                keep.append(m)
+                continue
+            body = m.get("text")
+            frame = None
+            if isinstance(body, str) and body.lstrip().startswith("{"):
+                try:
+                    o = json.loads(body)
+                    if isinstance(o, dict) and isinstance(o.get("type"), str):
+                        frame = o
+                except ValueError:
+                    frame = None
+            if not frame or frame.get("type") not in PRUNABLE:
+                keep.append(m)
+                continue
+            if retired(by_name.get(m.get("from"))):
+                dropped.append({"from": m.get("from"), "at": time.time(),
+                                "reason": frame.get("idleReason") or "available"})
+            else:
+                keep.append(m)          # went idle without reporting: that earns a turn
+        if not dropped:
+            if time.time() < deadline:
+                lk.__exit__()           # do not hold the lock while waiting
+                time.sleep(0.05)
+                return prune_inbox(state, payload, deadline)
+            return
+        try:
+            tmp = f.with_suffix(".maestro-tmp")
+            tmp.write_text(json.dumps(keep, indent=2))
+            tmp.replace(f)
+            state["inbox_seen"] = [f.stat().st_mtime_ns, gate[1]]
+        except OSError:
+            return
+    state.setdefault("pruned", []).extend(dropped)
+    del state["pruned"][:-100]
 
 
 def bare(agent_type):
@@ -173,6 +511,7 @@ def adopt_worktree_owner(state, pid, now):
         "type": (match or {}).get("type") or "agent",
         "model": (match or {}).get("model") or tier_of((match or {}).get("type")),
         "status": "running", "description": (match or {}).get("description", ""),
+        "prompt": (match or {}).get("prompt", ""),
         "depth": 1, "started": now, "ended": None, "tools": {},
         "last_tool": None, "last_file": None, "files": [],
         "worktree": f"agent-{pid}", "tokens": 0,
@@ -279,7 +618,7 @@ def touch_file(n, path):
     n["last_file"] = path
 
 
-def apply(state, payload):
+def apply(state, payload, d=None):
     ev = payload.get("hook_event_name") or ""
     now = time.time()
     state["updated"] = now
@@ -299,6 +638,11 @@ def apply(state, payload):
                 "parent": me,
                 "type": atype,
                 "description": (ti.get("description") or ti.get("prompt") or "")[:160],
+                # The full brief, not just the label. A second opinion that
+                # judges a dispatch from its tool signature calls an
+                # attribution trace across a 14k-line service a "trivial
+                # lookup"; the prompt is the only thing that shows the stakes.
+                "prompt": (ti.get("prompt") or "")[:800],
                 "model": tier_of(atype, ti.get("model")),
                 "background": bool(ti.get("run_in_background")),
                 "at": now,
@@ -335,9 +679,14 @@ def apply(state, payload):
             aid = f"{atype}-{int(now*1000)%10**8}"
         state["nodes"][aid] = {
             "id": aid, "parent": parent, "type": canon_type(atype),
+            # Keep the name the caller chose. It is how the conductor addresses
+            # this agent, so it is also how a notice about it has to name it —
+            # "scout finished" is unusable when five scouts are out.
+            "name": bare(atype) or None,
             "model": (match or {}).get("model") or tier_of(atype),
             "status": "running",
             "description": (match or {}).get("description", ""),
+            "prompt": (match or {}).get("prompt", ""),
             "depth": 0, "started": now, "ended": None, "tools": {},
             "last_tool": None, "last_file": None, "files": [],
             "worktree": None, "tokens": 0,
@@ -353,14 +702,7 @@ def apply(state, payload):
             n = next((v for v in state["nodes"].values()
                       if v["type"] == canon_type(atype) and v["status"] == "running"), None)
         if n:
-            n["status"] = "failed" if payload.get("error") else "done"
-            n["ended"] = now
-            # The final reply arrives as `last_assistant_message` on this hook;
-            # `result`/`response` never appear on real payloads.
-            res = (payload.get("last_assistant_message")
-                   or payload.get("result") or payload.get("response") or "")
-            if isinstance(res, str) and res.strip():
-                n["result"] = res.strip()[-1200:]
+            record_stop(n, payload, d, now)
 
     elif ev == "WorktreeCreate":
         name = payload.get("name") or payload.get("worktree") or "?"
@@ -387,6 +729,15 @@ def apply(state, payload):
         state["notes"].append({"at": now, "kind": kind,
                                "text": (payload.get("message") or "")[:200]})
         del state["notes"][:-50]
+
+    elif ev == "TeammateIdle":
+        # Fires inside the teammate that is going idle, naming itself. It is
+        # the moment the idle frame is written, so it is the earliest point at
+        # which a stale one can be taken back out.
+        who = payload.get("teammate_name")
+        n = next((v for v in state["nodes"].values() if v.get("name") == who), None)
+        if n:
+            n["idle_at"] = now
 
     elif ev == "Stop":
         state["nodes"][ROOT]["status"] = "idle"
@@ -579,7 +930,13 @@ def main():
                 except (json.JSONDecodeError, OSError):
                     pass
             state.setdefault("nodes", {}).setdefault(ROOT, blank(payload)["nodes"][ROOT])
-            state = apply(state, payload)
+            state = apply(state, payload, d)
+            wait = 0.0
+            if (payload.get("hook_event_name") == "TeammateIdle"
+                    and retired(next((v for v in state["nodes"].values()
+                                      if v.get("name") == payload.get("teammate_name")), None))):
+                wait = time.time() + IDLE_CATCH
+            prune_inbox(state, payload, wait)
             tmp = sf.with_suffix(".tmp")
             tmp.write_text(json.dumps(state, default=str))
             tmp.replace(sf)

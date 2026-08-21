@@ -16,6 +16,7 @@ record the actual output, and only then decide whether it passed.
 | Installed as | `maestro@maestro-marketplace` (user scope) |
 | Ledger written to | `<repo>/.claude/maestro/<8-char-session-id>/{state.json,events.jsonl}` |
 | Board | `http://127.0.0.1:7717` |
+| Hook replay harness | `<source>/tests/replay.py` |
 | Terminal | Warp (primary spawn target) with Ghostty 1.3.x as fallback |
 
 Debug switches: `MAESTRO_DEBUG=1` (errors to stderr), `MAESTRO_REORCH_LLM=0`
@@ -239,16 +240,198 @@ board's Worktrees panel lists it with a working diff command.
 echo '{"hook_event_name":"SubagentStop","cwd":"'$PWD'"}' | MAESTRO_REORCH_LLM=0 MAESTRO_DEBUG=1 python3 ~/Documents/Development/maestro-marketplace/maestro/scripts/reorchestrate.py
 ```
 
-On a healthy tree this prints **nothing** — that is a pass, not a failure.
+On a healthy tree this prints **nothing** — that is a pass, not a failure. It
+must also print nothing on `SubagentStop` *ever*, and nothing on any payload
+carrying an `agent_id`: context injected there is delivered to the subagent,
+which then answers the re-check instead of returning its report.
 
-To confirm the rules actually fire, hand-edit a copy of `state.json` so one agent
-is `running` with `last_activity` 700 seconds old and everything else `done`,
-then re-run. **Pass:** findings about serial drift, a stall, and idle lanes.
+```bash
+echo '{"hook_event_name":"PostToolUse","tool_name":"Bash","agent_id":"a123","cwd":"'$PWD'"}' | python3 ~/Documents/Development/maestro-marketplace/maestro/scripts/reorchestrate.py
+```
 
-Then verify the LLM path does not pollute the ledger. Let it trigger with
-`MAESTRO_REORCH_LLM=1`, wait ~30s, and check that **no new session directory**
-appeared under `.claude/maestro/` and that `current` still points at your real
-session. The guard is `MAESTRO_LEDGER_OFF=1` in the child env — confirm it holds.
+**Pass:** no output. Any output here is the report-clobbering bug returning.
+
+To confirm the rules still fire, hand-edit a copy of `state.json` so one agent
+is `running` with `last_activity` 700 seconds old, then fire an ordinary
+`PostToolUse`. **Pass:** a stall finding, once — firing the same event again
+must print nothing, because findings are delivered at most once.
+
+Then verify the LLM path does not pollute the ledger. It is off by default now,
+so force it with `MAESTRO_REORCH_LLM=1`, wait ~30s, and check that **no new
+session directory** appeared under `.claude/maestro/` and that `current` still
+points at your real session. The guard is `MAESTRO_LEDGER_OFF=1` in the child
+env — confirm it holds.
+
+---
+
+### 2.3.1 Conductor message budget — the five-agent batch
+
+This is the case the messaging field report was written from. Every hook message
+costs the conductor a full main-loop turn on a very large context, so what is
+being measured is **count**, and of that count how many carried a number that
+was true when it was rendered and would have changed a decision.
+
+**Target for a healthy five-agent batch: one message, accurate, actionable —
+and zero while the batch is still landing.**
+
+#### Automated, before and after
+
+```bash
+cd ~/Documents/Development/maestro-marketplace && python3 tests/replay.py --before && python3 tests/replay.py
+```
+
+`tests/replay.py` drives the real `ledger.py` and `reorchestrate.py` with real
+payload shapes taken from the field ledgers, under the wiring each revision
+actually shipped. `--before` replays a git revision (default `HEAD`) so the two
+runs are comparable. It replays a seven-agent session: one five-agent batch in a
+single assistant message, two of whose agents hand back only an
+`idle_notification` frame; a two-agent batch; and a second Claude session
+running concurrently in the same workspace.
+
+Dispatch ordering inside a parallel batch is the one thing the ledgers cannot
+show — every recorded batch is sequential — so both orderings are replayed:
+`interleaved` (Pre/Post/Start per agent) and `batched` (all Pre, then all Post,
+then all Start). The fix must hold for both.
+
+**Recorded on 2026-08-21, macOS 26, Python 3.14:**
+
+| | before (`0.2.1`) | after |
+|---|---|---|
+| messages reaching the conductor | 3 interleaved / 2 batched | 1 |
+| …arriving mid-batch | all of them | 0 |
+| …accurate when rendered | 0 | 1 |
+| …that would change a decision | 0 | 1 |
+| swallowed reports surfaced | 0 of 2 | 2 of 2 |
+| sibling session leaking in | 1 message, 1 duplicated line | 0 |
+
+The `before` run reproduces the reported strings verbatim, which is what makes
+it a reproduction rather than a story:
+
+```
+MAESTRO RE-CHECK — 1 agent(s) in flight, 1 lane(s) open.      (five were launching)
+MAESTRO RE-CHECK — 0 agent(s) in flight, 5 lane(s) open.      (two had just launched)
+MAESTRO RE-CHECK — 6 agent(s) in flight, 6 lane(s) open.
+- Two live agents touched CREATOR-PROGRAM-BINDING-PLAN.md …   (another session's file)
+- Two live agents touched CREATOR-PROGRAM-BINDING-PLAN.md …   (and said twice)
+```
+
+**Pass:** `python3 tests/replay.py` exits 0 and prints `PASS`. It fails the run
+if any message arrives mid-batch, carries a count it cannot justify, would not
+have changed a decision, names another session's work, repeats a finding inside
+one message, or if either swallowed report fails to surface.
+
+#### Live, in a real session
+
+The replay proves the hooks; only a real session proves the wiring. In a repo
+with the plugin installed:
+
+```
+In ONE message, dispatch five maestro:scout subagents in parallel to summarise five different files. Then reply with the five summaries.
+```
+
+Count what actually reached you. Then read back what the hooks recorded:
+
+```bash
+python3 -c "
+import json,glob,os
+d=os.path.dirname(max(glob.glob('.claude/maestro/*/state.json'),key=os.path.getmtime))
+b=json.load(open(os.path.join(d,'recheck.json')))
+s=json.load(open(os.path.join(d,'state.json')))
+print('open batch   :',b['open'],'size',b['size'])
+print('settled sizes:',b['sizes'])
+print('findings said:',len(b['said']))
+for n in s['nodes'].values():
+  if n['id']!='root': print(f\"  {n.get('name') or n['type']:<24} {n.get('status'):<8} {n.get('report_status')}\")"
+```
+
+**Pass:** while the wave is still out, `open batch: True size 5`. Once the
+conductor has made one ordinary tool call after it, that moves to
+`settled sizes: [5]`. A `[1, 1, 1, 1, 1]` means the batch is not being held
+together and the debounce is defeated. Once the scouts finish, every one of
+them should read `done` / `delivered`; a `recovered` or `missing` there is the
+next section.
+
+#### Report loss, deliberately induced
+
+Loss is the one class that must always speak. Fake a swallowed report against a
+live ledger — an agent whose last message is a protocol frame, with its real
+report still in its transcript:
+
+```bash
+D=$(ls -td .claude/maestro/*/ | head -1) && A=$(python3 -c "
+import json;s=json.load(open('$D/state.json'))
+print(next(k for k,v in s['nodes'].items() if k!='root'))") && T=$(mktemp) && printf '%s\n' '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"RETURN:\n  answer: the real report\n  files: /x.py:1\n  gaps: none"}]}}' > "$T" && echo '{"hook_event_name":"SubagentStop","cwd":"'$PWD'","session_id":"'$(basename $D)'","agent_id":"'$A'","agent_type":"scout","last_assistant_message":"{\"type\":\"idle_notification\",\"from\":\"scout\",\"idleReason\":\"available\"}","agent_transcript_path":"'$T'"}' | python3 ~/Documents/Development/maestro-marketplace/maestro/scripts/ledger.py
+```
+
+**Pass:** that node now reads `"report_status": "recovered"` and a
+`reports/<agent-id>.md` holds the real text. Wait past `MAESTRO_REPORT_GRACE`
+(5s), fire any `PostToolUse`, and the re-check must hand back the report inline
+under `REPORT RECOVERED`, once. Firing again must print nothing.
+
+With no transcript to recover from, the status must be `missing` and the notice
+must say `REPORT NOT DELIVERED`. A swallowed report that surfaces as silence is
+the failure this whole section exists to catch.
+
+#### Stale idle pings in the lead's mailbox
+
+A named teammate that goes idle writes a four-field JSON frame into the lead's
+mailbox at `~/.claude/teams/session-<session-id>/inboxes/<lead>.json`, and it
+arrives wrapped in the ~120-word cross-session security preamble. `ledger.py`
+removes those frames when the ledger shows that agent has already delivered or
+already stopped, and leaves them when it has not.
+
+`tests/replay.py` builds a faithful replica of that directory and asserts both
+directions, plus every frame type that must survive. To watch it live, list a
+real mailbox mid-wave:
+
+```bash
+cat ~/.claude/teams/session-$(basename $(cat .claude/maestro/current))/inboxes/*.json | python3 -m json.tool | head -40
+```
+
+**Pass:** no `"type":"idle_notification"` entry from an agent that has already
+reported. Cross-check against the ledger:
+
+```bash
+python3 -c "
+import json,glob,os
+d=os.path.dirname(max(glob.glob('.claude/maestro/*/state.json'),key=os.path.getmtime))
+s=json.load(open(os.path.join(d,'state.json')))
+print('pruned pings:', s.get('pruned') or 'none yet')"
+```
+
+**Must never be removed** — verify by hand at least once, because a false
+positive here silently drops a protocol frame the orchestra depends on: prose
+from a peer, `permission_request`, `plan_approval_request`, `shutdown_request`,
+entries already marked `read`, and pings from agents this session did not
+dispatch. Seed one of each into a scratch mailbox, fire any hook, and confirm
+the file is byte-identical apart from the stale pings.
+
+Also confirm the failure mode is inert, not destructive:
+
+```bash
+D=~/.claude/teams/session-probe/inboxes && mkdir -p $D && echo '{"not":"a list"}' > $D/team-lead.json
+echo '{"hook_event_name":"PostToolUse","tool_name":"Bash","cwd":"'$PWD'","session_id":"probe"}' \
+  | python3 ~/Documents/Development/maestro-marketplace/maestro/scripts/ledger.py
+cat $D/team-lead.json && rm -rf ~/.claude/teams/session-probe
+```
+
+**Pass:** the file is unchanged. A mailbox maestro does not understand is a
+mailbox maestro does not write to.
+
+Finally, the ordering race. The frame is written by one entry in the teammate's
+`Stop` chain while maestro runs from another, in no guaranteed order. On
+`TeammateIdle`, maestro waits up to `MAESTRO_IDLE_CATCH` (1.5s) for a frame it
+knows is coming. Confirm the hook still returns promptly when no frame ever
+arrives — it must not sit for the full hook timeout on every idle transition.
+
+#### Concurrent sessions in one workspace
+
+`.claude/maestro/current` is workspace-global and the last session to fire a
+hook owns it. Run two Claude sessions in the same repo, dispatch a wave in each,
+and confirm neither conductor is ever told about the other's agents, lanes, or
+file collisions. `tests/replay.py` forces the losing side of that race
+deterministically; the live check is whether the counts you see match the agents
+you personally dispatched.
 
 ### 2.4 Board, multi-repo
 

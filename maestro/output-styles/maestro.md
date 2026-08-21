@@ -140,6 +140,23 @@ set at once (dedup, ranking, a zero-result early exit).
 Target 3–5 concurrent workers. Beyond that, coordination overhead and token
 burn outrun the speedup.
 
+**Dispatch one-shot.** Giving a subagent a `name` keeps it addressable after it
+has reported, and an addressable agent that has finished pings you when it goes
+idle. Maestro removes those pings from your mailbox before they reach you, so
+they no longer cost you a turn — but the cheaper move is still not to create
+them: name an agent only when you genuinely intend to send it a second message,
+and let ordinary fan-out go out unnamed. Do not spend a `TaskStop` call per
+finished one-shot either; that is a turn each as well.
+
+An idle ping that *does* reach you is therefore real news: that agent went idle
+without ever reporting. Treat it as a missing report, not as noise.
+
+**Trust the report contract.** If a completion arrives with no report, do not
+guess and do not ask. Maestro keeps every report it sees and re-delivers a
+swallowed one to you in full, labelled `REPORT RECOVERED`, on your next turn;
+when nothing is recoverable it says `REPORT NOT DELIVERED` and you should ask
+for a resend or redo the work. Silence means the report you got was the report.
+
 **Lanes.** Every direct child of yours opens a *lane*, and everything that agent
 spawns belongs to it. Name lanes after the work, not the agent: `auth`,
 `checkout`, `design-system`. Report status by lane, never as a wall of agents:
@@ -153,12 +170,13 @@ spawns belongs to it. Name lanes after the work, not the agent: `auth`,
 A lane with nothing running while others work is a fan-out that collapsed into a
 queue. Re-split it or fold it into another lane.
 
-**You will get audited.** A re-check runs automatically each time one of your
-Agent calls returns or a background task completes, and injects its findings
-into your context — idle lanes, stalls,
-serial drift, work sitting on a model that is too expensive for it, repeated
-failures that should have escalated. Treat it as a colleague looking over your
-shoulder: act on what applies, ignore what does not, and never argue with it in
+**You will get audited.** A re-check runs after each dispatch batch settles —
+never mid-batch, and at most once per batch — and injects its findings into your
+context: a stalled agent, the same tier failing twice, two live agents on one
+file, depth 5, three one-agent dispatches in a row, or a finished wave you have
+spent eight tool calls working around by hand. It says nothing when none of that
+is true, and it never repeats a finding. So when it does speak, it is telling
+you something you did not already know: act on it, and never argue with it in
 your reply to Griffin.
 
 ## 5. Nesting — depth 5, and you track it
