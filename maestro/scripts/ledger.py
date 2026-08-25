@@ -124,6 +124,74 @@ def transcript_texts(path, limit=12):
     return out
 
 
+def transcript_usage(path, skip_sidechain=False):
+    """Token totals from a transcript, deduped by API request.
+
+    One API response can land as several assistant records sharing a
+    `requestId`, each carrying the same usage object; only the first per
+    request may count or the sum inflates. Sidechain records are a subagent's
+    activity mirrored into its caller's transcript — skipped when summing the
+    caller itself, or every subagent would be counted twice.
+    """
+    if not path:
+        return None
+    tot = {"in": 0, "cw": 0, "cr": 0, "out": 0, "reqs": 0}
+    seen = set()
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"usage"' not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if rec.get("type") != "assistant":
+                    continue
+                if skip_sidechain and rec.get("isSidechain"):
+                    continue
+                u = (rec.get("message") or {}).get("usage")
+                if not isinstance(u, dict):
+                    continue
+                rid = rec.get("requestId") or rec.get("uuid")
+                if rid is not None and rid in seen:
+                    continue
+                seen.add(rid)
+                try:
+                    tot["in"] += int(u.get("input_tokens") or 0)
+                    tot["cw"] += int(u.get("cache_creation_input_tokens") or 0)
+                    tot["cr"] += int(u.get("cache_read_input_tokens") or 0)
+                    tot["out"] += int(u.get("output_tokens") or 0)
+                except (TypeError, ValueError):
+                    continue
+                tot["reqs"] += 1
+    except OSError:
+        return None
+    return tot if tot["reqs"] else None
+
+
+def record_usage(n, path, key="usage_size"):
+    """Fold a transcript's token totals into a node, once per file size.
+
+    `tokens` is the headline spend — uncached input + cache writes + output.
+    Cache reads are an order of magnitude cheaper and stay in the breakdown,
+    where the board shows them as the cached share.
+    """
+    if not path:
+        return
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return
+    if size == n.get(key):
+        return
+    u = transcript_usage(path, skip_sidechain=(key == "usage_size_self"))
+    if u:
+        n[key] = size
+        n["usage"] = u
+        n["tokens"] = u["in"] + u["cw"] + u["out"]
+
+
 def write_report(d, n, text):
     """Durable copy of a report, so delivery failure is recoverable offline."""
     if not d:
@@ -200,6 +268,8 @@ def record_stop(n, payload, d, now):
         n["report_status"] = "recovered"
     else:
         n["report_status"] = "missing"
+
+    record_usage(n, tpath)
 
 
 TEAMS = Path.home() / ".claude" / "teams"
@@ -742,6 +812,10 @@ def apply(state, payload, d=None):
     elif ev == "Stop":
         state["nodes"][ROOT]["status"] = "idle"
         state["needs_input"] = False
+        # The conductor's own spend, from its own transcript. Sidechain
+        # records are skipped — each subagent is counted from its own file.
+        record_usage(state["nodes"][ROOT], payload.get("transcript_path"),
+                     key="usage_size_self")
 
     elif ev == "SessionEnd":
         state["nodes"][ROOT]["status"] = "done"

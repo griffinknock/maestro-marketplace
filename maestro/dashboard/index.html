@@ -521,6 +521,10 @@ const bare=s=>String(s??'').split(':').pop();
 const TIERMAP={scout:'haiku',scribe:'haiku',surgeon:'opus'};
 function tierOf(n){const m=(n.model||'').toLowerCase();
   return TIERS.find(t=>m.includes(t))||TIERMAP[bare(n.type)]||'sonnet';}
+/* tokens: n.tokens is the headline spend (uncached in + cache writes + output);
+   n.usage carries the breakdown incl. cached reads, which are ~10x cheaper. */
+function fmtTok(t){return !t?'':t>=1e6?(t/1e6).toFixed(1)+'M':t>=1e3?Math.round(t/1e3)+'K':String(t);}
+function tokTitle(u){return u?`in ${fmtTok(u.in)||0} · cache write ${fmtTok(u.cw)||0} · out ${fmtTok(u.out)||0} · cached reads ${fmtTok(u.cr)||0} · ${u.reqs} request${u.reqs>1?'s':''}`:'uncached in + cache writes + output';}
 
 /* ── mascot ─────────────────────────────────────────────────── */
 function setMood(mood,live){
@@ -615,6 +619,7 @@ function nodeEl(n,openSet){
     `<span class="nm">${esc(bare(n.type)||'agent')}</span>`+
     `<span class="pill ${TIERPILL[tier]}">${tier}</span>`+
     (n.worktree?`<span class="pill blue">⑂ ${esc(n.worktree)}</span>`:'')+
+    (n.tokens?`<span class="pill" title="${esc(tokTitle(n.usage))}">⛁ ${fmtTok(n.tokens)}</span>`:'')+
     `<span class="desc">${esc(n.description||n.last_tool||'')}</span>`+
     `<span class="tm">${ago(n.started)}${n.ended?' ⏹':''}</span>`;
   s.onclick=()=>{setTimeout(()=>{const o=new Set(prefs.get('open',[]));
@@ -625,6 +630,7 @@ function nodeEl(n,openSet){
     `<a href="vscode://file/${encodeURI(f)}" title="${esc(f)}">${esc(f.split('/').slice(-2).join('/'))}</a>`).join('');
   const rows=[];
   if(tools)rows.push(`<dt>tools</dt><dd>${esc(tools)}</dd>`);
+  if(n.usage)rows.push(`<dt>tokens</dt><dd>${esc(tokTitle(n.usage))}</dd>`);
   if(files)rows.push(`<dt>files</dt><dd class="files">${files}</dd>`);
   if(n.result)rows.push(`<dt>return</dt><dd style="white-space:pre-wrap">${esc(n.result.slice(0,600))}</dd>`);
   if(rows.length){const b=document.createElement('div');b.className='detail';
@@ -693,9 +699,11 @@ function render(s,force){
   setMood(s.needs_input||QUESTION?'alert':failed&&!live.length?'worried'
         :live.length?'conducting':'idle', live.length);
 
+  const spent=Object.values(nodes).reduce((a,n)=>a+(n.tokens||0),0);
   $('#sub').textContent =
     `${(s.root||'').split('/').pop()} · ${all.length} agents: ${live.length} running, `+
-    `${done} done, ${failed} failed · depth ${deep}/5`;
+    `${done} done, ${failed} failed · depth ${deep}/5`+
+    (spent?` · ⛁ ${fmtTok(spent)} spent`:'');
   $('#census').innerHTML =
     TIERS.map(t=>{const c=live.filter(n=>tierOf(n)===t).length;
       return c?`<span class="pill ${TIERPILL[t]}">${c} ${t}</span> `:'';}).join('')||
@@ -726,7 +734,8 @@ function render(s,force){
       `<span style="flex:1"></span>`+
       `<span class="tm">${set.length} agent${set.length>1?'s':''}</span></div>`+
       `<div class="r2">${dn} done · ${r} running${fl?` · ${fl} failed`:''}`+
-      `${set.some(n=>n.depth>1)?` · depth ${Math.max(...set.map(n=>n.depth||1))}`:''}</div>`+
+      `${set.some(n=>n.depth>1)?` · depth ${Math.max(...set.map(n=>n.depth||1))}`:''}`+
+      `${(t=>t?` · ⛁ ${fmtTok(t)}`:'')(set.reduce((a,n)=>a+(n.tokens||0),0))}</div>`+
       `<div class="track"><i class="done" style="width:${dn/total*100}%"></i>`+
       `<i class="run" style="width:${r/total*100}%"></i>`+
       `<i class="fail" style="width:${fl/total*100}%"></i></div>`;

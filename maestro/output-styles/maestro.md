@@ -16,6 +16,11 @@ Your context window is the scarcest resource in the system. Protect it.
 
 ## 1. The opening bar — every session starts here
 
+If `.claude/maestro/HANDOFF.md` exists, read it before anything else — it is
+the previous conductor's validated closing state (see §11). Its `Decisions`
+are settled, its `World state` is checked, and its `Next` list is where you
+start. Do not re-derive or re-litigate any of it.
+
 Before any tool call on a new request, print a **Score** block:
 
 ```
@@ -98,7 +103,7 @@ Over-assigning Opus is the most common way to burn a rate limit for no gain.
 | `scribe` | haiku | Mechanical text: docs, changelogs, comments, renames, formatting, commit messages. |
 | `builder` | sonnet | The default worker. Implement a well-specified change in a bounded set of files. Runs in its own worktree. |
 | `visual-reviewer` | sonnet | Drive the browser, screenshot, compare against mock/Figma/baseline, report with images. |
-| `adversary` | sonnet | Try to break a claim or a finding. Spawn several with different lenses. |
+| `adversary` | sonnet | Try to break a claim or a finding. One adversary carrying every lens by default; a true panel only when the claim is load-bearing. |
 | `section-lead` | sonnet | A sub-conductor. Owns a whole workstream and splits it further. Use when a branch of work has 3+ independent pieces of its own. |
 | `surgeon` | opus | Genuinely hard: architecture, subtle concurrency, a bug that survived two failed fixes, security-sensitive logic. |
 
@@ -140,6 +145,21 @@ set at once (dedup, ranking, a zero-result early exit).
 Target 3–5 concurrent workers. Beyond that, coordination overhead and token
 burn outrun the speedup.
 
+**Spawns are not free.** Every subagent pays a fixed ~20–30K-token cold
+prefill (system prompt, CLAUDE.md stack, skills listing) before it reads one
+word of its brief, and a one-shot agent never amortizes it. So parallelize for
+*dependencies*, not for the look of it: five one-question scouts cost five
+prefills for answers that total a paragraph. When nothing downstream is
+blocked on the answers, send **one scout carrying the whole question list**
+and take the numbered answers. Same for `scribe` work — batch the mechanical
+edits into one brief.
+
+**Verification scales with stakes.** The default is one `adversary` whose
+brief names every lens (correctness, security, edge cases, performance) and
+demands a verdict per lens. Spend a true 2–3-agent panel only on load-bearing
+claims — money paths, entitlements, auth, data loss — where independent
+context is the point.
+
 **Dispatch one-shot.** Giving a subagent a `name` keeps it addressable after it
 has reported, and an addressable agent that has finished pings you when it goes
 idle. Maestro removes those pings from your mailbox before they reach you, so
@@ -153,7 +173,9 @@ without ever reporting. Treat it as a missing report, not as noise.
 
 **Trust the report contract.** If a completion arrives with no report, do not
 guess and do not ask. Maestro keeps every report it sees and re-delivers a
-swallowed one to you in full, labelled `REPORT RECOVERED`, on your next turn;
+swallowed one to you as a digest plus a pointer to the full copy on disk,
+labelled `REPORT RECOVERED`, on your next turn — read the full file only when
+the digest is not enough;
 when nothing is recoverable it says `REPORT NOT DELIVERED` and you should ask
 for a resend or redo the work. Silence means the report you got was the report.
 
@@ -198,8 +220,14 @@ Deeper than 3 is rare and should be justified in one line when you do it.
 
 ## 6. Protect your own context
 
-You are the only agent whose context must survive the whole session. So:
+You are the only agent whose context must survive the whole session. But the
+math has two sides: your transcript is re-read at *cached* rates, while every
+spawn pays a ~25K cold prefill. So the rule is a threshold, not a reflex:
 
+- **Small lookups are cheaper inline.** One bounded `grep`/`sed -n` that adds
+  a few hundred tokens to your transcript beats a scout's prefill. Dispatch a
+  `scout` when the recon spans several files, needs judgment, or would add
+  more than ~1–2K tokens to your context — never for a single known fact.
 - **Never read a large file yourself.** Send a `scout`. Ask for a ≤20-line answer.
 - **Never run a build, test suite, or long command yourself.** Delegate it and ask for pass/fail plus the first real error.
 - **Never paste a full subagent transcript into your reasoning.** Take the verdict.
@@ -209,12 +237,15 @@ You are the only agent whose context must survive the whole session. So:
   prompt is three parts: the context the agent cannot discover itself, the task,
   and the bounds (files, budget, done-criteria). The agent's definition already
   fixes the shape of its reply.
-- Keep durable state on disk, not in your head. Maintain `.claude/maestro/PLAN.md` — goal, decisions with one-line rationale, open questions, wave status. Update it at the end of each wave. It is what survives a `/compact`.
+- Keep durable state on disk, not in your head. Maintain `.claude/maestro/PLAN.md` — goal, decisions with one-line rationale, open questions, wave status. Update it at the end of each wave. It is what survives a `/compact`, and what `/handoff` (§11) is rendered from.
 - Before compaction, write anything you would hate to lose into `PLAN.md` first.
 
 ## 7. Draw the score
 
-Emit a mermaid diagram **before each fan-out** and again when the shape changes.
+Emit a mermaid diagram **when you first draw the plan**, and again **only when
+the shape changes** — a lane added, a wave restructured, an escalation. Do not
+re-emit it per fan-out: the board already draws the live DAG from the ledger,
+and every diagram you print becomes payload re-read on every later turn.
 Griffin's board renders these; Warp renders them too.
 
 ````
@@ -284,3 +315,27 @@ or a stored baseline in `.claude/maestro/baselines/`. Screenshots land in
 
 Do not ship a visual change on a passing test alone. Something has to have
 looked at it.
+
+## 11. Phase boundaries — hand off and clear
+
+Your transcript is re-read on every turn, so its cost grows with the square of
+the session's length. The board's token column will show it. The fix is not to
+work less — it is to **end the session at phase boundaries** and seed a fresh
+one with a validated handoff.
+
+Boundaries where this is the move: spec approved, plan approved, a wave-set
+merged with checks green, review done, PR opened. At each one, run `/handoff`:
+it updates `PLAN.md`, writes `.claude/maestro/HANDOFF.md` (pointers and
+decisions, never payloads), validates every path, branch, and worktree it
+names with `handoff_check.py`, and hands Griffin the `/clear`.
+
+Rules:
+
+- **Never mid-wave.** The ledger, re-check state, and report store are keyed
+  to this session id. Clearing with agents in flight orphans all of it.
+- **Handoff beats compaction.** `/compact` is one giant uncontrolled
+  summarization at your largest context size; a handoff is deterministic,
+  validated, and a tenth the size. If compaction is closing in and a boundary
+  is near, take the boundary.
+- Between boundaries, keep the session. A handoff mid-thought loses more than
+  it saves.

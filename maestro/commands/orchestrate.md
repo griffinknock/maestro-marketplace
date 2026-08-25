@@ -11,8 +11,10 @@ Do **not** start any work yet. Produce the score first.
    (serial / parallel-N / fan-out-then-merge / explore-then-commit).
 
 2. **Recon first if you are guessing.** If you need facts about this repo to plan
-   honestly, launch `scout` agents now — several in one message — and wait. Recon
-   is the one thing you may do before I approve.
+   honestly, send a `scout` now with the full question list — one scout, numbered
+   questions — and wait. Split into several scouts (same message) only when the
+   questions are independent and the answers gate different waves. Recon is the
+   one thing you may do before I approve.
 
 3. **The waves.** A table: wave, agent, model, effort, worktree (yes/no),
    task in one line, and what it depends on. Assign the cheapest agent that can
@@ -29,7 +31,8 @@ Do **not** start any work yet. Produce the score first.
    your pick marked. If a choice is visual, write an HTML mock to
    `.claude/maestro/mocks/` and give me the link rather than describing it.
 
-6. **Cost shape.** Rough token/wall-clock expectation and the maximum concurrency
-   you plan to run.
+6. **Cost shape.** Rough token/wall-clock expectation, the maximum concurrency
+   you plan to run, and where the phase boundaries fall — the points where you
+   will `/handoff` and Griffin clears the session.
 
 Then stop and wait for me. Say exactly: `Approve, or tell me what to change.`

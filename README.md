@@ -58,7 +58,9 @@ click action.
 | Two-row status line | Model · project · branch · cost, then context · agent census · `depth N/5` · board link |
 | Board | `http://127.0.0.1:7717` — fan-out DAG, lanes, worktrees, screenshots |
 | Ledger | `.claude/maestro/<session>/{events.jsonl,state.json}` |
-| Re-orchestration check | One message per dispatch batch, or silence; re-delivers swallowed reports |
+| Token accounting | Per-agent and conductor spend from the transcripts, on the board and lanes |
+| Phase-boundary handoffs | `/handoff` writes a validated `HANDOFF.md`, then the session is cleared |
+| Re-orchestration check | One message per dispatch batch, or silence; re-delivers swallowed reports as digest + pointer |
 | Mailbox prune | Drops stale teammate idle pings before the conductor is ever woken by them |
 | Sleep assertion | Holds `caffeinate` while agents are in flight |
 | Ghostty config | `ghostty/config` — keybinds, theme pairing, shell integration |
@@ -74,6 +76,7 @@ declare `isolation: worktree` and run in their own checkout.
 |---|---|
 | `/orchestrate <task>` | Plans waves — agent, model, worktree, dependencies, cost — then stops and asks |
 | `/brainstorm <topic>` | No code, no edits. Prior-art recon (web + repo), then one numbered question per message, then alternatives with trade-offs, ending in an `/orchestrate` score |
+| `/handoff [note]` | Closes a conductor session at a phase boundary: updates `PLAN.md`, writes `HANDOFF.md`, validates it with `handoff_check.py`, hands over the `/clear` |
 | `/board` | Starts the board, returns the link. `--lan` also binds to the network |
 | `/tree` | Prints the tree, waves, worktrees and a mermaid diagram as text |
 | `/look <url>` | Screenshot pass across viewports, compared against a mock or baseline |
@@ -200,17 +203,23 @@ is absent outright on roughly one stop in twelve.
 newest message, recovers one from `agent_transcript_path` when the payload has
 none, writes it to `<session>/reports/<agent-id>.md`, and records separately
 whether the copy the **conductor** received was that report. When it was not,
-the re-check hands the report over in full on the conductor's next turn:
+the re-check hands over a **digest plus a pointer** on the conductor's next
+turn — the first ~15 lines, then the path to the durable copy:
 
 ```
 REPORT RECOVERED — scout-web-referral finished, but the copy delivered to you
 was empty or a bare protocol frame. Its real report, from its own transcript,
 is below. Do not ask it to resend.
+…
+… digest — 27 more line(s) on disk. Read the full report only if the digest
+is not enough: .claude/maestro/<sid>/reports/<agent-id>.md
 ```
 
-and when nothing is recoverable it says `REPORT NOT DELIVERED` instead of
-letting loss look like a clean finish. This is the one class that always earns
-a turn.
+Re-delivering in full would re-buy the report's tokens on the conductor's
+largest context every remaining turn; the digest carries the verdict and the
+pointer carries the rest. When nothing is recoverable it says
+`REPORT NOT DELIVERED` instead of letting loss look like a clean finish. This
+is the one class that always earns a turn.
 
 ### It reads its own session, never the workspace pointer
 
@@ -298,6 +307,67 @@ an agent addressable and pinging after it has reported.
 
 ---
 
+## Token accounting
+
+Agent-loop cost is quadratic in turn count — every turn re-reads the whole
+transcript — and each subagent spawn pays a fixed 20–30K-token cold prefill
+before it reads its brief. Neither number is visible from inside a session, so
+the ledger measures both.
+
+On every `SubagentStop` the ledger sums the agent's own transcript; on every
+conductor `Stop` it sums the main transcript (skipping sidechain records, so
+subagents are never double-counted). Records are deduplicated by `requestId` —
+one API response can land as several transcript lines sharing one usage
+object. Each node gets:
+
+- `tokens` — the headline spend: uncached input + cache writes + output.
+  Cache reads are an order of magnitude cheaper and deliberately excluded.
+- `usage` — the full breakdown: `in`, `cw` (cache write), `cr` (cache read),
+  `out`, `reqs`.
+
+The board shows a `⛁` pill per agent (hover for the breakdown), a per-lane
+sum, and the session total in the header. Re-runs are cheap: totals refresh
+only when the transcript's size changes.
+
+What the numbers are for: if scouts carry a big share of the session, batch
+their questions; if the conductor's own total dominates, the session has run
+past a phase boundary — see the next section.
+
+The doctrine the output style pairs with this: batch scout questions into one
+spawn, default to a single multi-lens `adversary` (a 2–3 panel only for
+load-bearing claims), keep small greps inline instead of paying a spawn, and
+emit the mermaid plan once rather than per fan-out.
+
+---
+
+## Phase boundaries and handoffs
+
+The cheapest large context is the one you stop carrying. At a phase boundary —
+spec approved, plan approved, a wave-set merged with checks green, review
+done, PR opened — the conductor runs `/handoff` and the session ends.
+
+`/handoff` refuses to run mid-wave (the ledger, re-check state, and report
+store are keyed to the session id; clearing with agents in flight orphans
+them). Otherwise it updates `PLAN.md`, writes `.claude/maestro/HANDOFF.md` —
+goal, decisions with one-line rationale, world state, open questions, next
+actions — and validates it:
+
+```bash
+python3 maestro/scripts/handoff_check.py
+```
+
+The validator is what makes the handoff trustworthy blind: required sections,
+a 120-line cap, no fenced block over 20 lines (pointers, not payloads), every
+backticked path resolved on disk, every `branch:` resolved in git, every
+`worktree:` a real directory. The conductor iterates until `HANDOFF PASS`,
+then prints the `/clear` and the one-line seed for the next session. The next
+conductor reads `HANDOFF.md` before its opening Score and starts from `Next`.
+
+A handoff beats `/compact`: compaction is one uncontrolled summarization at
+the session's largest context size, and what it keeps is not up to you.
+
+---
+
 ## Blocking questions
 
 The conductor writes `question.json` before it asks. That fires a macOS
@@ -359,8 +429,9 @@ so one orphaned by a deleted session dir dies on its own.
   <session-id>/
     events.jsonl           every hook payload, appended
     state.json             the reconstructed agent tree; each finished node
-                           keeps the tail of the agent's best report (`result`)
-                           and its `report_status`
+                           keeps the tail of the agent's best report (`result`),
+                           its `report_status`, and its token spend
+                           (`tokens`, `usage`)
     reports/<agent-id>.md  the full report, kept whether or not the harness
                            managed to deliver it
     recheck.json           dispatch-batch bookkeeping and findings already said
@@ -370,6 +441,7 @@ so one orphaned by a deleted session dir dies on its own.
   baselines/               reference images
   mocks/                   HTML mocks from /brainstorm
   PLAN.md                  the conductor's durable ledger
+  HANDOFF.md               the validated phase-boundary handoff (/handoff)
 ```
 
 Add `.claude/maestro/` to `.gitignore`; commit `baselines/` if you want visual
@@ -386,6 +458,9 @@ regression references in the repo.
   `section-lead` for isolation, not for summarising. This needs a platform
   capability, not a prompt change.
 - Parent linkage depends on worktree naming — see *How the tree is built*.
+- Token totals refresh on stop events only: a live agent shows nothing until
+  its first `SubagentStop`, and an agent whose stop never matches its node
+  (see reaping) keeps `tokens: 0`. Totals are floor values, not billing.
 - The board is read-only apart from spawning and the music transport.
 - Split-pane agent teams need tmux or iTerm2. In-process mode is the default.
 

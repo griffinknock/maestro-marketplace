@@ -41,8 +41,8 @@ are stranded. Both guards are enforced in main(), independent of hooks.json.
 It also carries the one message class that is always worth a turn: a subagent
 report the harness failed to deliver. `ledger.py` keeps every report it sees;
 when the copy that reached the conductor was empty or was a bare protocol
-frame, the report is re-delivered here in full, so recovery costs no round
-trip and loss is never silent.
+frame, the report is re-delivered here as a bounded digest with a pointer to
+the durable copy, so recovery costs no round trip and loss is never silent.
 
 Env:
   MAESTRO_REORCH=0          disable entirely
@@ -174,17 +174,31 @@ def where(state, n):
     return f" (lane {who(state.get('nodes', {}).get(lane, {'type': lane}))})"
 
 
-def read_report(n, limit=1600):
-    """The recovered report text, preferring the full copy on disk."""
+def read_report(n, max_lines=15, max_chars=900):
+    """A digest of the recovered report, plus the pointer to the full copy.
+
+    Re-delivering a report in full re-buys its tokens on the conductor's
+    largest context every remaining turn. The durable copy already exists on
+    disk (`ledger.py` writes it), so past ~15 lines the transcript gets a
+    digest and a path, not the payload.
+    """
     p = n.get("report_path")
+    txt = ""
     if p:
         try:
-            txt = Path(p).read_text()[:limit]
-            if txt.strip():
-                return txt.strip()
+            txt = Path(p).read_text().strip()
         except OSError:
-            pass
-    return (n.get("result") or "").strip()[:limit]
+            txt = ""
+    if not txt:
+        txt = (n.get("result") or "").strip()
+    lines = txt.splitlines()
+    digest = "\n".join(lines[:max_lines])[:max_chars].rstrip()
+    if len(digest) < len(txt.rstrip()):
+        dropped = max(0, len(lines) - len(digest.splitlines()))
+        digest += f"\n… digest — {dropped} more line(s) on disk"
+        if p:
+            digest += f". Read the full report only if the digest is not enough: {p}"
+    return digest
 
 
 def delivery_findings(state, now):
@@ -211,7 +225,7 @@ def delivery_findings(state, now):
                 f"REPORT RECOVERED — {who(n)} finished, but the copy delivered to you "
                 f"was empty or a bare protocol frame. Its real report, from its own "
                 f"transcript, is below. Do not ask it to resend.\n"
-                f"{read_report(n)}"))
+                f"{read_report(n)}"))  # digest + pointer; full copy stays on disk
         else:
             out.append((
                 f"report:{n.get('id')}:missing",
