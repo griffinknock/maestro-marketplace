@@ -29,35 +29,57 @@ CACHE_TTL = 4
 # and, above all, invisible: it must never change what gets printed and must
 # never raise.
 #
-# usage.json shape (C1): {"five_hour": {"used_percentage", "resets_at",
-# "captured_at"} | None, "seven_day": {...} | None} — each window carries its
-# OWN captured_at. This is what makes cross-session merging correct: every
-# open session's statusline writes every 3s, so an idle session sitting on
-# an hours-old, lower reading of the SAME window (same resets_at) must never
-# overwrite a fresher, higher reading from another session just because it
-# re-sends with a newer wall-clock time.
+# usage.json shape (C1): {"captured_at", "session_id", "five_hour":
+# {"used_percentage", "resets_at", "captured_at"} | None, "seven_day": {...}
+# | None}. Each window carries its OWN captured_at: the last time its value
+# was seen to rise (or the window to roll over). This is what makes
+# cross-session merging correct: every open session's statusline writes every
+# 3s, so an idle session sitting on an hours-old, lower reading of the SAME
+# window must never overwrite a fresher, higher reading from another session
+# just because it re-sends with a newer wall-clock time. The top-level
+# `captured_at` is the later of the two windows' (kept for older readers);
+# `session_id` is whichever session wrote last and may be null — readers
+# must not rely on it.
 USAGE_FILE = Path(os.environ.get("MAESTRO_USAGE_FILE")
                   or (Path.home() / ".claude" / "maestro" / "usage.json"))
+# Two readings of one window whose resets_at differ by at most this many
+# seconds are the SAME window: resets_at jitters by a second or so between
+# sessions and responses, and a jittered idle reading must never pass for a
+# new window and replace a fresh one.
+RESET_JITTER_S = 60.0
+
+
+def _finite(v):
+    """float(v) when v is a real, finite number (bools excluded), else None."""
+    if isinstance(v, bool):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f in (float("inf"), float("-inf")):
+        return None
+    return f
 
 
 def _window(w):
     """One rate-limit window -> `{"used_percentage", "resets_at"}` or None.
-    NaN/non-numeric `used_percentage` is treated as absent — this reading
-    must never merge in."""
+    A NaN/inf/non-numeric `used_percentage` makes the window absent (it must
+    never merge in); a NaN/inf/non-numeric `resets_at` is treated as None."""
     if not isinstance(w, dict) or "used_percentage" not in w:
         return None
-    try:
-        pct = float(w.get("used_percentage"))
-    except (TypeError, ValueError):
-        return None
-    if pct != pct:  # NaN
+    pct = _finite(w.get("used_percentage"))
+    if pct is None:
         return None
     resets = w.get("resets_at")
-    try:
-        resets = float(resets) if resets is not None else None
-    except (TypeError, ValueError):
-        resets = None
+    resets = _finite(resets) if resets is not None else None
     return {"used_percentage": pct, "resets_at": resets}
+
+
+def _same_window(a, b):
+    if a is None or b is None:
+        return a is None and b is None
+    return abs(a - b) <= RESET_JITTER_S
 
 
 def _merge_window(old, new, now):
@@ -68,24 +90,32 @@ def _merge_window(old, new, now):
     Contract (C1):
       - `new` is None (window absent from this payload) -> keep `old`
         untouched; a payload missing a window must never remove/null it.
-      - same `resets_at` as `old` -> keep max(used_percentage); captured_at
-        only updates (to `now`) when the new value is strictly greater than
-        the existing one — an idle session re-sending an hours-old, lower
-        (or equal, unchanged) reading must not revive its timestamp and
-        look fresh, and a truly-unchanged tick must not force a write.
-      - `new.resets_at` newer than `old.resets_at` -> replace outright (a new
-        window has begun).
-      - `new.resets_at` older than `old.resets_at` -> ignore (a stale
-        cross-window race; never regress).
+      - same window (resets_at within RESET_JITTER_S of `old`'s) -> keep
+        max(used_percentage) and the later resets_at; captured_at only
+        updates (to `now`) when the new value is strictly greater than the
+        existing one — an idle session re-sending an hours-old, lower (or
+        equal) reading must not revive its timestamp and look fresh, and a
+        truly-unchanged tick must not force a write.
+      - `new.resets_at` later than that -> replace outright (a new window
+        has begun).
+      - `new.resets_at` earlier than that -> ignore (a stale cross-window
+        race; never regress).
     """
     if new is None:
         return old
     if old is None:
         return {**new, "captured_at": now}
-    old_resets, new_resets = old.get("resets_at"), new.get("resets_at")
-    if new_resets == old_resets:
-        if new["used_percentage"] > old.get("used_percentage", float("-inf")):
-            return {**new, "captured_at": now}
+    old_resets = old.get("resets_at")
+    old_resets = _finite(old_resets) if old_resets is not None else None
+    new_resets = new.get("resets_at")
+    if _same_window(old_resets, new_resets):
+        resets = max(old_resets, new_resets) if new_resets is not None else None
+        old_pct = _finite(old.get("used_percentage"))
+        if old_pct is None or new["used_percentage"] > old_pct:
+            return {"used_percentage": new["used_percentage"], "resets_at": resets,
+                    "captured_at": now}
+        if resets != old.get("resets_at"):
+            return {**old, "resets_at": resets}
         return old
     if new_resets is not None and (old_resets is None or new_resets > old_resets):
         return {**new, "captured_at": now}
@@ -114,7 +144,7 @@ def snapshot_usage(payload):
             old = json.loads(USAGE_FILE.read_text())
             if not isinstance(old, dict):
                 old = {}
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         old = {}
     old_five = old.get("five_hour") if isinstance(old.get("five_hour"), dict) else None
     old_seven = old.get("seven_day") if isinstance(old.get("seven_day"), dict) else None
@@ -125,7 +155,11 @@ def snapshot_usage(payload):
     if merged_five == old_five and merged_seven == old_seven:
         return  # nothing changed — skip the write
 
-    rec = {"session_id": payload.get("session_id"),
+    caps = [_finite(w.get("captured_at")) for w in (merged_five, merged_seven)
+            if isinstance(w, dict)]
+    caps = [c for c in caps if c is not None]
+    rec = {"captured_at": max(caps) if caps else None,
+           "session_id": payload.get("session_id"),
            "five_hour": merged_five, "seven_day": merged_seven}
     tmp = None
     try:

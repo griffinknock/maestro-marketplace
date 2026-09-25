@@ -507,6 +507,156 @@ def cli_unexpected_exception_stops_case():
               decision and decision.get("action") == "stop", decision)
 
 
+# ── round-3 finding 2: frozen readings must not fabricate zero burn ──────
+
+def frozen_chunks(n, used, captured_at, five_resets, start_at=1000.0, span=100.0):
+    """n chunks whose start AND end carry the same stale reading (same
+    captured_at) — what a usage.json that stopped updating produces."""
+    hist = []
+    for i in range(1, n + 1):
+        s = start_at + (i - 1) * span
+        hist.append(pace_rec(i, "start", s, five_used=used, five_resets=five_resets,
+                             captured_at=captured_at))
+        hist.append(pace_rec(i, "end", s + span * 0.9, five_used=used, five_resets=five_resets,
+                             captured_at=captured_at))
+    return hist
+
+
+def frozen_reading_at_75_case():
+    print("\n=== frozen 75% reading, ceiling 80, 12 chunks -> never continue (finding 2 repro a) ===")
+    t0 = 900.0
+    resets = 1000.0 + 4 * 3600
+    history = frozen_chunks(12, 75.0, t0, resets)
+    now = 1000.0 + 12 * 100 + 10
+    snapshot = {"captured_at": t0, "session_id": None,
+                "five_hour": {"used_percentage": 75.0, "resets_at": resets, "captured_at": t0},
+                "seven_day": None}
+    d = decide(snapshot, now, DEFAULT_POLICY, history)
+    check("not continue on a frozen reading", d["action"] != "continue", d)
+    check("stops: 12 chunks in a row ended with no fresh reading",
+          d["action"] == "stop" and "no usage signal" in d["reason"], d)
+    d1 = decide(snapshot, 1000.0 + 100 + 10, DEFAULT_POLICY, history[:2])
+    check("even after ONE frozen chunk the stale reading is projected with the "
+          "conservative burn, not zero (75 + 5 >= 80 -> sleep)", d1["action"] == "sleep", d1)
+
+
+def frozen_reading_700000s_old_case():
+    print("\n=== 700000 s-old reading, resets passed, 6 frozen chunks since -> never continue (finding 2 repro b) ===")
+    now = 1_000_000.0
+    old = now - 700000.0
+    history = frozen_chunks(6, 99.0, old, old + 100, start_at=now - 1000)
+    snapshot = {"captured_at": old,
+                "five_hour": {"used_percentage": 99.0, "resets_at": old + 100, "captured_at": old},
+                "seven_day": {"used_percentage": 99.0, "resets_at": old + 200, "captured_at": old}}
+    d = decide(snapshot, now, DEFAULT_POLICY, history)
+    check("not continue after 6 chunks on a 700000 s-old reading", d["action"] != "continue", d)
+    check("stops for no usage signal", d["action"] == "stop" and "no usage signal" in d["reason"], d)
+    d2 = decide(snapshot, now, dict(DEFAULT_POLICY, allow_blind=True, blind_gap_s=600), history)
+    check("with allow_blind it sleeps blind_gap_s instead of continuing",
+          d2["action"] == "sleep" and d2["delay_s"] == 600, d2)
+
+
+def only_fresh_deltas_count_case():
+    print("\n=== a chunk's delta only counts when its end reading is fresh ===")
+    from pace import _burn_and_duration, _completed_chunks, _trailing_unread
+    resets = 50000.0
+    history = [
+        # fresh: end captured during the chunk -> delta 4
+        pace_rec(1, "start", 0, five_used=10.0, five_resets=resets, captured_at=0),
+        pace_rec(1, "end", 100, five_used=14.0, five_resets=resets, captured_at=90),
+        # frozen: end carries the start's capture -> not a zero delta, unread
+        pace_rec(2, "start", 200, five_used=14.0, five_resets=resets, captured_at=90),
+        pace_rec(2, "end", 300, five_used=14.0, five_resets=resets, captured_at=90),
+        # end captured BEFORE the chunk started -> not fresh either
+        pace_rec(3, "start", 400, five_used=14.0, five_resets=resets, captured_at=90),
+        pace_rec(3, "end", 500, five_used=14.0, five_resets=resets, captured_at=350),
+    ]
+    burn, gate, dur, dflt = _burn_and_duration(_completed_chunks(history), "five_hour")
+    check("mean burn is the fresh chunk's 4.0, not diluted to 1.33 by frozen chunks",
+          abs(burn - 4.0) < 1e-9 and not dflt, (burn, gate, dur, dflt))
+    check("two trailing chunks without a fresh end reading count as unread",
+          _trailing_unread(history) == 2, _trailing_unread(history))
+    history.append(pace_rec(4, "start", 600, five_used=14.0, five_resets=resets, captured_at=90))
+    history.append(pace_rec(4, "end", 700, five_used=14.0, five_resets=resets, captured_at=90))
+    snapshot = snap(710.0, five_hour={"used_percentage": 14.0, "resets_at": resets, "captured_at": 90})
+    d = decide(snapshot, 710.0, DEFAULT_POLICY, history)
+    check("three unread chunks in a row -> stop even though usage.json exists",
+          d["action"] == "stop" and "no usage signal" in d["reason"], d)
+    history.append(pace_rec(5, "start", 800, five_used=14.0, five_resets=resets, captured_at=90))
+    history.append(pace_rec(5, "end", 900, five_used=15.0, five_resets=resets, captured_at=880))
+    check("a fresh reading resets the unread run", _trailing_unread(history) == 0)
+
+
+def per_window_capture_in_pace_records_case():
+    print("\n=== per-window 'captured' in pace records is honoured over captured_at ===")
+    from pace import _fresh_end
+    start = {"chunk": 1, "event": "start", "at": 100,
+             "usage": {"five_hour": 10.0, "seven_day": 5.0, "captured_at": 150,
+                       "captured": {"five_hour": 50, "seven_day": 150},
+                       "resets": {"five_hour": 9000, "seven_day": 900000}}}
+    end = {"chunk": 1, "event": "end", "at": 200,
+           "usage": {"five_hour": 12.0, "seven_day": 5.0, "captured_at": 190,
+                     "captured": {"five_hour": 190, "seven_day": 150},
+                     "resets": {"five_hour": 9000, "seven_day": 900000}}}
+    check("five_hour end reading is fresh", _fresh_end(start, end, "five_hour"))
+    check("seven_day end reading (same capture as start) is not", not _fresh_end(start, end, "seven_day"))
+
+
+def interrupted_chunks_excluded_case():
+    print("\n=== chunks closed by recover (interrupted) are excluded from burn/duration ===")
+    from pace import _burn_and_duration, _completed_chunks, _trailing_unread
+    resets = 50000.0
+    history = [
+        pace_rec(1, "start", 0, five_used=10.0, five_resets=resets, captured_at=0),
+        pace_rec(1, "end", 100, five_used=12.0, five_resets=resets, captured_at=90),
+        pace_rec(2, "start", 200, five_used=12.0, five_resets=resets, captured_at=90),
+        dict(pace_rec(2, "end", 20000, five_used=40.0, five_resets=resets, captured_at=19000),
+             interrupted=True),
+    ]
+    burn, gate, dur, _ = _burn_and_duration(_completed_chunks(history), "five_hour")
+    check("interrupted chunk's 28-point, 19800 s span not counted",
+          abs(burn - 2.0) < 1e-9 and abs(dur - 100.0) < 1e-9, (burn, gate, dur))
+    check("interrupted chunk is neutral for the unread run", _trailing_unread(history) == 0)
+
+
+def reset_jitter_delta_case():
+    print("\n=== resets_at jitter (1 s) between start and end is not a mid-chunk reset ===")
+    from pace import _burn_and_duration, _completed_chunks
+    history = [
+        pace_rec(1, "start", 0, five_used=10.0, five_resets=50000.0, captured_at=0),
+        pace_rec(1, "end", 100, five_used=13.0, five_resets=50001.0, captured_at=90),
+    ]
+    burn, _, _, dflt = _burn_and_duration(_completed_chunks(history), "five_hour")
+    check("jittered chunk still yields its delta", not dflt and abs(burn - 3.0) < 1e-9, (burn, dflt))
+
+
+def projection_uses_gate_burn_case():
+    print("\n=== post-reset projection uses max(burn, gate_burn), not the mean ===")
+    now = 100000.0
+    resets_at = now - 5000.0          # the snapshot's window has already reset
+    new_resets = now + 10000.0
+    history = []
+    t = resets_at + 10
+    # two measured chunks: deltas 1 and 9 -> mean 5, gate 9
+    for i, (a, b) in enumerate([(0.0, 1.0), (1.0, 10.0)], 1):
+        history.append(pace_rec(i, "start", t, five_used=a, five_resets=new_resets, captured_at=t - 5))
+        history.append(pace_rec(i, "end", t + 100, five_used=b, five_resets=new_resets, captured_at=t + 90))
+        t += 200
+    # six more chunks with fresh end readings whose deltas are discarded
+    # (window rolled mid-chunk) — read, so not "blind", but no new burn data
+    for i in range(3, 9):
+        history.append(pace_rec(i, "start", t, five_used=10.0, five_resets=new_resets, captured_at=t - 5))
+        history.append(pace_rec(i, "end", t + 100, five_used=1.0, five_resets=new_resets + 18000,
+                                captured_at=t + 90))
+        t += 200
+    snapshot = snap(now, five_hour=reading(99.0, resets_at))
+    d = decide(snapshot, now, DEFAULT_POLICY, history)
+    # 8 chunks since reset * gate 9 = 72 -> headroom 8 < 9 -> sleep; the old
+    # mean-based estimate (8 * 5 = 40) said "comfortable, continue".
+    check("8 chunks x gate 9 = 72 leaves less than one chunk under 80 -> not continue",
+          d["action"] == "sleep" and "since reset" in d["reason"], d)
+
+
 def main():
     no_history_case()
     low_usage_far_from_reset_case()
@@ -538,6 +688,13 @@ def main():
     per_window_captured_at_overrides_top_level_case()
     cli_smoke_case()
     cli_unexpected_exception_stops_case()
+    frozen_reading_at_75_case()
+    frozen_reading_700000s_old_case()
+    only_fresh_deltas_count_case()
+    per_window_capture_in_pace_records_case()
+    interrupted_chunks_excluded_case()
+    reset_jitter_delta_case()
+    projection_uses_gate_burn_case()
 
     print()
     if FAILURES:

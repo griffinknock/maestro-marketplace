@@ -2,8 +2,10 @@
 """Checks for maestro/skills/sweep/SKILL.md: valid frontmatter, that every
 sweep_state.py / pace.py subcommand or flag it references actually exists
 (grepped from their argparse definitions), that the resume/wakeup prompt
-string is consistent everywhere it appears, and that it matches the anchor
-text sweep_state.py's SessionStart hook prints.
+string is consistent everywhere it appears, that it matches the anchor
+text sweep_state.py's SessionStart hook prints, that the owner comes from
+the session id (never a minted token), and that every exit code
+sweep_state.py returns is documented.
 
     python3 tests/sweep_skill_units.py
 
@@ -31,6 +33,10 @@ def read(p):
     return p.read_text()
 
 
+def norm(s):
+    return re.sub(r"\s+", " ", s).strip()
+
+
 # ── (1) SKILL.md exists with valid frontmatter ───────────────────────────
 
 def frontmatter_case():
@@ -53,6 +59,8 @@ def frontmatter_case():
     check("frontmatter has 'description'", "description" in fields, fm)
     check("frontmatter has 'argument-hint'", "argument-hint" in fields, fm)
     check("name is 'sweep'", fields.get("name") == "sweep", fields.get("name"))
+    check("argument-hint lists takeover", "takeover <slug>" in fields.get("argument-hint", ""),
+          fields.get("argument-hint"))
     return text
 
 
@@ -77,43 +85,19 @@ def script_surface_case(text):
     unknown = sorted(referenced - subcommands)
     check("every referenced sweep_state.py subcommand exists in argparse",
           not unknown, unknown)
-    check("skill references 'new'", "new" in referenced)
-    check("skill references 'recover'", "recover" in referenced)
-    check("skill references 'check'", "check" in referenced)
-    check("skill references 'next'", "next" in referenced)
-    check("skill references 'done'", "done" in referenced)
-    check("skill references 'fail'", "fail" in referenced)
-    check("skill references 'finding'", "finding" in referenced)
-    check("skill references 'add'", "add" in referenced)
-    check("skill references 'amend-plan'", "amend-plan" in referenced)
-    check("skill references 'end-chunk'", "end-chunk" in referenced)
-    check("skill references 'status'", "status" in referenced)
-    check("skill references 'list'", "list" in referenced)
+    for sub in ("new", "recover", "check", "next", "done", "fail", "finding", "add",
+                "amend-plan", "end-chunk", "status", "list", "set-policy"):
+        check(f"skill references '{sub}'", sub in referenced)
 
-    # flags used on --policy / --n / --note / --reason / --text / --item /
-    # --label / --from-finding / --file must exist somewhere in argparse.
-    #
-    # --owner and --stale-after are part of the shared cross-worktree
-    # contract (C1: a stable per-loop OWNER threaded through next / recover
-    # / end-chunk; C3: recover's --stale-after) that the skill is written
-    # against, but the scripts in *this* worktree don't implement yet —
-    # other builders are wiring them into sweep_state.py in parallel. Treat
-    # them as known-pending rather than failing the build, but say so
-    # explicitly so this carve-out is removed once argparse catches up.
-    PENDING_CONTRACT_FLAGS = {"owner", "stale-after"}
+    # every --flag the skill mentions must exist in one of the two argparse
+    # surfaces — no carve-outs any more: --owner/--stale-after are real.
     flags_in_skill = set(re.findall(r"--([a-z][a-z-]*)", text))
     known_flags = set(re.findall(r'add_argument\("--([a-z-]+)"', state_src))
     known_flags |= set(re.findall(r'add_argument\("--([a-z-]+)"', pace_src))
-    pending = sorted(f for f in flags_in_skill if f in PENDING_CONTRACT_FLAGS and f not in known_flags)
-    if pending:
-        print(f"  note  contract flags referenced but not yet in argparse (expected "
-              f"until sweep_state.py/pace.py add them): {pending}")
-    # dest= aliases (e.g. --from-finding maps via dest but the flag text itself is literal)
-    unknown_flags = sorted(f for f in flags_in_skill
-                            if f not in known_flags and f not in PENDING_CONTRACT_FLAGS)
-    check("every --flag referenced by the skill exists in argparse or is a "
-          "known-pending contract flag",
-          not unknown_flags, unknown_flags)
+    unknown_flags = sorted(flags_in_skill - known_flags)
+    check("every --flag referenced by the skill exists in argparse", not unknown_flags, unknown_flags)
+    check("skill documents recover --takeover", "--takeover" in text and "takeover" in known_flags)
+    check("skill explains --stale-after", "--stale-after" in text)
 
     check("skill references pace.py's --sweep flag", "--sweep" in text)
     check("skill mentions all four pace.py actions",
@@ -130,47 +114,48 @@ def resume_prompt_case(text):
 
     run_count = text.count("/loop /maestro:sweep run <slug>")
     resume_count = text.count("/loop /maestro:sweep resume <slug>")
-    check("skill uses '/loop /maestro:sweep run <slug>' to start a sweep",
-          run_count >= 1)
+    check("skill uses '/loop /maestro:sweep run <slug>' to start a sweep", run_count >= 1)
     check("skill uses '/loop /maestro:sweep resume <slug>' to resume one",
-          resume_count >= 2, f"found {resume_count} occurrences, expected "
-          ">= 2 (stop's printed resume command, and the run/resume section)")
+          resume_count >= 2, f"found {resume_count}")
 
-    # C1: OWNER must ride along on the entry-point invocations Griffin is
-    # actually told to type (the opening block, the `new`-section
-    # confirmation, and `stop`'s printed resume line) — a bare run/resume
-    # there can't be threaded through next/recover/end-chunk later in the
-    # same loop. This deliberately does NOT require every occurrence to
-    # carry --owner: the literal SessionStart anchor quote (see
-    # anchor_match_case) only carries --owner once a chunk has actually
-    # started — with no chunk started yet, sweep_state.py has no owner to
-    # recover and prints the bare form instead.
-    owner_run_count = text.count("/loop /maestro:sweep run <slug> --owner <owner>")
-    owner_resume_count = text.count("/loop /maestro:sweep resume <slug> --owner <owner>")
-    check("skill tells Griffin to type '/loop /maestro:sweep run <slug> "
-          "--owner <owner>' to start a sweep",
-          owner_run_count >= 1, owner_run_count)
-    check("skill tells Griffin to type '/loop /maestro:sweep resume <slug> "
-          "--owner <owner>' at least at stop's printed resume line and the "
-          "run/resume section",
-          owner_resume_count >= 2, owner_resume_count)
+    # Every /loop line Griffin is told to type is exactly the slug form —
+    # no owner token riding along (the owner is the session id now).
+    loop_lines = re.findall(r"^/loop .*$", text, re.M)
+    check("every fenced /loop line is exactly '/loop /maestro:sweep run|resume <slug>'",
+          loop_lines and all(l.strip() in ("/loop /maestro:sweep run <slug>",
+                                           "/loop /maestro:sweep resume <slug>")
+                             for l in loop_lines), loop_lines)
+    check("no '--owner <owner>' anywhere in the skill", "--owner <owner>" not in text)
 
-    # every occurrence of "/maestro:sweep resume" in the skill must be
-    # wrapped in "/loop " — a bare resume can't self-schedule.
-    bare = re.findall(r"(?<!/loop )/maestro:sweep resume <slug>", text)
-    check("every '/maestro:sweep resume' in the skill is wrapped in '/loop '",
-          not bare, bare)
-    bare_run = re.findall(r"(?<!/loop )/maestro:sweep run <slug>", text)
-    check("every '/maestro:sweep run' in the skill is wrapped in '/loop '",
-          not bare_run, bare_run)
+    bare = re.findall(r"(?<!/loop )(?<!/loop\n)/maestro:sweep resume <slug>", text)
+    check("every '/maestro:sweep resume' in the skill is wrapped in '/loop '", not bare, bare)
+    bare_run = re.findall(r"(?<!/loop )(?<!/loop\n)/maestro:sweep run <slug>", text)
+    check("every '/maestro:sweep run' in the skill is wrapped in '/loop '", not bare_run, bare_run)
 
-    # the skill must state ScheduleWakeup is /loop-only and name the tool
     check("skill names ScheduleWakeup", "ScheduleWakeup" in text)
     check("skill states ScheduleWakeup is /loop-only",
           re.search(r"only exists? inside.*`?/loop`?|only.*available.*`?/loop`?", text, re.I | re.DOTALL) is not None)
 
 
-# ── (4) anchor text matches the skill's invocation syntax ────────────────
+# ── (4) the owner is the session id, not a minted token ──────────────────
+
+def owner_case(text):
+    print("\n=== SKILL.md / sweep_state.py — owner is Claude Code's session id ===")
+    if text is None:
+        check("skipped — no SKILL.md text", False)
+        return
+    state_src = read(STATE_PY)
+    check("sweep_state.py reads CLAUDE_CODE_SESSION_ID", '"CLAUDE_CODE_SESSION_ID"' in state_src)
+    check("SKILL.md explains CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_SESSION_ID" in text)
+    check("SKILL.md cites the env-vars reference",
+          "https://code.claude.com/docs/en/env-vars" in text)
+    check("no random owner-token minting left in SKILL.md",
+          "token_hex" not in text and "OWNER=" not in text and '"$OWNER"' not in text)
+    check("the anchor no longer prints an owner token",
+          "--owner" not in re.search(r"def cmd_anchor\b.*?(?=\n# ── CLI)", state_src, re.DOTALL).group(0))
+
+
+# ── (5) anchor text matches the skill's quotes ───────────────────────────
 
 def anchor_match_case(text):
     print("\n=== sweep_state.py anchor text matches skill invocation syntax ===")
@@ -178,71 +163,59 @@ def anchor_match_case(text):
         check("skipped — no SKILL.md text", False)
         return
     state_src = read(STATE_PY)
-
-    # cmd_anchor builds its resume line in two documented forms: with
-    # --owner once a chunk has started (owner comes from pace.jsonl's
-    # latest start record), and without one when none has started yet.
-    # Adjacent f-string literals split across lines are implicit
-    # concatenation in Python source, so merge them before extracting the
-    # literal "Resume with ..." text each branch actually prints.
-    func_m = re.search(r"def cmd_anchor\b.*?(?=\ndef )", state_src, re.DOTALL)
+    func_m = re.search(r"def cmd_anchor\b.*?(?=\ndef |\n# ── CLI)", state_src, re.DOTALL)
     check("found cmd_anchor in sweep_state.py", func_m is not None)
     if not func_m:
         return
-    merged = re.sub(r'"\s*\n\s*f"', "", func_m.group(0))
-    resume_lines = re.findall(r"Resume with [^\"]+", merged)
-    check("sweep_state.py's cmd_anchor builds exactly two resume-line forms "
-          "(with --owner and without)",
-          len(resume_lines) == 2, resume_lines)
-    if len(resume_lines) != 2:
+    forms = re.findall(r'f"((?:Resume|Take over) with [^"]*)"', func_m.group(0))
+    canonical = sorted(f.replace("{p.name}", "<slug>").strip() for f in forms)
+    check("cmd_anchor builds exactly the resume form and the takeover form",
+          canonical == ["Resume with /loop /maestro:sweep resume <slug>",
+                        "Take over with /maestro:sweep takeover <slug>"], canonical)
+
+    quoted = [norm(q) for q in re.findall(r"`((?:Resume|Take over)\s+with\s+[^`]+)`", text)]
+    check("SKILL.md quotes the anchor's lines", len(quoted) >= 2, quoted)
+    mismatched = [q for q in quoted if q not in canonical]
+    check("every backtick-quoted anchor line in SKILL.md matches sweep_state.py exactly",
+          not mismatched, f"expected one of {canonical!r}, got {mismatched!r}")
+    for c in canonical:
+        check(f"SKILL.md quotes {c!r}", c in quoted, quoted)
+
+
+# ── (6) every exit code is documented ────────────────────────────────────
+
+def exit_codes_case(text):
+    print("\n=== SKILL.md documents every sweep_state.py exit code ===")
+    if text is None:
+        check("skipped — no SKILL.md text", False)
         return
-
-    canonical = sorted(
-        line.replace("{p.name}", "<slug>").replace("{owner}", "<owner>").strip()
-        for line in resume_lines
-    )
-    canonical_with_owner = next(c for c in canonical if "--owner" in c)
-    canonical_without_owner = next(c for c in canonical if "--owner" not in c)
-    check("one form carries --owner and the other doesn't",
-          canonical_with_owner != canonical_without_owner, canonical)
-    check("anchor's subcommand ('resume') is documented in the skill as an "
-          "entry point (wrapped by /loop)",
-          "/loop /maestro:sweep resume <slug>" in text, canonical)
-
-    # The bug this case exists to catch: SKILL.md previously *quoted* the
-    # anchor's printed text with the wrong shape (missing /loop, or a form
-    # sweep_state.py doesn't actually print) even though
-    # "/loop /maestro:sweep resume <slug>" also appeared elsewhere in the
-    # doc — a mere substring check would pass either way and miss it.
-    # Require every backtick-quoted "Resume with ..." string in SKILL.md —
-    # i.e. every place the skill quotes what the anchor prints, not every
-    # place it tells Griffin to type a resume command — to match one of
-    # the two canonical forms exactly, whitespace/newlines aside.
-    quoted = re.findall(r"`(Resume\s+with\s+[^`]+)`", text)
-    check("SKILL.md quotes at least one anchor string", len(quoted) >= 1, quoted)
-    mismatched = []
-    for q in quoted:
-        normalized = re.sub(r"\s+", " ", q).strip()
-        if normalized not in (canonical_with_owner, canonical_without_owner):
-            mismatched.append(normalized)
-    check("every backtick-quoted 'Resume with ...' string in SKILL.md "
-          "matches one of sweep_state.py's two actual anchor forms exactly",
-          not mismatched,
-          f"expected one of {(canonical_with_owner, canonical_without_owner)!r}, "
-          f"got {mismatched!r}")
-    check("SKILL.md quotes the with-owner anchor form at least once",
-          any(re.sub(r"\s+", " ", q).strip() == canonical_with_owner for q in quoted),
-          quoted)
-    check("SKILL.md quotes the without-owner anchor form at least once",
-          any(re.sub(r"\s+", " ", q).strip() == canonical_without_owner for q in quoted),
-          quoted)
+    state_src = read(STATE_PY)
+    codes = {int(c) for c in re.findall(r"\breturn ([0-9])\b", state_src)}
+    check("sweep_state.py returns codes 0-5", codes == {0, 1, 2, 3, 4, 5}, codes)
+    rows = {int(m) for m in re.findall(r"^\| ([0-9]) \|", text, re.M)}
+    check("SKILL.md's exit-code table has a row for every code", codes <= rows, (codes, rows))
+    check("exit 2 says stop and report", re.search(r"^\| 2 \|.*stop.*report", text, re.M) is not None)
+    check("exit 3 is the finished sweep", re.search(r"^\| 3 \|.*(nothing pending or running|finished)",
+                                                   text, re.M) is not None)
+    check("exit 4 explains takeover", re.search(r"^\| 4 \|.*takeover", text, re.M) is not None)
+    check("exit 5 reschedules at the minimum delay",
+          re.search(r"^\| 5 \|.*minimum delay", text, re.M) is not None)
+    check("step 1 never proceeds past a recover that didn't exit 0",
+          "where `recover` did not\n   exit 0" in text or "recover` did not exit 0" in norm(text))
+    check("set-policy only on Griffin's explicit request",
+          "Only on Griffin's explicit request" in text)
+    check("invalid-policy remedy points to set-policy, not a hand edit",
+          re.search(r"\*\*invalid policy\*\*.*?set-policy", text, re.DOTALL) is not None
+          and "fix\n     `policy.json`" not in text and "re-run `new`" not in text)
 
 
 def main():
     text = frontmatter_case()
     script_surface_case(text)
     resume_prompt_case(text)
+    owner_case(text)
     anchor_match_case(text)
+    exit_codes_case(text)
     print("\n  " + ("PASS" if not FAILURES else f"FAIL ({len(FAILURES)}): {FAILURES}"))
     return 1 if FAILURES else 0
 

@@ -33,10 +33,20 @@ def tmpdir(prefix):
     return Path(tempfile.mkdtemp(prefix=prefix))
 
 
-def base_env(sweeps_dir=None, usage_file=None):
+TEST_SESSION = "sess-test-0001"
+
+
+def base_env(sweeps_dir=None, usage_file=None, session=TEST_SESSION):
+    """Claude Code exports $CLAUDE_CODE_SESSION_ID to every Bash-tool
+    subprocess; sweep_state.py takes the owner from it. Pin it (or remove
+    it, session=None) so these checks behave the same inside and outside a
+    Claude Code session."""
     env = dict(os.environ)
     env["MAESTRO_SWEEPS_DIR"] = str(sweeps_dir or tmpdir("maestro-sweeps-"))
     env["MAESTRO_USAGE_FILE"] = str(usage_file or (tmpdir("maestro-usage-") / "usage.json"))
+    env.pop("CLAUDE_CODE_SESSION_ID", None)
+    if session is not None:
+        env["CLAUDE_CODE_SESSION_ID"] = session
     return env
 
 
@@ -221,7 +231,9 @@ def lifecycle_case():
     check("next appends one pace start line", len(pace) == 1 and pace[0]["event"] == "start")
     check("pace start carries the claimed ids", pace[0]["items"] == [c["id"] for c in claimed])
     check("pace start carries a usage snapshot shape",
-          set(pace[0]["usage"]) == {"five_hour", "seven_day", "captured_at", "resets"})
+          set(pace[0]["usage"]) == {"five_hour", "seven_day", "captured_at", "captured", "resets"})
+    check("pace start's owner is this Claude Code session's id",
+          pace[0].get("owner") == TEST_SESSION, pace[0].get("owner"))
 
     r = run_sweep(["status", "s1"], env)
     check("status mentions 2 running", "2 running" in r.stdout, r.stdout)
@@ -283,11 +295,15 @@ def amend_plan_case():
     check("amend-plan refused under additive", r.returncode == 2, f"rc={r.returncode}")
 
     run_sweep(["fail", "s3", "i-0001", "--reason", "x"], env)  # no-op on policy; just touching state
-    # bump the policy to adaptive
-    policy_path = d / "policy.json"
-    pol = json.loads(policy_path.read_text())
-    pol["deviation"] = "adaptive"
-    policy_path.write_text(json.dumps(pol))
+    # bump the policy to adaptive — through set-policy, the only supported way
+    r = run_sweep(["set-policy", "s3", "--json", json.dumps({"deviation": "adaptive"})], env)
+    check("set-policy to adaptive succeeds", r.returncode == 0, r.stderr)
+
+    r = run_sweep(["amend-plan", "s3", "--file", str(new_plan), "--from-finding", "f-0001"], env)
+    check("amend-plan refuses an unknown --from-finding", r.returncode == 2 and "finding" in r.stderr,
+          f"rc={r.returncode} err={r.stderr}")
+    check("refused amend-plan wrote no plan version", not (d / "plan.v2.md").exists())
+    run_sweep(["finding", "s3", "--text", "the plan misses a step"], env)  # -> f-0001
 
     r = run_sweep(["amend-plan", "s3", "--file", str(new_plan), "--from-finding", "f-0001"], env)
     check("amend-plan accepted under adaptive", r.returncode == 0, r.stderr)
@@ -296,6 +312,8 @@ def amend_plan_case():
     index = json.loads((d / "index.json").read_text())
     check("plan_versions records the new version",
           any(v["file"] == "plan.v2.md" for v in index.get("plan_versions", [])))
+    r = run_sweep(["check", "s3"], env)
+    check("check passes after set-policy + amend-plan", r.returncode == 0, r.stdout)
 
 
 def recover_case():
@@ -332,6 +350,11 @@ def next_drained_case():
     d = ws / "sweeps" / "s4b"
     r = run_sweep(["next", "s4b"], env)
     check("first next claims the only item", json.loads(r.stdout) != [] and r.returncode == 0)
+    r1 = run_sweep(["next", "s4b"], env)
+    check("next while the only item is still running is not 'finished' (exit 4, not 3)",
+          r1.returncode == 4 and r1.stdout.strip() == "[]", f"rc={r1.returncode}")
+    run_sweep(["done", "s4b", "i-0001"], env)
+    run_sweep(["end-chunk", "s4b"], env)
     pace_before = (d / "pace.jsonl").read_text()
 
     r2 = run_sweep(["next", "s4b"], env)
@@ -607,35 +630,94 @@ def anchor_case():
     check("anchor never raises on malformed stdin", r4.returncode == 0)
 
 
+def anchor_payload(ws, session):
+    return json.dumps({"cwd": str(ws), "hook_event_name": "SessionStart",
+                       "source": "resume", "session_id": session})
+
+
+def anchor_ctx(env, payload):
+    r = run_sweep(["anchor"], env, input_text=payload)
+    if r.returncode != 0 or not r.stdout.strip():
+        return ""
+    return json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+
+
 def anchor_owner_case():
-    print("\n=== sweep_state — anchor carries the latest chunk's owner ===")
+    print("\n=== sweep_state — owner is the session id; anchor hints only the owner (finding 3) ===")
     ws = tmpdir("maestro-ws-")
     sweeps = ws / "sweeps"
     env = base_env(sweeps_dir=sweeps)
     plan, items = write_plan_and_items(ws, ["a", "b"])
     run_sweep(["new", "--slug", "s8", "--plan", str(plan), "--items", str(items)], env)
-    payload = json.dumps({"cwd": str(ws), "hook_event_name": "SessionStart", "source": "resume"})
+    d = sweeps / "s8"
 
-    # No chunk has started yet -> no --owner in the resume line.
-    r0 = run_sweep(["anchor"], env, input_text=payload)
-    out0 = json.loads(r0.stdout)
-    ctx0 = out0["hookSpecificOutput"]["additionalContext"]
-    check("anchor with no chunks omits --owner",
-          "resume s8" in ctx0 and "--owner" not in ctx0, ctx0)
+    ctx0 = anchor_ctx(env, anchor_payload(ws, "sess-A"))
+    check("no chunk open -> plain resume hint, no owner token, no takeover",
+          "Resume with /loop /maestro:sweep resume s8" in ctx0 and "--owner" not in ctx0
+          and "Take over" not in ctx0, ctx0)
 
-    # First chunk claimed by owner-a.
-    run_sweep(["next", "s8", "--n", "1", "--owner", "owner-a"], env)
-    r1 = run_sweep(["anchor"], env, input_text=payload)
-    ctx1 = json.loads(r1.stdout)["hookSpecificOutput"]["additionalContext"]
-    check("anchor carries the sole chunk's owner",
-          "resume s8 --owner owner-a" in ctx1, ctx1)
+    # Session A opens a chunk; its owner is A's session id (from the env,
+    # exactly as the Bash tool provides it — no --owner on the command line).
+    env_a = base_env(sweeps_dir=sweeps, session="sess-A")
+    run_sweep(["next", "s8", "--n", "1"], env_a)
+    pace = [json.loads(l) for l in (d / "pace.jsonl").read_text().splitlines() if l.strip()]
+    check("chunk owner is the calling session's CLAUDE_CODE_SESSION_ID",
+          pace[-1].get("owner") == "sess-A", pace[-1])
 
-    # Second chunk claimed by owner-b (a later/different session) -> latest wins.
-    run_sweep(["next", "s8", "--n", "1", "--owner", "owner-b"], env)
-    r2 = run_sweep(["anchor"], env, input_text=payload)
-    ctx2 = json.loads(r2.stdout)["hookSpecificOutput"]["additionalContext"]
-    check("anchor's owner is the latest start record's, not the first",
-          "resume s8 --owner owner-b" in ctx2 and "owner-a" not in ctx2, ctx2)
+    ctx_a = anchor_ctx(env, anchor_payload(ws, "sess-A"))
+    check("the owning session gets the resume hint",
+          "Resume with /loop /maestro:sweep resume s8" in ctx_a and "Take over" not in ctx_a, ctx_a)
+
+    # The attack: any other session in the repo used to be handed A's owner
+    # token and adopt A's live chunk. Now it is told the sweep is owned
+    # elsewhere and is never given a resume line.
+    ctx_b = anchor_ctx(env, anchor_payload(ws, "sess-B"))
+    check("another session is told the sweep is owned by another session since <time>",
+          "owned by another session" in ctx_b and "sess-A" in ctx_b and " since " in ctx_b, ctx_b)
+    check("another session gets the takeover line, not a resume line",
+          "Take over with /maestro:sweep takeover s8" in ctx_b and "Resume with" not in ctx_b, ctx_b)
+
+    env_b = base_env(sweeps_dir=sweeps, session="sess-B")
+    r = run_sweep(["recover", "s8"], env_b)
+    check("session B's recover refuses A's fresh chunk (exit 4)", r.returncode == 4, r.stderr)
+    check("the busy line names the owner and the takeover remedy",
+          "sess-A" in r.stderr and "takeover" in r.stderr, r.stderr)
+    r = run_sweep(["end-chunk", "s8"], env_b)
+    check("session B cannot close A's chunk", r.returncode == 2, r.stderr)
+    index = json.loads((d / "index.json").read_text())
+    check("A's item still running after B's attempts",
+          index["items"][0]["status"] == "running", index["items"][0])
+
+    # Crashed-session reclaim without waiting 7200 s: explicit takeover.
+    r = run_sweep(["recover", "s8", "--takeover"], env_b)
+    check("recover --takeover reclaims a fresh foreign chunk", r.returncode == 0
+          and json.loads(r.stdout) == ["i-0001"], f"rc={r.returncode} out={r.stdout} err={r.stderr}")
+    amendments = [json.loads(l) for l in (d / "amendments.jsonl").read_text().splitlines() if l.strip()]
+    check("takeover recorded in amendments (from A to B, explicit)",
+          any(a.get("op") == "takeover" and a.get("from_owner") == "sess-A"
+              and a.get("to_owner") == "sess-B" and a.get("reason") == "explicit"
+              for a in amendments), amendments)
+    r = run_sweep(["check", "s8"], env)
+    check("check passes after a takeover", r.returncode == 0, r.stdout)
+    ctx_b2 = anchor_ctx(env, anchor_payload(ws, "sess-B"))
+    check("after takeover (no open chunk) the resume hint is back",
+          "Resume with /loop /maestro:sweep resume s8" in ctx_b2, ctx_b2)
+
+
+def owner_required_case():
+    print("\n=== sweep_state — no session id and no --owner -> refuse, never guess (finding 3) ===")
+    ws = tmpdir("maestro-ws-")
+    env = base_env(sweeps_dir=ws / "sweeps", session=None)
+    plan, items = write_plan_and_items(ws, ["a"])
+    run_sweep(["new", "--slug", "so", "--plan", str(plan), "--items", str(items)], env)
+    for args in (["next", "so"], ["recover", "so"], ["end-chunk", "so"]):
+        r = run_sweep(args, env)
+        check(f"{args[0]} refuses without an owner (exit 2)",
+              r.returncode == 2 and "CLAUDE_CODE_SESSION_ID" in r.stderr, f"rc={r.returncode} err={r.stderr}")
+    index = json.loads((ws / "sweeps" / "so" / "index.json").read_text())
+    check("nothing claimed without an owner", index["items"][0]["status"] == "pending")
+    r = run_sweep(["next", "so", "--owner", "explicit"], env)
+    check("--owner still works as an explicit override", r.returncode == 0, r.stderr)
 
 
 def anchor_corrupt_pace_case():
@@ -650,13 +732,299 @@ def anchor_corrupt_pace_case():
     pace_path = sweeps / "s9" / "pace.jsonl"
     pace_path.write_text(pace_path.read_text() + "not json at all\n")
 
-    payload = json.dumps({"cwd": str(ws), "hook_event_name": "SessionStart", "source": "resume"})
-    r = run_sweep(["anchor"], env, input_text=payload)
+    r = run_sweep(["anchor"], env, input_text=anchor_payload(ws, "owner-a"))
     check("anchor exits 0 with a corrupt pace.jsonl line", r.returncode == 0, r.stderr)
-    out = json.loads(r.stdout)
-    ctx = out["hookSpecificOutput"]["additionalContext"]
-    check("anchor still resolves the owner from the valid start record despite the corrupt line",
-          "resume s9 --owner owner-a" in ctx, ctx)
+    ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"] if r.stdout.strip() else ""
+    check("anchor still resolves the open chunk's owner despite the corrupt line",
+          "Resume with /loop /maestro:sweep resume s9" in ctx, ctx)
+    ctx_b = anchor_ctx(env, anchor_payload(ws, "owner-b"))
+    check("…and still refuses to hand another session a resume line", "Take over" in ctx_b, ctx_b)
+
+
+# ── round-3 adversary findings ───────────────────────────────────────────
+
+def statusline_payload(five_pct=None, five_resets=None, seven_pct=None, seven_resets=None,
+                       sid="s"):
+    p = {"model": {"display_name": "Sonnet"},
+         "context_window": {"used_percentage": 10}, "rate_limits": {}}
+    if sid is not None:
+        p["session_id"] = sid
+    if five_pct is not None:
+        p["rate_limits"]["five_hour"] = {"used_percentage": five_pct, "resets_at": five_resets}
+    if seven_pct is not None:
+        p["rate_limits"]["seven_day"] = {"used_percentage": seven_pct, "resets_at": seven_resets}
+    return p
+
+
+def reset_jitter_case():
+    print("\n=== statusline — resets_at jitter is the same window (finding 1) ===")
+    usage_file = tmpdir("maestro-usage-") / "usage.json"
+    env = base_env(usage_file=usage_file)
+    # Repro: A 79 -> idle B re-sends 30 with resets_at 1 s later -> A 80.
+    run_statusline(statusline_payload(five_pct=79, five_resets=5000, sid="A"), env)
+    time.sleep(0.02)
+    run_statusline(statusline_payload(five_pct=30, five_resets=5001, sid="B"), env)
+    rec = json.loads(usage_file.read_text())
+    check("a jittered (+1 s) idle lower reading does not replace the fresh one",
+          rec["five_hour"]["used_percentage"] == 79, rec)
+    check("the later resets_at is kept", rec["five_hour"]["resets_at"] == 5001, rec)
+    time.sleep(0.02)
+    run_statusline(statusline_payload(five_pct=80, five_resets=5000, sid="A"), env)
+    rec = json.loads(usage_file.read_text())
+    check("the fresh session's next reading still lands (not ignored as 'older')",
+          rec["five_hour"]["used_percentage"] == 80, rec)
+    time.sleep(0.02)
+    run_statusline(statusline_payload(five_pct=3, five_resets=5000 + 18000, sid="A"), env)
+    rec = json.loads(usage_file.read_text())
+    check("a genuinely new window (resets_at well past the jitter) still replaces",
+          rec["five_hour"]["used_percentage"] == 3, rec)
+
+    # Non-finite resets_at is absent; non-finite used_percentage never merges.
+    usage_file2 = tmpdir("maestro-usage-") / "usage.json"
+    env2 = base_env(usage_file=usage_file2)
+    raw = json.dumps(statusline_payload(five_pct=50, five_resets=7000)).replace("7000", "Infinity")
+    r = subprocess.run([sys.executable, str(STATUSLINE)], input=raw, capture_output=True,
+                       text=True, env=env2)
+    check("inf resets_at doesn't crash statusline", r.returncode == 0, r.stderr)
+    rec2 = json.loads(usage_file2.read_text())
+    check("inf resets_at is stored as absent (None)", rec2["five_hour"]["resets_at"] is None, rec2)
+    raw = json.dumps(statusline_payload(five_pct=51, five_resets=None)).replace("51", "Infinity")
+    subprocess.run([sys.executable, str(STATUSLINE)], input=raw, capture_output=True,
+                   text=True, env=env2)
+    rec3 = json.loads(usage_file2.read_text())
+    check("inf used_percentage is ignored, prior value kept",
+          rec3["five_hour"]["used_percentage"] == 50, rec3)
+
+
+def usage_top_level_case():
+    print("\n=== statusline — top-level captured_at restored; session_id may be null (finding 8) ===")
+    usage_file = tmpdir("maestro-usage-") / "usage.json"
+    env = base_env(usage_file=usage_file)
+    run_statusline(statusline_payload(five_pct=10, five_resets=5000, seven_pct=20,
+                                      seven_resets=900000, sid=None), env)
+    rec = json.loads(usage_file.read_text())
+    check("top-level captured_at present", isinstance(rec.get("captured_at"), (int, float)), rec)
+    check("top-level captured_at == latest window capture",
+          rec.get("captured_at") == max(rec["five_hour"]["captured_at"],
+                                        rec["seven_day"]["captured_at"]), rec)
+    check("a payload with no session_id still writes (session_id null)",
+          "session_id" in rec and rec["session_id"] is None, rec)
+    # sweep_state's snapshot reads per-window capture times without relying on session_id.
+    ws = tmpdir("maestro-ws-")
+    env2 = base_env(sweeps_dir=ws / "sweeps", usage_file=usage_file)
+    plan, items = write_plan_and_items(ws, ["a"])
+    run_sweep(["new", "--slug", "u8", "--plan", str(plan), "--items", str(items)], env2)
+    run_sweep(["next", "u8"], env2)
+    pace = [json.loads(l) for l in (ws / "sweeps" / "u8" / "pace.jsonl").read_text().splitlines() if l.strip()]
+    u = pace[-1]["usage"]
+    check("pace snapshot carries per-window capture times",
+          u["captured"]["five_hour"] == rec["five_hour"]["captured_at"]
+          and u["captured"]["seven_day"] == rec["seven_day"]["captured_at"], u)
+
+
+def stranded_running_case():
+    print("\n=== sweep_state — unreported items never stranded as running (finding 4) ===")
+    ws = tmpdir("maestro-ws-")
+    env = base_env(sweeps_dir=ws / "sweeps")
+    plan, items = write_plan_and_items(ws, ["a", "b"])
+    run_sweep(["new", "--slug", "s10", "--plan", str(plan), "--items", str(items)], env)
+    d = ws / "sweeps" / "s10"
+    claimed = json.loads(run_sweep(["next", "s10"], env).stdout)
+    check("both items claimed", len(claimed) == 2)
+    run_sweep(["done", "s10", "i-0001"], env)      # i-0002's agent never reports
+    r = run_sweep(["end-chunk", "s10"], env)
+    check("end-chunk exits 0", r.returncode == 0, r.stderr)
+    check("end-chunk reports the item it returned", json.loads(r.stdout) == ["i-0002"], r.stdout)
+    it2 = find(d, "i-0002")
+    check("unreported item back to pending, a recovery counted, no attempt spent",
+          it2["status"] == "pending" and it2["recoveries"] == 1 and it2["attempts"] == 0, it2)
+    r = run_sweep(["next", "s10"], env)
+    check("next re-claims it (not exit 3 on an unfinished sweep)",
+          r.returncode == 0 and [c["id"] for c in json.loads(r.stdout)] == ["i-0002"], r.stdout)
+    run_sweep(["done", "s10", "i-0002"], env)
+    run_sweep(["end-chunk", "s10"], env)
+    r = run_sweep(["next", "s10"], env)
+    check("next exits 3 once nothing is pending or running", r.returncode == 3, r.stderr)
+    r = run_sweep(["anchor"], env, input_text=anchor_payload(ws, TEST_SESSION))
+    check("anchor stops advertising a finished sweep", r.stdout.strip() == "", r.stdout)
+
+    # Nothing pending but items running in another session's open chunk:
+    # not "finished" (3) — busy (4), naming the owner.
+    ws2 = tmpdir("maestro-ws-")
+    env2 = base_env(sweeps_dir=ws2 / "sweeps")
+    plan2, items2 = write_plan_and_items(ws2, ["only"])
+    run_sweep(["new", "--slug", "s11", "--plan", str(plan2), "--items", str(items2)], env2)
+    run_sweep(["next", "s11", "--owner", "sess-A"], env2)
+    r = run_sweep(["next", "s11", "--owner", "sess-B"], env2)
+    check("next with nothing pending but items running exits 4, not 3",
+          r.returncode == 4 and "sess-A" in r.stderr, f"rc={r.returncode} err={r.stderr}")
+
+    # A legacy strand (running item, chunk already closed) is reclaimed by recover.
+    pace_path = ws2 / "sweeps" / "s11" / "pace.jsonl"
+    with open(pace_path, "a") as f:
+        f.write(json.dumps({"chunk": 1, "event": "end", "at": time.time(), "usage": {},
+                            "interrupted": False}) + "\n")
+    r = run_sweep(["recover", "s11", "--owner", "sess-B"], env2)
+    check("recover reclaims an orphaned running item (no open chunk)",
+          r.returncode == 0 and json.loads(r.stdout) == ["i-0001"], f"{r.stdout} {r.stderr}")
+
+
+def find(d, item_id):
+    index = json.loads((d / "index.json").read_text())
+    return next(it for it in index["items"] if it["id"] == item_id)
+
+
+def policy_tamper_case():
+    print("\n=== sweep_state — policy tampering is never honoured (finding 5) ===")
+    ws = tmpdir("maestro-ws-")
+    env = base_env(sweeps_dir=ws / "sweeps")
+    plan, items = write_plan_and_items(ws, ["one"])
+    run_sweep(["new", "--slug", "t5", "--plan", str(plan), "--items", str(items),
+              "--policy", json.dumps({"deviation": "locked"})], env)
+    d = ws / "sweeps" / "t5"
+    run_sweep(["finding", "t5", "--text", "want more work"], env)   # f-0001
+
+    # The attack: edit policy.json to autonomous, add, restore, check.
+    original = (d / "policy.json").read_text()
+    pol = json.loads(original)
+    pol["deviation"] = "autonomous"
+    (d / "policy.json").write_text(json.dumps(pol, indent=2))
+    r = run_sweep(["add", "t5", "--label", "sneaky", "--from-finding", "f-0001"], env)
+    check("add refuses an edited policy.json (sha mismatch)",
+          r.returncode == 2 and "policy_sha256" in r.stderr, f"rc={r.returncode} err={r.stderr}")
+    r = run_sweep(["next", "t5"], env)
+    check("next refuses an edited policy.json too", r.returncode == 2, r.stderr)
+    (d / "policy.json").write_text(original)
+    index = json.loads((d / "index.json").read_text())
+    check("no item was added", len(index["items"]) == 1, index["items"])
+    r = run_sweep(["check", "t5"], env)
+    check("check passes on the untouched sweep", r.returncode == 0, r.stdout)
+
+    # A hand-forged add (amendment + item + hashes) under a locked policy.
+    index["items"].append({"id": "i-0002", "label": "forged", "status": "pending",
+                           "attempts": 0, "recoveries": 0, "from_finding": "f-0001", "note": None})
+    import hashlib
+    index["items_sha256"] = hashlib.sha256(json.dumps(
+        [[it["id"], it["label"]] for it in index["items"]]).encode()).hexdigest()
+    (d / "index.json").write_text(json.dumps(index))
+    with open(d / "amendments.jsonl", "a") as f:
+        f.write(json.dumps({"at": time.time(), "op": "add_item", "item": "i-0002",
+                            "from_finding": "f-0001", "policy": "additive"}) + "\n")
+    r = run_sweep(["check", "t5"], env)
+    check("check rejects an add_item whose recorded deviation isn't the one in force",
+          r.returncode == 1 and "in force was 'locked'" in r.stdout, r.stdout)
+    lines = (d / "amendments.jsonl").read_text().replace('"policy": "additive"', '"policy": "locked"')
+    (d / "amendments.jsonl").write_text(lines)
+    r = run_sweep(["check", "t5"], env)
+    check("check rejects an add_item recorded under a deviation that doesn't allow it",
+          r.returncode == 1 and "does not allow it" in r.stdout, r.stdout)
+
+    # amend-plan <-> plan_versions reconciliation.
+    ws2 = tmpdir("maestro-ws-")
+    env2 = base_env(sweeps_dir=ws2 / "sweeps")
+    plan2, items2 = write_plan_and_items(ws2, ["one"])
+    run_sweep(["new", "--slug", "t5b", "--plan", str(plan2), "--items", str(items2),
+              "--policy", json.dumps({"deviation": "autonomous"})], env2)
+    d2 = ws2 / "sweeps" / "t5b"
+    run_sweep(["finding", "t5b", "--text", "plan gap"], env2)
+    newplan = ws2 / "p2.md"
+    newplan.write_text("# v2\n")
+    r = run_sweep(["amend-plan", "t5b", "--file", str(newplan), "--from-finding", "f-0001"], env2)
+    check("amend-plan under autonomous succeeds", r.returncode == 0, r.stderr)
+    amends = [json.loads(l) for l in (d2 / "amendments.jsonl").read_text().splitlines() if l.strip()]
+    check("amend_plan amendment carries the version's sha and file",
+          amends and amends[-1].get("op") == "amend_plan" and amends[-1].get("file") == "plan.v2.md", amends)
+    idx2 = json.loads((d2 / "index.json").read_text())
+    saved = list(idx2["plan_versions"])
+    idx2["plan_versions"] = []
+    (d2 / "index.json").write_text(json.dumps(idx2))
+    r = run_sweep(["check", "t5b"], env2)
+    check("check rejects an amend_plan amendment with no plan_versions entry",
+          r.returncode == 1 and "amend_plan" in r.stdout, r.stdout)
+    idx2["plan_versions"] = saved
+    (d2 / "index.json").write_text(json.dumps(idx2))
+    (d2 / "amendments.jsonl").write_text("")
+    r = run_sweep(["check", "t5b"], env2)
+    check("check rejects a plan version with no amend_plan amendment",
+          r.returncode == 1 and "amend_plan" in r.stdout, r.stdout)
+
+
+def set_policy_case():
+    print("\n=== sweep_state — set-policy: validated, versioned, chain-checked (finding 6) ===")
+    ws = tmpdir("maestro-ws-")
+    env = base_env(sweeps_dir=ws / "sweeps")
+    plan, items = write_plan_and_items(ws, ["one"])
+    run_sweep(["new", "--slug", "t6", "--plan", str(plan), "--items", str(items)], env)
+    d = ws / "sweeps" / "t6"
+    check("new writes policy.v1.json", (d / "policy.v1.json").read_text() == (d / "policy.json").read_text())
+
+    sha_before = json.loads((d / "index.json").read_text())["policy_sha256"]
+    r = run_sweep(["set-policy", "t6", "--json", json.dumps({"chunk_size": 0})], env)
+    check("set-policy rejects an invalid policy (exit 2)", r.returncode == 2, r.stderr)
+    check("…and changes nothing",
+          json.loads((d / "index.json").read_text())["policy_sha256"] == sha_before
+          and not (d / "policy.v2.json").exists())
+
+    r = run_sweep(["set-policy", "t6", "--json", json.dumps({"deviation": "locked", "chunk_size": 2})], env)
+    check("set-policy exits 0", r.returncode == 0, r.stderr)
+    pol = json.loads((d / "policy.json").read_text())
+    check("policy.json is the merged new policy",
+          pol["deviation"] == "locked" and pol["chunk_size"] == 2 and pol["ceilings"]["five_hour"] == 80, pol)
+    index = json.loads((d / "index.json").read_text())
+    check("policy_versions has v1 and v2", [v["version"] for v in index["policy_versions"]] == [1, 2],
+          index.get("policy_versions"))
+    check("policy.v2.json matches the current policy_sha256",
+          (d / "policy.v2.json").read_text() == (d / "policy.json").read_text()
+          and index["policy_versions"][-1]["sha256"] == index["policy_sha256"])
+    amends = [json.loads(l) for l in (d / "amendments.jsonl").read_text().splitlines() if l.strip()]
+    check("a set_policy amendment is recorded",
+          any(a.get("op") == "set_policy" and a.get("deviation") == "locked"
+              and a.get("from_deviation") == "additive" for a in amends), amends)
+    r = run_sweep(["check", "t6"], env)
+    check("check passes after set-policy", r.returncode == 0, r.stdout)
+    run_sweep(["finding", "t6", "--text", "x"], env)
+    r = run_sweep(["add", "t6", "--label", "no", "--from-finding", "f-0001"], env)
+    check("the new (locked) policy is enforced", r.returncode == 2, r.stderr)
+
+    # A tampered policy.json can be repaired only with a complete policy.
+    (d / "policy.json").write_text("{\"deviation\": \"autonomous\"}")
+    r = run_sweep(["check", "t6"], env)
+    check("check fails on the tampered policy.json", r.returncode == 1, r.stdout)
+    r = run_sweep(["set-policy", "t6", "--json", json.dumps({"deviation": "additive"})], env)
+    check("set-policy refuses a partial policy when the current one can't be trusted",
+          r.returncode == 2 and "complete policy" in r.stderr, r.stderr)
+    full = dict(pol, deviation="additive")
+    r = run_sweep(["set-policy", "t6", "--json", json.dumps(full)], env)
+    check("set-policy with a complete policy repairs it", r.returncode == 0, r.stderr)
+    r = run_sweep(["check", "t6"], env)
+    check("check passes after the repair (the remedy SKILL.md points to)", r.returncode == 0, r.stdout)
+
+    # Chain tampering is caught.
+    (d / "policy.v2.json").write_text("{}")
+    r = run_sweep(["check", "t6"], env)
+    check("check fails when a policy version file was edited",
+          r.returncode == 1 and "policy.v2.json" in r.stdout, r.stdout)
+    (d / "policy.v2.json").write_text((d / "policy.v1.json").read_text())
+
+
+def missing_sweep_exit_codes_case():
+    print("\n=== sweep_state — a missing sweep is exit 2 'no such sweep', never 5 'busy' (finding 7) ===")
+    ws = tmpdir("maestro-ws-")
+    env = base_env(sweeps_dir=ws / "sweeps")
+    env["MAESTRO_LOCK_TIMEOUT_S"] = "0.2"
+    (ws / "sweeps").mkdir()
+    newplan = ws / "p.md"
+    newplan.write_text("x\n")
+    cmds = [["next", "typo"], ["recover", "typo"], ["end-chunk", "typo"], ["done", "typo", "i-0001"],
+            ["fail", "typo", "i-0001", "--reason", "x"], ["finding", "typo", "--text", "x"],
+            ["add", "typo", "--label", "x", "--from-finding", "f-0001"],
+            ["amend-plan", "typo", "--file", str(newplan), "--from-finding", "f-0001"],
+            ["set-policy", "typo", "--json", "{}"], ["status", "typo"]]
+    for args in cmds:
+        r = run_sweep(args, env)
+        check(f"{args[0]} on a missing sweep exits 2 with 'no such sweep'",
+              r.returncode == 2 and "no such sweep" in r.stderr, f"rc={r.returncode} err={r.stderr}")
+    check("no sweep directory was created by a typo", not (ws / "sweeps" / "typo").exists())
 
 
 def main():
@@ -679,7 +1047,14 @@ def main():
     atomic_writes_case()
     anchor_case()
     anchor_owner_case()
+    owner_required_case()
     anchor_corrupt_pace_case()
+    reset_jitter_case()
+    usage_top_level_case()
+    stranded_running_case()
+    policy_tamper_case()
+    set_policy_case()
+    missing_sweep_exit_codes_case()
     print("\n  " + ("PASS" if not FAILURES else f"FAIL ({len(FAILURES)}): {FAILURES}"))
     return 1 if FAILURES else 0
 

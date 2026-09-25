@@ -45,6 +45,8 @@ def base_env(sweeps_dir, usage_file):
     env = dict(os.environ)
     env["MAESTRO_SWEEPS_DIR"] = str(sweeps_dir)
     env["MAESTRO_USAGE_FILE"] = str(usage_file)
+    # sweep_state.py takes the chunk owner from Claude Code's session id.
+    env["CLAUDE_CODE_SESSION_ID"] = "sess-integration"
     return env
 
 
@@ -219,6 +221,44 @@ def no_usage_file_at_all_case():
     check("probes when there is no usage.json yet", d is not None and d.get("action") == "probe", d)
 
 
+def frozen_usage_file_case():
+    print("\n=== integration: usage.json stops updating (headless / no statusLine) -> never continue ===")
+    sweeps_dir = tmpdir("maestro-sweeps-")
+    usage_file = tmpdir("maestro-usage-") / "usage.json"
+    env = base_env(sweeps_dir, usage_file)
+    sweep_dir = new_sweep(env, "frozen", n_items=12, policy={"chunk_size": 1})
+    # One reading written up front, then never again: every chunk's start
+    # and end records carry the same stale reading. The old burn estimate
+    # turned each into a zero-burn chunk and kept saying continue.
+    t0 = write_usage(usage_file, five_used=75, five_resets_delta=4 * 3600,
+                     seven_used=20, seven_resets_delta=5 * 86400)
+    actions = []
+    for _ in range(4):
+        run_one_chunk(env, "frozen", sweep_dir)
+        d = run_pace(sweep_dir, usage_file, now=time.time())
+        actions.append(d and d.get("action"))
+    check("no chunk after a frozen reading is waved through with continue",
+          "continue" not in actions, actions)
+    check("pace ends on a 'no usage signal' stop once 3 chunks ran unread",
+          d is not None and d.get("action") == "stop" and "no usage signal" in d.get("reason", ""), d)
+
+    # Same sweep shape, but the statusline keeps writing fresh readings: no
+    # blind stop, the burn is measured.
+    sweeps_dir2 = tmpdir("maestro-sweeps-")
+    usage_file2 = tmpdir("maestro-usage-") / "usage.json"
+    env2 = base_env(sweeps_dir2, usage_file2)
+    sweep_dir2 = new_sweep(env2, "fresh", n_items=12, policy={"chunk_size": 1})
+    used = 10.0
+    for _ in range(4):
+        run_one_chunk_with_burn(env2, "fresh", usage_file2, five_used=used, seven_used=20,
+                                five_resets_delta=4 * 3600, seven_resets_delta=5 * 86400,
+                                burn_five=0.5)
+        used += 0.5
+    d2 = run_pace(sweep_dir2, usage_file2, now=time.time())
+    check("fresh readings every chunk -> not a blind stop",
+          d2 is not None and "no usage signal" not in d2.get("reason", ""), d2)
+
+
 def main():
     no_history_case()
     one_chunk_case()
@@ -226,6 +266,7 @@ def main():
     weekly_ceiling_case()
     window_absent_case()
     no_usage_file_at_all_case()
+    frozen_usage_file_case()
 
     print()
     if FAILURES:
