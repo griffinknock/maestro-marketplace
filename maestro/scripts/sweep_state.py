@@ -640,7 +640,7 @@ def cmd_anchor(_args):
         total = len(index.get("items", []))
         lines.append(
             f"MAESTRO — active sweep {p.name}: {c['done']}/{total} done, "
-            f"{c['failed']} failed. Resume with /maestro:sweep resume {p.name}")
+            f"{c['failed']} failed. Resume with /loop /maestro:sweep resume {p.name}")
     if not lines:
         return 0
     print(json.dumps({

@@ -144,8 +144,8 @@ def anchor_match_case(text):
         check("skipped — no SKILL.md text", False)
         return
     state_src = read(STATE_PY)
-    m = re.search(r'Resume with (/maestro:sweep resume \{[^}]+\}|/maestro:sweep resume \S+)', state_src)
-    check("sweep_state.py anchor prints a 'Resume with /maestro:sweep resume ...' line",
+    m = re.search(r'Resume with (/loop /maestro:sweep resume \{[^}]+\}|/loop /maestro:sweep resume \S+)', state_src)
+    check("sweep_state.py anchor prints a 'Resume with /loop /maestro:sweep resume ...' line",
           m is not None, state_src)
     if not m:
         return
