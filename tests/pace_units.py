@@ -197,6 +197,32 @@ def both_windows_sleep_mismatched_wake_at_case():
     check("delay_s clamped to [60, 3600]", 60 <= d["delay_s"] <= 3600, d)
 
 
+def probe_beats_continue_five_hour_probes_case():
+    print("\n=== probe outranks continue: five_hour probes, seven_day comfortable -> probe wins ===")
+    now = 1000.0
+    snapshot = snap(
+        now,
+        five_hour=reading(95.0, now - 10),   # already reset, no chunk since -> probe
+        seven_day=reading(50.0, None),       # no reset horizon -> comfortable continue
+    )
+    d = decide(snapshot, now, DEFAULT_POLICY, [])
+    check("probe beats a comfortable continue on the other window", d["action"] == "probe", d)
+    check("window is five_hour (the one that's actually unknown)", d["window"] == "five_hour", d)
+
+
+def probe_beats_continue_seven_day_probes_case():
+    print("\n=== probe outranks continue, reversed: seven_day probes, five_hour comfortable -> probe wins ===")
+    now = 1000.0
+    snapshot = snap(
+        now,
+        five_hour=reading(50.0, None),        # no reset horizon -> comfortable continue
+        seven_day=reading(95.0, now - 10),    # already reset, no chunk since -> probe
+    )
+    d = decide(snapshot, now, DEFAULT_POLICY, [])
+    check("probe beats a comfortable continue regardless of window order", d["action"] == "probe", d)
+    check("window is seven_day (the one that's actually unknown)", d["window"] == "seven_day", d)
+
+
 def zero_delta_coarse_readings_case():
     print("\n=== zero-delta coarse readings -> treated as real (zero) burn ===")
     now = 1000.0
@@ -491,6 +517,8 @@ def main():
     most_restrictive_wins_case()
     both_windows_continue_case()
     both_windows_sleep_mismatched_wake_at_case()
+    probe_beats_continue_five_hour_probes_case()
+    probe_beats_continue_seven_day_probes_case()
     zero_delta_coarse_readings_case()
     stale_reading_projected_forward_case()
     resets_at_passed_no_chunks_since_probes_case()

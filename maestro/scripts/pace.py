@@ -103,7 +103,9 @@ For each window ("five_hour", "seven_day") present in `snapshot`:
 
 5. **Combine windows**: evaluate every present window independently, then
    take the most restrictive verdict: stop > sleep (longer sleep wins over a
-   shorter one) > {continue, probe}. `window` on the returned decision names
+   shorter one) > probe > continue — a probe on one window (its usage is
+   genuinely unknown, e.g. post-reset with no chunk run since) is never
+   masked by a comfortable continue on the other. `window` on the returned decision names
    which window drove the verdict.
 
 6. **Clamping & long waits.** Any sleep delay is clamped to [60, 3600]
@@ -315,13 +317,16 @@ def _burn_and_duration(pairs, window):
     return mean_burn, gate_burn, sum(durations) / len(durations), False
 
 
-_RANK = {"continue": 0, "probe": 0, "sleep": 1, "stop": 2}
+_RANK = {"continue": 0, "probe": 1, "sleep": 2, "stop": 3}
 
 
 def _more_restrictive(a, b):
     """Pick the more restrictive of two per-window verdicts: rank first
-    (stop > sleep > {continue, probe}), then — for two sleeps — the longer
-    delay_s. A continue/probe verdict carries no wake time at all, so
+    (stop > sleep > probe > continue), then — for two sleeps — the longer
+    delay_s. `probe` outranks a plain `continue` because a post-reset probe
+    means one window's usage is genuinely unknown — a comfortable reading
+    on the *other* window must never mask that and wave a chunk through
+    anyway. A continue/probe verdict carries no wake time at all, so
     ranking must settle ties before any wake-time-shaped field is touched;
     comparing delay_s (always an int, always present) rather than wake_at
     (often None) is what keeps this total and crash-free."""
