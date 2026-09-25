@@ -177,6 +177,64 @@ def crlf_case():
     shutil.rmtree(ws, ignore_errors=True)
 
 
+def uncommitted_file_delete_case():
+    print("\n=== uncommitted delete of the file itself fails ===")
+    ws = git_repo()
+    personal = write_lessons(ws / "lessons.md", [entry("L-001", "global")])
+    commit_all(ws, "add")
+    personal.unlink()
+    reasons = lc.check(personal, None, None)
+    check("uncommitted file delete detected",
+          any("append-only" in r and "missing from the working copy" in r for r in reasons),
+          "; ".join(reasons))
+    shutil.rmtree(ws, ignore_errors=True)
+
+
+def committed_file_delete_case():
+    print("\n=== committed delete of the file fails, names the commit ===")
+    ws = git_repo()
+    personal = write_lessons(ws / "lessons.md", [entry("L-001", "global")])
+    commit_all(ws, "add")
+    subprocess.run(["git", "-C", str(ws), "rm", "-q", "lessons.md"], check=True)
+    commit_all(ws, "remove lessons file")
+    reasons = lc.check(personal, None, None)
+    check("committed file delete names the deleting commit",
+          any("append-only" in r and "deleted" in r for r in reasons), "; ".join(reasons))
+    shutil.rmtree(ws, ignore_errors=True)
+
+
+def delete_then_recreate_case():
+    print("\n=== delete-then-recreate with fewer entries fails ===")
+    ws = git_repo()
+    personal = write_lessons(ws / "lessons.md", [
+        entry("L-001", "global"), entry("L-002", "global", accepted="2026-10-03"),
+    ])
+    commit_all(ws, "add")
+    subprocess.run(["git", "-C", str(ws), "rm", "-q", "lessons.md"], check=True)
+    commit_all(ws, "remove")
+    write_lessons(personal, [entry("L-003", "global", accepted="2026-10-04")])
+    commit_all(ws, "recreate with fewer entries")
+    reasons = lc.check(personal, None, None)
+    check("delete-then-recreate detected",
+          any("later recreated" in r for r in reasons), "; ".join(reasons))
+    shutil.rmtree(ws, ignore_errors=True)
+
+
+def git_mv_away_new_file_case():
+    print("\n=== git mv away + new file at old path fails ===")
+    ws = git_repo()
+    personal = write_lessons(ws / "lessons.md", [entry("L-001", "global")])
+    commit_all(ws, "add")
+    subprocess.run(["git", "-C", str(ws), "mv", "lessons.md", "lessons-old.md"], check=True)
+    commit_all(ws, "rename away")
+    write_lessons(personal, [entry("L-002", "global", accepted="2026-10-03")])
+    commit_all(ws, "new unrelated file at old path")
+    reasons = lc.check(personal, None, None)
+    check("rename-away then new file at old path detected",
+          any("append-only" in r for r in reasons), "; ".join(reasons))
+    shutil.rmtree(ws, ignore_errors=True)
+
+
 def committed_edit_case():
     print("\n=== committed edit fails via history walk, names the commit ===")
     ws = git_repo()
@@ -355,6 +413,10 @@ def main():
     deletion_case()
     reorder_case()
     crlf_case()
+    uncommitted_file_delete_case()
+    committed_file_delete_case()
+    delete_then_recreate_case()
+    git_mv_away_new_file_case()
     committed_edit_case()
     append_passes_case()
     untracked_file_case()

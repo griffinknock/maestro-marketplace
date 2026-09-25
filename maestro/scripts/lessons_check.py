@@ -284,48 +284,87 @@ def _git_toplevel(cwd):
     return Path(r.stdout.strip())
 
 
+def _existing_ancestor(path):
+    """Nearest existing directory above `path`, for use as a `git -C`
+    argument even when `path` itself does not (or no longer) exist on disk.
+    `git -C` needs a directory, so this always starts from the parent —
+    never returns `path` itself, even if `path` happens to be a directory
+    that exists."""
+    p = Path(os.path.realpath(str(path))).parent
+    while not p.exists():
+        parent = p.parent
+        if parent == p:
+            return p  # filesystem root; give up gracefully
+        p = parent
+    return p
+
+
 def _check_append_only(path, fail):
-    """A tracked lesson file's committed history, plus its current working
-    content, must form a strictly-increasing chain of byte prefixes. Any
-    edit, delete, reorder or whitespace/line-ending change of existing bytes
-    breaks the chain; appending never does. Untracked/non-git files are out
-    of scope for this check (parse/cap/budget checks still apply to them).
+    """A lesson file's committed history, plus its current working content,
+    must form a strictly-increasing chain of byte prefixes. Any edit,
+    delete, reorder, or whitespace/line-ending change of existing bytes
+    breaks the chain; appending never does. Deleting the file — from the
+    working tree, from HEAD, or anywhere in the middle of its history (even
+    if something is later recreated at the same path) — is exactly the kind
+    of "erase what was accepted" move this check exists to catch, so it is
+    always a break, never treated as a fresh start.
+
+    A path with no git history at all (never committed, nothing to lose) is
+    out of scope for this check — parse/cap/budget checks still apply to it.
     """
-    if not path.exists():
-        return
-    top = _git_toplevel(path.parent)
+    top = _git_toplevel(_existing_ancestor(path))
     if top is None:
-        return
+        return  # never touched a git repo
+    abs_path = Path(os.path.realpath(str(path)))
     try:
-        relpath = path.resolve().relative_to(top.resolve()).as_posix()
+        relpath = abs_path.relative_to(top).as_posix()
     except ValueError:
         return
-
-    tracked = subprocess.run(
-        ["git", "-C", str(top), "ls-files", "--error-unmatch", relpath],
-        capture_output=True, text=True)
-    if tracked.returncode != 0:
-        return  # untracked
 
     log = subprocess.run(
         ["git", "-C", str(top), "log", "--format=%H", "--reverse", "--", relpath],
         capture_output=True, text=True)
     hashes = [h for h in log.stdout.split("\n") if h]
+    if not hashes:
+        return  # no history for this path — untracked/never existed
 
-    sequence = []  # (label, bytes)
+    contents = []  # (label, bytes | None); None means absent at that step
     for h in hashes:
         show = subprocess.run(["git", "-C", str(top), "show", f"{h}:{relpath}"],
                               capture_output=True)
-        if show.returncode == 0:
-            sequence.append((h, show.stdout))
+        contents.append((h, show.stdout if show.returncode == 0 else None))
 
     try:
         working = path.read_bytes()
     except OSError:
-        working = b""
-    sequence.append(("WORKING", working))
+        working = None
+    contents.append(("WORKING", working))
 
-    for (h_prev, c_prev), (h_next, c_next) in zip(sequence, sequence[1:]):
+    # Currently missing (working tree or HEAD) despite having history.
+    n = len(contents)
+    idx = n - 1
+    while idx >= 0 and contents[idx][1] is None:
+        idx -= 1
+    trailing_start = idx + 1
+    if trailing_start < n:
+        label0 = contents[trailing_start][0]
+        if label0 == "WORKING":
+            fail(f"append-only violation: {relpath} has git history but is "
+                 "missing from the working copy")
+        else:
+            fail(f"append-only violation: commit {label0[:7]} deleted "
+                 f"{relpath} and it was never recreated")
+        return
+
+    # Deleted, then recreated, somewhere in the middle of history — a break
+    # regardless of whether the recreated bytes happen to differ.
+    for h, c in contents[:-1]:
+        if c is None:
+            fail(f"append-only violation: commit {h[:7]} deleted {relpath}; "
+                 "it was later recreated, which is not a pure append")
+            return
+
+    for (h_prev, c_prev), (h_next, c_next) in zip(contents, contents[1:]):
         if not c_next.startswith(c_prev):
             if h_next == "WORKING":
                 fail(f"append-only violation: uncommitted edit to {relpath} "
