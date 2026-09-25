@@ -61,8 +61,15 @@ import sys
 import time
 from pathlib import Path
 
+try:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import lessons as _lessons
+except Exception:
+    _lessons = None
+
 DEBUG = os.environ.get("MAESTRO_DEBUG") == "1"
 OFF = os.environ.get("MAESTRO_REORCH") == "0"
+LESSONS_ON = os.environ.get("MAESTRO_LESSONS", "1") != "0"
 # Default OFF. Every verdict this ever produced in the field was confidently
 # wrong and argued for downgrading a tier that was carrying real difficulty.
 # The attribution bug behind that is fixed below, but a model recommendation
@@ -310,6 +317,39 @@ def check(state, batch, settled, now):
     return f, suspicious
 
 
+def _lesson_fingerprint(fp, is_report):
+    """`report:<id>:missing` -> `delivery:missing:<id>` for the lessons queue.
+
+    The reorch-internal fingerprint is keyed for `said`-dedupe within one
+    session; the lessons store dedupes across sessions on (session,
+    fingerprint), so a delivery finding gets its own stable shape instead.
+    """
+    if is_report and fp.startswith("report:"):
+        parts = fp.split(":", 2)
+        if len(parts) == 3:
+            _, aid, kind = parts
+            return f"delivery:{kind}:{aid}"
+    return fp
+
+
+def capture_lessons(payload, fresh):
+    """Feed every NEW finding to the lessons candidate queue.
+
+    Best-effort and silent: a capture failure must never change what this
+    script prints or does, so every call is individually guarded.
+    """
+    if _lessons is None or not LESSONS_ON:
+        return
+    for fp, text, is_report in fresh:
+        try:
+            _lessons.capture_finding(
+                payload.get("session_id"), payload.get("cwd"),
+                _lesson_fingerprint(fp, is_report), text,
+                tool_use_id=payload.get("tool_use_id"))
+        except Exception:
+            pass
+
+
 def spawn_llm(d, state, live, now):
     """Detached second opinion, judged on the dispatch prompt and attributed.
 
@@ -470,6 +510,8 @@ def main():
                 continue
             seen.add(fp)
             fresh.append((fp, text, fp.startswith("report:")))
+
+        capture_lessons(payload, fresh)
 
         if fresh or verdict:
             _, live, starting = census(state, now)
