@@ -11,18 +11,22 @@ this repo's `.claude/maestro/` gitignore):
 
   plan.md            frozen at `new`; never rewritten by any command
   plan.v2.md, ...    plan amendments (adaptive/autonomous only)
-  index.json         slug, created, plan_sha256, plan_versions, items[]
-  policy.json        ceilings, deviation, chunk_size, margin_s, max_attempts
+  index.json         slug, created, plan_sha256, policy_sha256, items_sha256,
+                      original_count, plan_versions, items[]
+  policy.json        ceilings, deviation, chunk_size, margin_s, max_attempts,
+                      allow_blind, blind_gap_s
   findings.jsonl     append-only — one line per `finding`
   amendments.jsonl   append-only — one line per `add`/`amend-plan`
-  pace.jsonl         two lines per chunk: start, then end
+  pace.jsonl         two lines per chunk: start (carries "owner"), then end
 
 `pace.py` (built in parallel) reads these files; the schemas here are the
 contract with it — see each write site below.
 
 Every write is atomic (tmp file + os.replace, tmp always cleaned up) and
 every command that mutates a sweep's files takes a `.sweep.lock` directory
-lock, matching the proper-lockfile-compatible pattern in `ledger.py`.
+lock, matching the proper-lockfile-compatible pattern in `ledger.py`. On
+sustained contention the lock now raises rather than silently proceeding
+unlocked — see `Lock`/`LockTimeout`.
 
 Usage: see `build_parser()`. `anchor` is special — it is the SessionStart
 hook body, reads a hook payload on stdin, and never raises or exits nonzero.
@@ -34,6 +38,7 @@ import os
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 DEBUG = os.environ.get("MAESTRO_DEBUG") == "1"
@@ -44,25 +49,43 @@ DEFAULT_POLICY = {
     "chunk_size": 5,
     "margin_s": 120,
     "max_attempts": 2,
+    "allow_blind": False,
+    "blind_gap_s": 900,
 }
 STATUSES = ("pending", "running", "done", "failed")
-LOCK_STALE = 10.0
+DEVIATIONS = ("locked", "additive", "adaptive", "autonomous")
+LOCK_STALE = float(os.environ.get("MAESTRO_LOCK_STALE_S", "10.0"))
+LOCK_TIMEOUT_S = float(os.environ.get("MAESTRO_LOCK_TIMEOUT_S", "4.0"))
+MAX_RECOVERIES = 3
 USAGE_FILE_DEFAULT = str(Path.home() / ".claude" / "maestro" / "usage.json")
 
 
 # ── locking + atomic writes ──────────────────────────────────────────────
 
+class LockTimeout(Exception):
+    """Raised when a `.sweep.lock` could not be acquired before the
+    contention timeout. Callers must never proceed unlocked — `main()`
+    catches this once, for every command, and exits 5."""
+
+
 class Lock:
     """mkdir-to-acquire / rmdir-to-release — the same pattern as ledger.py's
     `_Lock`, so a sweep directory and a ledger session dir can never deadlock
-    each other by disagreeing on a convention."""
+    each other by disagreeing on a convention.
+
+    On sustained contention (`LOCK_TIMEOUT_S`, default 4s) this raises
+    `LockTimeout` instead of returning unlocked — a prior version fell
+    through silently after its retry budget ran out, letting two callers
+    mutate the same sweep at once.
+    """
 
     def __init__(self, target):
         self.p = Path(str(target) + ".lock")
         self.held = False
 
     def __enter__(self):
-        for _ in range(200):
+        deadline = time.time() + LOCK_TIMEOUT_S
+        while time.time() < deadline:
             try:
                 self.p.mkdir()
                 self.held = True
@@ -77,7 +100,7 @@ class Lock:
                 time.sleep(0.02)
             except OSError:
                 break
-        return self
+        raise LockTimeout(f"refused: could not acquire lock (busy): {self.p}")
 
     def __exit__(self, *_):
         if self.held:
@@ -157,6 +180,14 @@ def sha256_of(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def items_hash(items):
+    """sha256 over the ordered (id, label) pairs — the check gate's ground
+    truth for "were the items edited outside add/amend": a relabel, a
+    removal, or a reorder all change this even when ids stay gap-free."""
+    pairs = [[it.get("id"), it.get("label")] for it in items]
+    return sha256_of(json.dumps(pairs))
+
+
 # ── locating a sweep ─────────────────────────────────────────────────────
 
 def git_toplevel(cwd):
@@ -184,20 +215,93 @@ def sweep_dir(slug, cwd=None):
 # ── usage (written by statusline.py) ─────────────────────────────────────
 
 def usage_snapshot():
-    """U, as defined in the pace.jsonl contract — read fresh, every call."""
+    """U, as defined in the pace.jsonl contract — read fresh, every call.
+
+    usage.json (written by statusline.py) now carries a `captured_at` per
+    window rather than one top-level timestamp (C1); this keeps the returned
+    shape — the contract pace.py reads out of pace.jsonl — unchanged by
+    folding the two window timestamps down to their max.
+    """
     path = Path(os.environ.get("MAESTRO_USAGE_FILE") or USAGE_FILE_DEFAULT)
     d = read_json(path, {}) or {}
     five = d.get("five_hour") if isinstance(d.get("five_hour"), dict) else {}
     seven = d.get("seven_day") if isinstance(d.get("seven_day"), dict) else {}
+    captured = [w.get("captured_at") for w in (five, seven)
+                if isinstance(w, dict) and w.get("captured_at") is not None]
     return {
         "five_hour": five.get("used_percentage"),
         "seven_day": seven.get("used_percentage"),
-        "captured_at": d.get("captured_at"),
+        "captured_at": max(captured) if captured else d.get("captured_at"),
         "resets": {
             "five_hour": five.get("resets_at"),
             "seven_day": seven.get("resets_at"),
         },
     }
+
+
+# ── policy validation (C4) ────────────────────────────────────────────────
+
+def validate_policy(policy):
+    """Returns None if `policy` is a fully-shaped, valid policy; otherwise a
+    short human-readable reason. Every field is required — callers that want
+    defaults must merge them in (`merge_policy(DEFAULT_POLICY, ...)`) before
+    validating, e.g. `new`."""
+    if not isinstance(policy, dict):
+        return "policy is not a JSON object"
+
+    ceilings = policy.get("ceilings")
+    if not isinstance(ceilings, dict):
+        return "ceilings must be an object"
+    for k in ("five_hour", "seven_day"):
+        v = ceilings.get(k)
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not (0 < v <= 100):
+            return f"ceilings.{k} must be a number in (0, 100]"
+
+    if policy.get("deviation") not in DEVIATIONS:
+        return "deviation must be exactly one of " + "|".join(DEVIATIONS)
+
+    chunk_size = policy.get("chunk_size")
+    if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size < 1:
+        return "chunk_size must be an integer >= 1"
+
+    margin_s = policy.get("margin_s")
+    if isinstance(margin_s, bool) or not isinstance(margin_s, int) or margin_s < 0:
+        return "margin_s must be an integer >= 0"
+
+    max_attempts = policy.get("max_attempts")
+    if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
+        return "max_attempts must be an integer >= 1"
+
+    allow_blind = policy.get("allow_blind")
+    if not isinstance(allow_blind, bool):
+        return "allow_blind must be a boolean"
+
+    blind_gap_s = policy.get("blind_gap_s")
+    if isinstance(blind_gap_s, bool) or not isinstance(blind_gap_s, int) or blind_gap_s < 60:
+        return "blind_gap_s must be an integer >= 60"
+
+    return None
+
+
+def load_policy(d):
+    """Read + validate this sweep's policy.json. Returns (policy, None) on
+    success or (None, reason) on failure. Missing/corrupt/invalid policy.json
+    is always an error here — an existing sweep never silently falls back to
+    DEFAULT_POLICY (a deleted or edited policy.json must not quietly turn a
+    locked sweep additive)."""
+    path = d / "policy.json"
+    try:
+        text = path.read_text()
+    except OSError:
+        return None, "policy.json is missing"
+    try:
+        policy = json.loads(text)
+    except json.JSONDecodeError:
+        return None, "policy.json is not valid JSON"
+    err = validate_policy(policy)
+    if err:
+        return None, f"invalid policy: {err}"
+    return policy, None
 
 
 # ── small helpers shared across commands ─────────────────────────────────
@@ -241,17 +345,26 @@ def chunk_count(pace):
     return len({r.get("chunk") for r in pace if r.get("event") == "start"})
 
 
-def last_open_chunk(pace):
-    """The newest chunk with a `start` and no matching `end`, or None."""
-    open_chunks = {}
+def open_chunks(pace):
+    """Every chunk with a `start` record and no matching `end`, as the start
+    record itself (carries chunk/owner/at/items) — one per still-open chunk,
+    not just the newest (C3: `recover`/`end-chunk` must be able to name and
+    act on the specific owner's chunk, not "the last open one")."""
+    starts = {}
+    ended = set()
     for r in pace:
         c = r.get("chunk")
         if r.get("event") == "start":
-            open_chunks[c] = True
+            starts[c] = r
         elif r.get("event") == "end":
-            open_chunks[c] = False
-    live = [c for c, is_open in open_chunks.items() if is_open]
-    return max(live) if live else None
+            ended.add(c)
+    return [r for c, r in starts.items() if c not in ended]
+
+
+def last_open_chunk(pace):
+    """The newest chunk with a `start` and no matching `end`, or None."""
+    chunks = open_chunks(pace)
+    return max((r.get("chunk") for r in chunks), default=None)
 
 
 def next_item_id(index):
@@ -283,20 +396,31 @@ def cmd_new(args):
         except json.JSONDecodeError:
             print("invalid --policy JSON", file=sys.stderr)
             return 2
+        if not isinstance(override, dict):
+            print("invalid --policy JSON: must be an object", file=sys.stderr)
+            return 2
         policy = merge_policy(policy, override)
+    err = validate_policy(policy)
+    if err:
+        print(f"invalid policy: {err}", file=sys.stderr)
+        return 2
 
     d.mkdir(parents=True, exist_ok=True)
     with Lock(d / ".sweep"):
         atomic_write_text(d / "plan.md", plan_text)
+        write_json(d / "policy.json", policy)
+        policy_sha256 = sha256_of((d / "policy.json").read_text())
         now = time.time()
         items = [{"id": f"i-{i + 1:04d}", "label": lbl, "status": "pending",
-                  "attempts": 0, "from_finding": None, "note": None}
+                  "attempts": 0, "recoveries": 0, "from_finding": None, "note": None}
                  for i, lbl in enumerate(labels)]
         index = {"slug": args.slug, "created": now,
                  "plan_sha256": sha256_of(plan_text),
+                 "policy_sha256": policy_sha256,
+                 "items_sha256": items_hash(items),
+                 "original_count": len(items),
                  "plan_versions": [], "items": items}
         write_json(d / "index.json", index)
-        write_json(d / "policy.json", policy)
         for fname in ("findings.jsonl", "amendments.jsonl", "pace.jsonl"):
             fp = d / fname
             if not fp.exists():
@@ -338,12 +462,16 @@ def cmd_list(args):
 
 def cmd_next(args):
     d = sweep_dir(args.slug)
+    owner = args.owner or "unknown"
     with Lock(d / ".sweep"):
         index = read_json(d / "index.json")
         if index is None:
             print(f"no such sweep: {args.slug}", file=sys.stderr)
             return 2
-        policy = read_json(d / "policy.json", DEFAULT_POLICY)
+        policy, err = load_policy(d)
+        if err:
+            print(f"refused: {err}", file=sys.stderr)
+            return 2
         n = args.n if args.n is not None else policy.get("chunk_size", DEFAULT_POLICY["chunk_size"])
         claimed = []
         for it in index["items"]:
@@ -352,6 +480,11 @@ def cmd_next(args):
             if it.get("status") == "pending":
                 it["status"] = "running"
                 claimed.append(it)
+        if not claimed:
+            # Nothing pending: write nothing (an empty start record here
+            # would later make `check` fail forever on a finished sweep).
+            print(json.dumps([]))
+            return 3
         write_json(d / "index.json", index)
         pace = read_jsonl(d / "pace.jsonl")
         chunk_no = max([r.get("chunk", 0) for r in pace if r.get("event") == "start"],
@@ -359,6 +492,7 @@ def cmd_next(args):
         append_jsonl(d / "pace.jsonl", {
             "chunk": chunk_no, "event": "start", "at": time.time(),
             "items": [it["id"] for it in claimed], "usage": usage_snapshot(),
+            "owner": owner,
         })
     print(json.dumps([{"id": it["id"], "label": it["label"]} for it in claimed]))
     return 0
@@ -393,7 +527,10 @@ def cmd_fail(args):
         if it is None:
             print(f"no such item: {args.item}", file=sys.stderr)
             return 2
-        policy = read_json(d / "policy.json", DEFAULT_POLICY)
+        policy, err = load_policy(d)
+        if err:
+            print(f"refused: {err}", file=sys.stderr)
+            return 2
         max_attempts = policy.get("max_attempts", DEFAULT_POLICY["max_attempts"])
         it["attempts"] = int(it.get("attempts") or 0) + 1
         it["note"] = args.reason
@@ -423,21 +560,35 @@ def cmd_add(args):
         if index is None:
             print(f"no such sweep: {args.slug}", file=sys.stderr)
             return 2
-        policy = read_json(d / "policy.json", DEFAULT_POLICY)
+        policy, err = load_policy(d)
+        if err:
+            print(f"refused: {err}", file=sys.stderr)
+            return 2
         deviation = policy.get("deviation")
         if deviation == "locked":
             print("refused: deviation policy is locked", file=sys.stderr)
             return 2
+        findings = read_jsonl(d / "findings.jsonl")
+        if not any(f.get("id") == args.from_finding for f in findings):
+            print(f"refused: no such finding: {args.from_finding}", file=sys.stderr)
+            return 2
         new_id = next_item_id(index)
-        index["items"].append({
-            "id": new_id, "label": args.label, "status": "pending",
-            "attempts": 0, "from_finding": args.from_finding, "note": None,
-        })
-        write_json(d / "index.json", index)
+
+        # Write the amendment BEFORE the index: a crash between the two used
+        # to leave an item in index.json with no amendment (a "ghost" that
+        # `check` couldn't see); an amendment with no matching item is
+        # already something `check` catches, so ordering it first means any
+        # half-finished `add` is visible instead of invisible.
         append_jsonl(d / "amendments.jsonl", {
             "at": time.time(), "op": "add_item", "item": new_id,
             "from_finding": args.from_finding, "policy": deviation,
         })
+        index["items"].append({
+            "id": new_id, "label": args.label, "status": "pending",
+            "attempts": 0, "recoveries": 0, "from_finding": args.from_finding, "note": None,
+        })
+        index["items_sha256"] = items_hash(index["items"])
+        write_json(d / "index.json", index)
     print(new_id)
     return 0
 
@@ -449,7 +600,10 @@ def cmd_amend_plan(args):
         if index is None:
             print(f"no such sweep: {args.slug}", file=sys.stderr)
             return 2
-        policy = read_json(d / "policy.json", DEFAULT_POLICY)
+        policy, err = load_policy(d)
+        if err:
+            print(f"refused: {err}", file=sys.stderr)
+            return 2
         deviation = policy.get("deviation")
         if deviation not in ("adaptive", "autonomous"):
             print(f"refused: amend-plan requires adaptive or autonomous deviation "
@@ -480,12 +634,14 @@ def cmd_amend_plan(args):
 
 def cmd_end_chunk(args):
     d = sweep_dir(args.slug)
+    owner = args.owner or "unknown"
     with Lock(d / ".sweep"):
         pace = read_jsonl(d / "pace.jsonl")
-        chunk = last_open_chunk(pace)
-        if chunk is None:
+        mine = [c for c in open_chunks(pace) if (c.get("owner") or "unknown") == owner]
+        if not mine:
             print("no open chunk", file=sys.stderr)
             return 2
+        chunk = max(c.get("chunk") for c in mine)
         append_jsonl(d / "pace.jsonl", {
             "chunk": chunk, "event": "end", "at": time.time(),
             "usage": usage_snapshot(), "interrupted": False,
@@ -494,28 +650,54 @@ def cmd_end_chunk(args):
 
 
 def cmd_recover(args):
-    """After a crash: `running` -> `pending` (attempts+1, or `failed` past the
-    ceiling), and close any open chunk with an `interrupted: true` end line."""
+    """After a crash: `running` -> `pending` (recoveries+1, never spending an
+    attempt — `fail()` alone spends attempts), or `failed` past
+    MAX_RECOVERIES. Any chunk still open closes with an `interrupted: true`
+    end line — unless it's owned by someone else and still fresh (C3): a
+    second session's recover must not reclaim items another session's chunk
+    still has in flight."""
     d = sweep_dir(args.slug)
+    owner = args.owner or "unknown"
+    stale_after = args.stale_after
     with Lock(d / ".sweep"):
         index = read_json(d / "index.json")
         if index is None:
             print(f"no such sweep: {args.slug}", file=sys.stderr)
             return 2
-        policy = read_json(d / "policy.json", DEFAULT_POLICY)
-        max_attempts = policy.get("max_attempts", DEFAULT_POLICY["max_attempts"])
+
+        pace = read_jsonl(d / "pace.jsonl")
+        chunks = open_chunks(pace)
+        now = time.time()
+        for ch in chunks:
+            ch_owner = ch.get("owner") or "unknown"
+            if ch_owner == owner:
+                continue
+            age = now - (ch.get("at") or 0)
+            if age < stale_after:
+                ts = datetime.fromtimestamp(ch.get("at") or 0, tz=timezone.utc).isoformat()
+                print(f"busy: chunk {ch.get('chunk')} owned by {ch_owner} since {ts}",
+                      file=sys.stderr)
+                return 4
+
+        reclaim_ids = set()
+        for ch in chunks:
+            reclaim_ids.update(ch.get("items") or [])
+
         recovered = []
         for it in index["items"]:
-            if it.get("status") == "running":
-                it["attempts"] = int(it.get("attempts") or 0) + 1
-                it["status"] = "pending" if it["attempts"] < max_attempts else "failed"
+            if it.get("status") == "running" and it.get("id") in reclaim_ids:
+                it["recoveries"] = int(it.get("recoveries") or 0) + 1
+                if it["recoveries"] >= MAX_RECOVERIES:
+                    it["status"] = "failed"
+                    it["note"] = f"failed after {it['recoveries']} recoveries"
+                else:
+                    it["status"] = "pending"
                 recovered.append(it["id"])
         write_json(d / "index.json", index)
-        pace = read_jsonl(d / "pace.jsonl")
-        chunk = last_open_chunk(pace)
-        if chunk is not None:
+
+        for ch in chunks:
             append_jsonl(d / "pace.jsonl", {
-                "chunk": chunk, "event": "end", "at": time.time(),
+                "chunk": ch.get("chunk"), "event": "end", "at": time.time(),
                 "usage": usage_snapshot(), "interrupted": True,
             })
     print(json.dumps(recovered))
@@ -561,6 +743,19 @@ def cmd_check(args):
     except OSError:
         reasons.append("plan.md is missing")
 
+    try:
+        policy_text = (d / "policy.json").read_text()
+        if sha256_of(policy_text) != index.get("policy_sha256"):
+            reasons.append("policy.json does not match policy_sha256 — policy.json was edited")
+        else:
+            err = validate_policy(json.loads(policy_text)) if policy_text.strip() else "empty"
+            if err:
+                reasons.append(f"policy.json is invalid: {err}")
+    except OSError:
+        reasons.append("policy.json is missing")
+    except json.JSONDecodeError:
+        reasons.append("policy.json is not valid JSON")
+
     for v in index.get("plan_versions", []):
         fname = v.get("file", "")
         try:
@@ -570,12 +765,22 @@ def cmd_check(args):
         except OSError:
             reasons.append(f"plan version file is missing: {fname}")
 
-    ids = [it.get("id") for it in index.get("items", [])]
+    items = index.get("items", [])
+    ids = [it.get("id") for it in items]
     dupes = sorted({i for i in ids if ids.count(i) > 1})
     if dupes:
         reasons.append(f"duplicate item id(s): {dupes}")
 
-    for it in index.get("items", []):
+    n = len(ids)
+    expected_ids = {f"i-{i:04d}" for i in range(1, n + 1)}
+    if set(ids) != expected_ids:
+        reasons.append(f"item ids are not gap-free i-0001..i-{n:04d}: {sorted(ids)}")
+
+    if index.get("items_sha256") != items_hash(items):
+        reasons.append("items_sha256 mismatch — an item was added, removed, or "
+                        "relabelled outside add/amend-plan")
+
+    for it in items:
         if it.get("status") not in STATUSES:
             reasons.append(f"invalid status on {it.get('id')}: {it.get('status')!r}")
 
@@ -588,6 +793,12 @@ def cmd_check(args):
     missing = sorted(added_ids - set(ids))
     if missing:
         reasons.append(f"item(s) added by an amendment are missing from index.json: {missing}")
+
+    original_count = index.get("original_count", 0)
+    extra_ids = set(ids[original_count:])
+    unlogged = sorted(extra_ids - added_ids)
+    if unlogged:
+        reasons.append(f"item(s) beyond the original count have no add_item amendment: {unlogged}")
 
     for fname in ("findings.jsonl",):
         try:
@@ -674,6 +885,7 @@ def build_parser():
     sp = sub.add_parser("next")
     sp.add_argument("slug")
     sp.add_argument("--n", type=int, default=None)
+    sp.add_argument("--owner")
 
     sp = sub.add_parser("done")
     sp.add_argument("slug")
@@ -702,9 +914,12 @@ def build_parser():
 
     sp = sub.add_parser("end-chunk")
     sp.add_argument("slug")
+    sp.add_argument("--owner")
 
     sp = sub.add_parser("recover")
     sp.add_argument("slug")
+    sp.add_argument("--owner")
+    sp.add_argument("--stale-after", dest="stale_after", type=float, default=7200.0)
 
     sp = sub.add_parser("check")
     sp.add_argument("slug")
@@ -736,7 +951,11 @@ def main():
             if DEBUG:
                 print(f"sweep_state anchor: {e}", file=sys.stderr)
             return 0
-    return fn(args)
+    try:
+        return fn(args)
+    except LockTimeout as e:
+        print(str(e), file=sys.stderr)
+        return 5
 
 
 if __name__ == "__main__":

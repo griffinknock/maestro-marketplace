@@ -74,8 +74,12 @@ def usage_snapshot_case():
     check("statusline exits 0 with rate_limits present", r.returncode == 0)
     check("usage file written when rate_limits present", usage_file.is_file())
     rec = json.loads(usage_file.read_text())
-    check("five_hour persisted", rec.get("five_hour") == {"used_percentage": 42.5, "resets_at": 1999999999})
-    check("seven_day persisted", rec.get("seven_day") == {"used_percentage": 10.0, "resets_at": 2000000000})
+    check("five_hour persisted", rec.get("five_hour", {}).get("used_percentage") == 42.5
+          and rec["five_hour"].get("resets_at") == 1999999999
+          and "captured_at" in rec["five_hour"], rec)
+    check("seven_day persisted", rec.get("seven_day", {}).get("used_percentage") == 10.0
+          and rec["seven_day"].get("resets_at") == 2000000000
+          and "captured_at" in rec["seven_day"], rec)
     check("session_id persisted", rec.get("session_id") == "s1")
 
     mtime_before = usage_file.stat().st_mtime
@@ -90,6 +94,75 @@ def usage_snapshot_case():
     run_statusline(changed, env)
     rec2 = json.loads(usage_file.read_text())
     check("changed value still gets written", rec2["five_hour"]["used_percentage"] == 55.0)
+
+
+def usage_merge_case():
+    print("\n=== statusline — C1 cross-session merge contract ===")
+    usage_file = tmpdir("maestro-usage-") / "usage.json"
+    env = base_env(usage_file=usage_file)
+
+    def payload_for(five_pct=None, five_resets=None, seven_pct=None, seven_resets=None, sid="s"):
+        p = {"session_id": sid, "model": {"display_name": "Sonnet"},
+             "context_window": {"used_percentage": 10}, "rate_limits": {}}
+        if five_pct is not None:
+            p["rate_limits"]["five_hour"] = {"used_percentage": five_pct, "resets_at": five_resets}
+        if seven_pct is not None:
+            p["rate_limits"]["seven_day"] = {"used_percentage": seven_pct, "resets_at": seven_resets}
+        return p
+
+    # Repro: session A at 79%, then idle session B re-sends a stale 30% for
+    # the SAME window (same resets_at) -> B's newer wall-clock write must
+    # not regress the persisted value.
+    run_statusline(payload_for(five_pct=79, five_resets=5000, sid="A"), env)
+    time.sleep(0.05)
+    run_statusline(payload_for(five_pct=30, five_resets=5000, sid="B"), env)
+    rec = json.loads(usage_file.read_text())
+    check("idle session's stale lower reading does not regress the window",
+          rec["five_hour"]["used_percentage"] == 79, rec)
+
+    # A payload carrying only seven_day must not remove/null five_hour.
+    time.sleep(0.05)
+    run_statusline(payload_for(seven_pct=12, seven_resets=9000, sid="C"), env)
+    rec2 = json.loads(usage_file.read_text())
+    check("seven_day-only payload keeps five_hour intact",
+          rec2.get("five_hour", {}).get("used_percentage") == 79, rec2)
+    check("seven_day-only payload persists seven_day",
+          rec2.get("seven_day", {}).get("used_percentage") == 12, rec2)
+
+    # A newer resets_at replaces outright, even with a lower percentage.
+    time.sleep(0.05)
+    run_statusline(payload_for(five_pct=2, five_resets=6000, sid="D"), env)
+    rec3 = json.loads(usage_file.read_text())
+    check("newer resets_at replaces the window outright",
+          rec3["five_hour"]["used_percentage"] == 2 and rec3["five_hour"]["resets_at"] == 6000, rec3)
+
+    # NaN used_percentage is ignored, not merged in.
+    usage_file2 = tmpdir("maestro-usage-") / "usage.json"
+    env2 = base_env(usage_file=usage_file2)
+    good = payload_for(five_pct=44, five_resets=7000, sid="E")
+    run_statusline(good, env2)
+    nan_payload = json.dumps(good).replace("44", "NaN")
+    r = subprocess.run([sys.executable, str(STATUSLINE)], input=nan_payload,
+                       capture_output=True, text=True, env=env2)
+    check("NaN payload doesn't crash statusline", r.returncode == 0, r.stderr)
+    rec4 = json.loads(usage_file2.read_text())
+    check("NaN used_percentage is ignored, prior value kept",
+          rec4["five_hour"]["used_percentage"] == 44, rec4)
+
+
+def tmp_cleanup_on_replace_failure_case():
+    print("\n=== statusline — tmp file cleaned up when os.replace fails ===")
+    usage_dir = tmpdir("maestro-usage-")
+    usage_file = usage_dir / "usage.json"
+    usage_file.mkdir()  # a directory in place of the file -> os.replace onto it fails
+    env = base_env(usage_file=usage_file)
+    payload = {"session_id": "s", "model": {"display_name": "Sonnet"},
+               "context_window": {"used_percentage": 10},
+               "rate_limits": {"five_hour": {"used_percentage": 50, "resets_at": 1000}}}
+    r = run_statusline(payload, env)
+    check("statusline exits 0 even when the write fails", r.returncode == 0, r.stderr)
+    leftovers = glob.glob(str(usage_dir / "*.tmp*"))
+    check("no leftover tmp file after a failed os.replace", leftovers == [], leftovers)
 
 
 def stdout_unchanged_case():
@@ -239,14 +312,94 @@ def recover_case():
     recovered = json.loads(r.stdout)
     check("recover reports both items", sorted(recovered) == ["i-0001", "i-0002"])
     index = json.loads((d / "index.json").read_text())
-    check("recovered items back to pending with attempts+1",
-          all(it["status"] == "pending" and it["attempts"] == 1 for it in index["items"]))
+    check("recovered items back to pending with recoveries+1, attempts untouched (fail() spends attempts, not recover())",
+          all(it["status"] == "pending" and it["recoveries"] == 1 and it["attempts"] == 0
+              for it in index["items"]))
     pace = [json.loads(l) for l in (d / "pace.jsonl").read_text().splitlines() if l.strip()]
     check("open chunk closed with interrupted end line",
           pace[-1]["event"] == "end" and pace[-1]["interrupted"] is True)
 
     r = run_sweep(["recover", "s4"], env)
     check("second recover is a no-op (nothing running)", json.loads(r.stdout) == [])
+
+
+def next_drained_case():
+    print("\n=== sweep_state — next on a drained sweep writes nothing and exits 3 ===")
+    ws = tmpdir("maestro-ws-")
+    env = base_env(sweeps_dir=ws / "sweeps")
+    plan, items = write_plan_and_items(ws, ["a"])
+    run_sweep(["new", "--slug", "s4b", "--plan", str(plan), "--items", str(items)], env)
+    d = ws / "sweeps" / "s4b"
+    r = run_sweep(["next", "s4b"], env)
+    check("first next claims the only item", json.loads(r.stdout) != [] and r.returncode == 0)
+    pace_before = (d / "pace.jsonl").read_text()
+
+    r2 = run_sweep(["next", "s4b"], env)
+    check("next on a drained sweep prints []", r2.stdout.strip() == "[]", r2.stdout)
+    check("next on a drained sweep exits 3", r2.returncode == 3)
+    check("next on a drained sweep writes nothing to pace.jsonl",
+          (d / "pace.jsonl").read_text() == pace_before)
+
+    r3 = run_sweep(["check", "s4b"], env)
+    check("check still passes on a finished sweep (no empty start record)",
+          r3.returncode == 0 and "SWEEP PASS" in r3.stdout, r3.stdout)
+
+
+def two_owner_recover_case():
+    print("\n=== sweep_state — recover: two-owner busy/stale/recoveries-cap ===")
+    ws = tmpdir("maestro-ws-")
+    env = base_env(sweeps_dir=ws / "sweeps")
+    plan, items = write_plan_and_items(ws, ["a", "b"])
+    run_sweep(["new", "--slug", "s4c", "--plan", str(plan), "--items", str(items)], env)
+    d = ws / "sweeps" / "s4c"
+
+    run_sweep(["next", "s4c", "--owner", "alice"], env)  # claims both (chunk_size default 5)
+
+    r = run_sweep(["recover", "s4c", "--owner", "bob", "--stale-after", "7200"], env)
+    check("a different, fresh owner's chunk refuses recover", r.returncode == 4, f"rc={r.returncode} out={r.stdout} err={r.stderr}")
+    check("busy message names the chunk and owner", "busy" in r.stderr and "alice" in r.stderr, r.stderr)
+    index = json.loads((d / "index.json").read_text())
+    check("nothing reclaimed while busy", all(it["status"] == "running" for it in index["items"]))
+
+    r2 = run_sweep(["recover", "s4c", "--owner", "bob", "--stale-after", "0"], env)
+    check("a stale owner's chunk IS reclaimed", r2.returncode == 0, r2.stderr)
+    check("stale reclaim reports both items", sorted(json.loads(r2.stdout)) == ["i-0001", "i-0002"])
+    index2 = json.loads((d / "index.json").read_text())
+    check("stale reclaim returns items to pending",
+          all(it["status"] == "pending" and it["recoveries"] == 1 for it in index2["items"]))
+
+    # recoveries cap: recover the same item to the failure threshold.
+    run_sweep(["next", "s4c", "--owner", "alice", "--n", "2"], env)
+    run_sweep(["recover", "s4c", "--owner", "alice", "--stale-after", "0"], env)  # recoveries=2
+    run_sweep(["next", "s4c", "--owner", "alice", "--n", "2"], env)
+    r3 = run_sweep(["recover", "s4c", "--owner", "alice", "--stale-after", "0"], env)  # recoveries=3 -> failed
+    index3 = json.loads((d / "index.json").read_text())
+    check("item recovered a 3rd time is marked failed, not pending",
+          all(it["status"] == "failed" and it["recoveries"] == 3 for it in index3["items"]), index3["items"])
+    check("failed-by-recoveries item carries an explanatory note",
+          all("recoveries" in (it.get("note") or "") for it in index3["items"]), index3["items"])
+
+
+def end_chunk_owner_case():
+    print("\n=== sweep_state — end-chunk closes the calling owner's chunk only ===")
+    ws = tmpdir("maestro-ws-")
+    env = base_env(sweeps_dir=ws / "sweeps")
+    plan, items = write_plan_and_items(ws, ["a", "b"])
+    run_sweep(["new", "--slug", "s4d", "--plan", str(plan), "--items", str(items),
+              "--policy", json.dumps({"chunk_size": 1})], env)
+    d = ws / "sweeps" / "s4d"
+    run_sweep(["next", "s4d", "--owner", "alice"], env)
+    run_sweep(["next", "s4d", "--owner", "bob"], env)
+
+    r = run_sweep(["end-chunk", "s4d", "--owner", "bob"], env)
+    check("end-chunk --owner bob succeeds", r.returncode == 0, r.stderr)
+    pace = [json.loads(l) for l in (d / "pace.jsonl").read_text().splitlines() if l.strip()]
+    bob_start = next(r for r in pace if r["event"] == "start" and r.get("owner") == "bob")
+    bob_end = [r for r in pace if r["event"] == "end" and r["chunk"] == bob_start["chunk"]]
+    alice_start = next(r for r in pace if r["event"] == "start" and r.get("owner") == "alice")
+    alice_end = [r for r in pace if r["event"] == "end" and r["chunk"] == alice_start["chunk"]]
+    check("bob's chunk is closed", len(bob_end) == 1, pace)
+    check("alice's chunk stays open", len(alice_end) == 0, pace)
 
 
 def check_gate_case():
@@ -285,6 +438,7 @@ def check_gate_case():
     (d / "index.json").write_text(json.dumps(index2))
 
     # item referenced by an amendment but missing from index.json
+    run_sweep(["finding", "s5", "--text", "seed for add"], env)  # -> f-0001
     run_sweep(["add", "s5", "--label", "three", "--from-finding", "f-0001"], env)
     index3 = json.loads((d / "index.json").read_text())
     index3["items"] = [it for it in index3["items"] if it["label"] != "three"]
@@ -297,7 +451,105 @@ def check_gate_case():
         f.write("not json at all\n")
     r = run_sweep(["check", "s5"], env)
     check("corrupt jsonl line fails", r.returncode == 1 and "does not parse" in r.stdout, r.stdout)
-    check("(plain item removal without amendment is not itself flagged)", ok_after_plain_removal or True)
+    check("plain item removal is now caught via items_sha256", not ok_after_plain_removal, "expected removal to be flagged now")
+
+
+def ghost_add_case():
+    print("\n=== sweep_state — check catches a ghost item (index edited outside add) ===")
+    ws = tmpdir("maestro-ws-")
+    env = base_env(sweeps_dir=ws / "sweeps")
+    plan, items = write_plan_and_items(ws, ["one", "two"])
+    run_sweep(["new", "--slug", "s5b", "--plan", str(plan), "--items", str(items)], env)
+    d = ws / "sweeps" / "s5b"
+
+    index = json.loads((d / "index.json").read_text())
+    index["items"].append({"id": "i-0003", "label": "ghost", "status": "pending",
+                            "attempts": 0, "recoveries": 0, "from_finding": None, "note": None})
+    (d / "index.json").write_text(json.dumps(index))
+    r = run_sweep(["check", "s5b"], env)
+    check("a ghost item (added outside `add`, no amendment) fails check",
+          r.returncode == 1 and ("items_sha256" in r.stdout or "no add_item amendment" in r.stdout), r.stdout)
+
+
+def unknown_finding_refused_case():
+    print("\n=== sweep_state — add refuses a nonexistent --from-finding ===")
+    ws = tmpdir("maestro-ws-")
+    env = base_env(sweeps_dir=ws / "sweeps")
+    plan, items = write_plan_and_items(ws, ["one"])
+    run_sweep(["new", "--slug", "s5c", "--plan", str(plan), "--items", str(items)], env)
+    r = run_sweep(["add", "s5c", "--label", "sneaky", "--from-finding", "f-9999"], env)
+    check("add refuses an unknown finding", r.returncode == 2, f"rc={r.returncode} out={r.stdout} err={r.stderr}")
+
+
+def policy_validation_case():
+    print("\n=== sweep_state — policy validation (new + check) ===")
+    ws = tmpdir("maestro-ws-")
+    env = base_env(sweeps_dir=ws / "sweeps")
+    plan, items = write_plan_and_items(ws, ["one"])
+
+    bad_policies = [
+        {"deviation": "Locked"},                 # wrong case, not in the closed set
+        {"chunk_size": "5"},                     # string, not int
+        {"ceilings": {"five_hour": 0}},           # not > 0
+        {"ceilings": {"five_hour": 150}},         # not <= 100
+        {"margin_s": -1},
+        {"max_attempts": 0},
+        {"allow_blind": "false"},                # string, not bool
+        {"blind_gap_s": 10},                      # below the 60s floor
+    ]
+    for i, override in enumerate(bad_policies):
+        slug = f"s8-bad-{i}"
+        r = run_sweep(["new", "--slug", slug, "--plan", str(plan), "--items", str(items),
+                      "--policy", json.dumps(override)], env)
+        check(f"invalid policy rejected at new: {override}", r.returncode == 2, f"out={r.stdout} err={r.stderr}")
+
+    r = run_sweep(["new", "--slug", "s8-good", "--plan", str(plan), "--items", str(items)], env)
+    check("a sweep with the default policy is created fine", r.returncode == 0, r.stderr)
+    d = ws / "sweeps" / "s8-good"
+    index = json.loads((d / "index.json").read_text())
+    check("index.json records a policy_sha256", bool(index.get("policy_sha256")))
+
+    # policy.json deleted -> every command that reads it refuses, and check fails.
+    (d / "policy.json").unlink()
+    r2 = run_sweep(["next", "s8-good"], env)
+    check("next refuses when policy.json is missing", r2.returncode == 2, r2.stderr)
+    r3 = run_sweep(["check", "s8-good"], env)
+    check("check fails when policy.json is missing", r3.returncode == 1 and "policy.json is missing" in r3.stdout, r3.stdout)
+
+    # policy.json edited (still valid JSON/shape, but doesn't match the hash) -> check fails.
+    run_sweep(["new", "--slug", "s8-edited", "--plan", str(plan), "--items", str(items)], env)
+    d2 = ws / "sweeps" / "s8-edited"
+    pol = json.loads((d2 / "policy.json").read_text())
+    pol["deviation"] = "locked"
+    (d2 / "policy.json").write_text(json.dumps(pol))
+    r4 = run_sweep(["check", "s8-edited"], env)
+    check("check fails when policy.json was edited (sha256 mismatch)",
+          r4.returncode == 1 and "policy.json" in r4.stdout, r4.stdout)
+
+
+def lock_timeout_case():
+    print("\n=== sweep_state — lock contention times out (exit 5), never proceeds unlocked ===")
+    ws = tmpdir("maestro-ws-")
+    env = base_env(sweeps_dir=ws / "sweeps")
+    env["MAESTRO_LOCK_TIMEOUT_S"] = "0.2"
+    env["MAESTRO_LOCK_STALE_S"] = "999"
+    plan, items = write_plan_and_items(ws, ["a"])
+    run_sweep(["new", "--slug", "s9", "--plan", str(plan), "--items", str(items)], env)
+    d = ws / "sweeps" / "s9"
+
+    lock_dir = Path(str(d / ".sweep") + ".lock")
+    lock_dir.mkdir()
+    try:
+        r = run_sweep(["next", "s9"], env)
+        check("contended lock exits 5", r.returncode == 5, f"rc={r.returncode} out={r.stdout} err={r.stderr}")
+        check("contended lock prints a clear refusal", "lock" in r.stderr.lower(), r.stderr)
+        index = json.loads((d / "index.json").read_text())
+        check("nothing mutated while the lock was held", index["items"][0]["status"] == "pending")
+    finally:
+        lock_dir.rmdir()
+
+    r2 = run_sweep(["next", "s9"], env)
+    check("lock released -> next works normally again", r2.returncode == 0, r2.stderr)
 
 
 def atomic_writes_case():
@@ -357,12 +609,21 @@ def anchor_case():
 
 def main():
     usage_snapshot_case()
+    usage_merge_case()
+    tmp_cleanup_on_replace_failure_case()
     stdout_unchanged_case()
     lifecycle_case()
     locked_add_case()
     amend_plan_case()
     recover_case()
+    next_drained_case()
+    two_owner_recover_case()
+    end_chunk_owner_case()
     check_gate_case()
+    ghost_add_case()
+    unknown_finding_refused_case()
+    policy_validation_case()
+    lock_timeout_case()
     atomic_writes_case()
     anchor_case()
     print("\n  " + ("PASS" if not FAILURES else f"FAIL ({len(FAILURES)}): {FAILURES}"))
