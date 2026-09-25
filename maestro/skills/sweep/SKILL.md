@@ -35,9 +35,10 @@ next iteration — it does not accept a new prompt per wakeup. So the "resume
 prompt" is nothing more than that exact line: say it once when you start the
 loop, and every later wakeup, `stop`'s printed resume command, and the
 SessionStart anchor line `sweep_state.py`'s `anchor` command prints (`Resume
-with /loop /maestro:sweep resume <slug>` — see the OWNER note below on why
-that anchor line has no `--owner`) must all resolve to the same slug and the
-same subcommand shape. If you are asked to `run`/`resume` outside a `/loop`
+with /loop /maestro:sweep resume <slug> --owner <owner>` once a chunk has
+started — see the OWNER note below for where that owner comes from) must
+all resolve to the same slug and the same subcommand shape. If you are asked
+to `run`/`resume` outside a `/loop`
 turn, do one recover→check→pace round honestly, then tell Griffin the
 sleep/stop decision cannot self-schedule here and hand him the
 `/loop /maestro:sweep run <slug> --owner <owner>` line to paste.
@@ -75,11 +76,15 @@ line. Starting a fresh `/loop /maestro:sweep run <slug>` with no prior owner
 mints a new token the same way, so two sessions on the same sweep never
 collide.
 
-`sweep_state.py`'s SessionStart anchor does not carry `--owner` yet — it
-still prints exactly `Resume with /loop /maestro:sweep resume <slug>`, no
-token. Until that changes, treat the anchor as a slug reminder only and pull
-the real `--owner` value from your own last resume line, not from the
-anchor.
+`sweep_state.py`'s SessionStart anchor is the authoritative source of the
+owner after a compaction or resume: it reads the sweep's `pace.jsonl` and
+takes the owner from the most recent `start` record, printing
+`Resume with /loop /maestro:sweep resume <slug> --owner <owner>`. If no
+chunk has started yet, there is no owner to recover and it prints
+`Resume with /loop /maestro:sweep resume <slug>` with no `--owner` — the
+skill then mints a fresh owner token as above. Either way, trust the
+anchor's line over anything you think you remember from before the
+compaction.
 
 ## `new <goal>` — brainstorm-style intake
 

@@ -849,9 +849,23 @@ def cmd_anchor(_args):
         if c["pending"] + c["running"] <= 0:
             continue
         total = len(index.get("items", []))
+        owner = None
+        try:
+            pace = read_jsonl(p / "pace.jsonl")
+        except Exception:
+            pace = []
+        starts = [r for r in pace if isinstance(r, dict) and r.get("event") == "start"]
+        if starts:
+            latest = max(starts, key=lambda r: r.get("chunk", 0))
+            owner = latest.get("owner")
+        if owner:
+            resume = (f"Resume with /loop /maestro:sweep resume {p.name} "
+                       f"--owner {owner}")
+        else:
+            resume = f"Resume with /loop /maestro:sweep resume {p.name}"
         lines.append(
             f"MAESTRO — active sweep {p.name}: {c['done']}/{total} done, "
-            f"{c['failed']} failed. Resume with /loop /maestro:sweep resume {p.name}")
+            f"{c['failed']} failed. {resume}")
     if not lines:
         return 0
     print(json.dumps({
