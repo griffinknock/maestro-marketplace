@@ -2,38 +2,45 @@
 """Maestro lessons — the cross-session lesson pipeline.
 
 A "lesson" is a small, human-approved rule about how Maestro orchestrates.
-This module owns the whole pipeline except the pure parse/validate/format
+This module owns the whole pipeline except the pure parse/validate/trust
 logic, which lives in `lessons_check.py` and is reused here by its public
-API (`parse`, `active_for`, `render_injection`, `check`):
+API (`parse`, `fold`, `active_for`, `render_injection`, `evaluate`, the
+approvals-ledger helpers, and `repo_identity`):
 
   - CAPTURE: candidates fed automatically by re-orchestration findings
     (`reorchestrate.py`) and manually by the conductor when Griffin corrects
     it (`flag`). Capture never decides a candidate is a lesson.
-  - INJECT: the SessionStart hook that puts active lessons, a check-failure
-    warning, and a pending-candidate count in front of the conductor.
-  - ACCEPT: turns a candidate into an active personal-store lesson (`L-NNN`),
-    gated by `lessons_check.check()` so a bad entry never lands.
+  - INJECT: the SessionStart hook. Injects active, APPROVED lessons only. If
+    the check fails it injects nothing but a one-line warning (fail closed),
+    and its output is always hard-capped at the lesson budget.
+  - ACCEPT: turns a candidate into an active personal-store lesson (`L-NNN`)
+    after Griffin's explicit yes: appends, validates, records the approval in
+    the ledger, commits — and rolls every byte back if any step fails.
   - PUBLISH: copies an accepted, repo-scoped lesson into that repo's own
     `.claude/maestro-lessons.md` (`R-NNN`), uncommitted — Griffin commits it.
+  - TRUST: records Griffin's approval of an `R-NNN` entry a teammate wrote,
+    bound to the exact bytes he was shown (its sha256).
   - STATUS: budget and queue counters for `/maestro:lessons`.
 
-Every function here is usable standalone, so a hook or a command markdown
-file can import this module without shelling out to its own CLI.
+accept, publish, trust and reject hold an exclusive lock on the store for
+their whole sequence (non-blocking with a bounded retry, then a clear
+error). Capture never blocks: it gives up silently after a short retry.
 
 Store layout ($MAESTRO_LESSONS_DIR, else ~/.claude/maestro/lessons/):
   lessons.md         the personal lesson file, git-tracked, append-only.
-                     Parsed and validated by `lessons_check.py`.
-  candidates.jsonl   append-only, gitignored, never committed. One creation
-                     record per candidate plus later status-change records;
-                     folding takes the latest status ("pending" by default).
-  rejected.jsonl     append-only, tracked in the store's own git repo. A rule
-                     Griffin explicitly rejected, keyed so a later review never
-                     re-proposes it.
-  .gitignore         written by `init`; contains "candidates.jsonl".
+  candidates.jsonl   append-only, gitignored. One creation record per
+                     candidate plus later status-change records; folding
+                     takes the latest status ("pending" by default).
+  .dedupe/<hash>     per-session capture dedupe index (one fingerprint per
+                     line), so capture never scans candidates.jsonl.
+  rejected.jsonl     append-only, tracked in the store's own git repo.
+  .gitignore         written by `init`.
+Approvals ledger: `lessons-approved.jsonl` NEXT TO the store directory
+($MAESTRO_LESSONS_APPROVALS overrides) — see lessons_check.py.
 
 Candidate record (creation):
   {"id": "c-<8 hex>", "at": <epoch float>, "session": "<session id>",
-   "repo": "<basename of git toplevel of cwd, or null>",
+   "repo": "<repo identity of cwd, or null>",
    "source": "finding"|"correction", "fingerprint": "<finding fingerprint
    or null>", "tool_use_id": "<id or null>", "text": "<one line, <=300 chars>"}
 
@@ -42,6 +49,10 @@ Candidate record (status change, appended later, same "id"):
 
 Rejected record:
   {"key": "<key>", "rule": "<drafted rule text>", "at": <epoch float>}
+Rejection keys: a finding is keyed by its fingerprint kind; a correction
+(fingerprint null) is keyed `correction:<first 16 hex of sha256 of its
+normalized text>` — normalized = control chars stripped, whitespace
+collapsed, lowercased. `candidates` prints it as the `key` column/field.
 
 CLI:
   lessons.py init
@@ -52,17 +63,24 @@ CLI:
   lessons.py rejected [--json]
   lessons.py inject                     (SessionStart hook; reads stdin)
   lessons.py accept --rule R --why W --evidence E [--scope global|repo:<name>]
-                    [--supersedes ID] [--candidates c-..,c-..]
+                    [--supersedes ID[,ID...]] [--candidates c-..,c-..]
   lessons.py publish ID
+  lessons.py untrusted [--json]
+  lessons.py trust R-NNN --sha SHA256
   lessons.py status [--json]
 
 Env:
-  MAESTRO_LESSONS_DIR   overrides the store directory
-  MAESTRO_LESSONS=0     disable capture and injection (tests/replay.py sets
-                         this so a replay never touches the real store)
+  MAESTRO_LESSONS_DIR        overrides the store directory
+  MAESTRO_LESSONS_APPROVALS  overrides the approvals ledger path
+  MAESTRO_LESSONS=0          disable capture, flag and injection (tests/
+                             replay.py sets this so a replay never touches
+                             the real store). The explicit review commands
+                             (accept/reject/mark/publish/trust) still work.
 """
 import argparse
+import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import secrets
@@ -74,52 +92,55 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import lessons_check
 
+lc = lessons_check
+
 STATUSES = ("reviewed", "not-a-lesson", "accepted")
 CANDIDATES_FILE = "candidates.jsonl"
 REJECTED_FILE = "rejected.jsonl"
-LESSONS_FILE = "lessons.md"
-REPO_LESSONS_RELPATH = Path(".claude") / "maestro-lessons.md"
-LESSONS_ON = os.environ.get("MAESTRO_LESSONS", "1") != "0"
+LESSONS_FILE = lc.LESSONS_FILE
+REPO_LESSONS_RELPATH = lc.REPO_LESSONS_RELPATH
+DEDUPE_DIR = ".dedupe"
+JSONL_LOCK = ".lock"          # guards candidates.jsonl / rejected.jsonl appends
+STORE_LOCK = ".store.lock"    # guards a whole accept/publish/trust/reject
+GITIGNORE_LINES = (CANDIDATES_FILE, f"{DEDUPE_DIR}/", JSONL_LOCK, STORE_LOCK)
 
-# Repo-name lookups are one `git rev-parse` per distinct cwd. Cheap on its
-# own, but capture_finding can run several times per process (tests, or a
-# conductor tool call that surfaces more than one fresh finding at once), so
-# cache it rather than re-shell out for the same cwd repeatedly.
+CAPTURE_LOCK_TRIES, CAPTURE_LOCK_DELAY = 5, 0.02     # <= ~0.1 s, then skip
+REVIEW_LOCK_TRIES, REVIEW_LOCK_DELAY = 50, 0.1       # <= ~5 s, then error
+LOCK_BUSY = ("lessons store is locked by another accept/publish/trust — "
+             "nothing was written; try again in a moment")
+GIT_ID = ["-c", "user.email=maestro@localhost", "-c", "user.name=maestro"]
+
+# Repo-name lookups are one `git rev-parse` per distinct cwd; cache them.
 _REPO_CACHE = {}
+
+
+def lessons_on():
+    return os.environ.get("MAESTRO_LESSONS", "1") != "0"
 
 
 def store_dir():
     """The lessons store directory. Never created here — callers do that."""
-    override = os.environ.get("MAESTRO_LESSONS_DIR")
-    if override:
-        return Path(override)
-    return Path.home() / ".claude" / "maestro" / "lessons"
+    return lc.default_store_dir()
+
+
+def approvals_path(d=None):
+    return lc.approvals_path(Path(d) if d else store_dir())
 
 
 def repo_name(cwd):
-    """Basename of the git toplevel of `cwd`, or None outside a repo."""
-    cwd = cwd or os.getcwd()
-    if cwd in _REPO_CACHE:
-        return _REPO_CACHE[cwd]
-    name = None
-    try:
-        r = subprocess.run(
-            ["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, timeout=2)
-        if r.returncode == 0:
-            top = r.stdout.strip()
-            if top:
-                name = Path(top).name
-    except (OSError, subprocess.SubprocessError):
-        name = None
-    _REPO_CACHE[cwd] = name
-    return name
+    """Repo identity (main working tree basename) of `cwd`, or None."""
+    cwd = str(cwd or os.getcwd())
+    if cwd not in _REPO_CACHE:
+        try:
+            _REPO_CACHE[cwd] = lc.repo_identity(cwd)[1]
+        except Exception:
+            _REPO_CACHE[cwd] = None
+    return _REPO_CACHE[cwd]
 
 
 def init(d=None):
     """mkdir -p the store, `git init` it if it is not already a repo, and
-    write a `.gitignore` that keeps `candidates.jsonl` out of it. Idempotent.
-    """
+    write a `.gitignore` that keeps queue and lock files out of it."""
     d = Path(d) if d else store_dir()
     d.mkdir(parents=True, exist_ok=True)
     if not (d / ".git").is_dir():
@@ -131,87 +152,122 @@ def init(d=None):
     gi = d / ".gitignore"
     try:
         cur = gi.read_text() if gi.is_file() else ""
-        if CANDIDATES_FILE not in cur.splitlines():
+        have = cur.splitlines()
+        missing = [ln for ln in GITIGNORE_LINES if ln not in have]
+        if missing:
             with open(gi, "a") as f:
                 if cur and not cur.endswith("\n"):
                     f.write("\n")
-                f.write(f"{CANDIDATES_FILE}\n")
+                f.write("".join(f"{ln}\n" for ln in missing))
     except OSError:
         pass
     return d
 
 
-def _append_line(d, filename, obj):
-    """Append one JSON line under a file lock (mkdir'd store assumed)."""
-    lock = d / ".lock"
-    with open(lock, "w") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
+# --- locking --------------------------------------------------------------
+
+@contextlib.contextmanager
+def _flock(path, tries, delay):
+    """Exclusive flock, non-blocking with a bounded retry. Yields True when
+    held, False when it could not be taken (or the lock file can't open)."""
+    fd = None
+    got = False
+    try:
         try:
-            with open(d / filename, "a") as f:
-                f.write(json.dumps(obj) + "\n")
-        finally:
-            fcntl.flock(lf, fcntl.LOCK_UN)
+            fd = os.open(str(path), os.O_RDWR | os.O_CREAT
+                         | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        except OSError:
+            fd = None
+        if fd is not None:
+            for attempt in range(max(1, tries)):
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    got = True
+                    break
+                except OSError:
+                    if attempt + 1 < tries:
+                        time.sleep(delay)
+        yield got
+    finally:
+        if fd is not None:
+            if got:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            os.close(fd)
 
 
-def _one_line(text, limit=300):
-    return (text or "").strip().replace("\n", " ").replace("\r", " ")[:limit]
+def _append_line(d, filename, obj, tries=REVIEW_LOCK_TRIES, delay=REVIEW_LOCK_DELAY):
+    """Append one JSON line under the jsonl lock. False if the lock was busy."""
+    with _flock(d / JSONL_LOCK, tries, delay) as ok:
+        if not ok:
+            return False
+        with open(d / filename, "a") as f:
+            f.write(json.dumps(obj) + "\n")
+    return True
 
 
-def _new_candidate(d, session_id, cwd, source, fingerprint, tool_use_id, text):
-    cid = f"c-{secrets.token_hex(4)}"
-    rec = {
-        "id": cid,
+# --- capture --------------------------------------------------------------
+
+def _candidate_record(session_id, cwd, source, fingerprint, tool_use_id, text):
+    return {
+        "id": f"c-{secrets.token_hex(4)}",
         "at": time.time(),
         "session": session_id,
         "repo": repo_name(cwd),
         "source": source,
         "fingerprint": fingerprint,
         "tool_use_id": tool_use_id,
-        "text": _one_line(text),
+        "text": lc.clean_one_line(text, 300),
     }
-    _append_line(d, CANDIDATES_FILE, rec)
-    return cid
 
 
-def _has_duplicate(d, session_id, fingerprint):
-    """A creation record already exists for this session + fingerprint."""
-    if fingerprint is None:
-        return False
-    path = d / CANDIDATES_FILE
-    if not path.is_file():
-        return False
-    try:
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except ValueError:
-                    continue
-                if ("text" in rec and rec.get("session") == session_id
-                        and rec.get("fingerprint") == fingerprint):
-                    return True
-    except OSError:
-        return False
-    return False
+def _new_candidate(d, session_id, cwd, source, fingerprint, tool_use_id, text,
+                   tries=REVIEW_LOCK_TRIES, delay=REVIEW_LOCK_DELAY):
+    d = Path(d)
+    fp = lc.clean_one_line(fingerprint, 200) if fingerprint is not None else None
+    rec = _candidate_record(session_id, cwd, source, fp, tool_use_id, text)
+    if not _append_line(d, CANDIDATES_FILE, rec, tries, delay):
+        return None
+    return rec["id"]
+
+
+def _dedupe_path(d, session_id):
+    h = hashlib.sha256(str(session_id).encode("utf-8")).hexdigest()[:24]
+    return Path(d) / DEDUPE_DIR / h
 
 
 def capture_finding(session_id, cwd, fingerprint, text, tool_use_id=None):
     """Append a re-orchestration finding as a candidate lesson.
 
-    Skips silently if a candidate with the same session + fingerprint already
-    exists. Never raises — a failure here (an unwritable store, a locked
-    file, anything) must never change what the caller prints or does.
+    Skips silently if this session already captured this fingerprint (a
+    small per-session index — never a scan of candidates.jsonl). Never
+    blocks for more than ~0.1 s on a busy lock and never raises: a failure
+    here must never change what the caller prints or does.
     """
     try:
+        if not lessons_on():
+            return None
         d = store_dir()
         d.mkdir(parents=True, exist_ok=True)
-        if _has_duplicate(d, session_id, fingerprint):
-            return None
-        return _new_candidate(d, session_id, cwd, "finding", fingerprint,
-                              tool_use_id, text)
+        fp = lc.clean_one_line(fingerprint, 200) if fingerprint is not None else None
+        rec = _candidate_record(session_id, cwd, "finding", fp, tool_use_id, text)
+        with _flock(d / JSONL_LOCK, CAPTURE_LOCK_TRIES, CAPTURE_LOCK_DELAY) as ok:
+            if not ok:
+                return None
+            idx = _dedupe_path(d, session_id) if fp is not None else None
+            if idx is not None and idx.is_file():
+                with open(idx, encoding="utf-8") as f:
+                    if fp in {ln.rstrip("\n") for ln in f}:
+                        return None
+            with open(d / CANDIDATES_FILE, "a") as f:
+                f.write(json.dumps(rec) + "\n")
+            if idx is not None:
+                idx.parent.mkdir(exist_ok=True)
+                with open(idx, "a", encoding="utf-8") as f:
+                    f.write(fp + "\n")
+        return rec["id"]
     except Exception:
         return None
 
@@ -219,16 +275,28 @@ def capture_finding(session_id, cwd, fingerprint, text, tool_use_id=None):
 def flag(session_id, text, cwd=None):
     """Record a correction Griffin made to how Maestro orchestrated.
 
-    Source is always "correction"; these are never deduped by fingerprint —
-    each one is its own manually-authored event.
+    Source is always "correction"; never deduped by fingerprint. Respects
+    MAESTRO_LESSONS=0 like capture and inject. Never raises.
     """
     try:
+        if not lessons_on():
+            return None
         d = store_dir()
         d.mkdir(parents=True, exist_ok=True)
         return _new_candidate(d, session_id, cwd or os.getcwd(), "correction",
                               None, None, text)
     except Exception:
         return None
+
+
+def candidate_key(rec):
+    """Rejection key for a candidate. Corrections have no fingerprint, so
+    they are keyed on their normalized text; findings keep the documented
+    "<fingerprint kind>" key chosen by the reviewer (None here)."""
+    if rec.get("source") == "correction":
+        norm = lc.clean_one_line(rec.get("text") or "").lower()
+        return "correction:" + hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
+    return None
 
 
 def load_candidates(d=None):
@@ -248,6 +316,8 @@ def load_candidates(d=None):
                     rec = json.loads(line)
                 except ValueError:
                     continue
+                if not isinstance(rec, dict):
+                    continue
                 cid = rec.get("id")
                 if not cid:
                     continue
@@ -263,6 +333,9 @@ def load_candidates(d=None):
     for cid in order:
         rec = dict(creations[cid])
         rec["status"] = statuses.get(cid, "pending")
+        key = candidate_key(rec)
+        if key:
+            rec["key"] = key
         out.append(rec)
     return out
 
@@ -273,25 +346,30 @@ def mark(cid, status, d=None):
         raise ValueError(f"invalid status: {status!r} (want one of {STATUSES})")
     d = Path(d) if d else store_dir()
     d.mkdir(parents=True, exist_ok=True)
-    _append_line(d, CANDIDATES_FILE, {"id": cid, "status": status, "at": time.time()})
+    if not _append_line(d, CANDIDATES_FILE,
+                        {"id": cid, "status": status, "at": time.time()}):
+        raise RuntimeError("lessons store is busy — status not recorded; try again")
 
 
 def reject(key, rule, d=None):
     """Record a permanently-rejected rule and commit it in the store repo."""
     d = Path(d) if d else store_dir()
     init(d)
-    rec = {"key": key, "rule": rule, "at": time.time()}
-    _append_line(d, REJECTED_FILE, rec)
-    try:
-        subprocess.run(["git", "-C", str(d), "add", REJECTED_FILE],
-                       capture_output=True, check=False)
-        subprocess.run(
-            ["git", "-C", str(d),
-             "-c", "user.email=maestro@localhost", "-c", "user.name=maestro",
-             "commit", "-q", "-m", f"reject: {key}"],
-            capture_output=True, check=False)
-    except (OSError, subprocess.SubprocessError):
-        pass
+    rec = {"key": lc.clean_one_line(key, 200), "rule": lc.clean_one_line(rule, 1000),
+           "at": time.time()}
+    with _flock(d / STORE_LOCK, REVIEW_LOCK_TRIES, REVIEW_LOCK_DELAY) as ok:
+        if not ok:
+            raise RuntimeError(LOCK_BUSY)
+        if not _append_line(d, REJECTED_FILE, rec):
+            raise RuntimeError("lessons store is busy — rejection not recorded")
+        try:
+            subprocess.run(["git", "-C", str(d), "add", "--", REJECTED_FILE],
+                           capture_output=True, check=False)
+            subprocess.run(["git", "-C", str(d), *GIT_ID, "commit", "-q",
+                            "-m", f"reject: {rec['key']}", "--", REJECTED_FILE],
+                           capture_output=True, check=False)
+        except (OSError, subprocess.SubprocessError):
+            pass
     return rec
 
 
@@ -318,31 +396,14 @@ def load_rejected(d=None):
 
 # --- shared file helpers -----------------------------------------------
 
-def _read_text_or_empty(path):
-    if path is None:
-        return ""
-    try:
-        p = Path(path)
-        if not p.is_file():
-            return ""
-        return p.read_text(encoding="utf-8")
-    except OSError:
-        return ""
-
-
-def _next_id(path, prefix):
-    """The next `<prefix>NNN` id, one past the highest existing number for
-    that prefix in the file at `path` (or `<prefix>001` if none/missing)."""
-    entries = lessons_check.parse(_read_text_or_empty(path))
-    nums = []
-    for e in entries:
-        eid = e.get("id") or ""
-        if eid.startswith(prefix):
-            digits = eid[len(prefix):]
-            if digits.isdigit():
-                nums.append(int(digits))
+def _next_id(entries, prefix):
+    """The next `<prefix>NNN` id, one past the highest strictly-formed id
+    with that prefix, or None once the 3-digit space is exhausted."""
+    id_re = lc.ID_RE_PERSONAL if prefix == "L-" else lc.ID_RE_REPO
+    nums = [int(e["id"][2:]) for e in entries
+            if e.get("id") and id_re.fullmatch(e["id"])]
     n = (max(nums) + 1) if nums else 1
-    return f"{prefix}{n:03d}"
+    return f"{prefix}{n:03d}" if n <= 999 else None
 
 
 def _append_entry_text(existing_text, block):
@@ -360,61 +421,177 @@ def _append_entry_text(existing_text, block):
     return existing_text + sep + block
 
 
-def _render_entry(lid, scope, rule, why, evidence, supersedes, accepted):
+def _render_entry(lid, scope, rule, why, evidence, supersedes_ids, accepted):
+    """One entry block. Every field must already be clean one-line text."""
     lines = [f"## {lid} · scope: {scope}",
-             f"Rule: {_one_line(rule, limit=1000)}",
-             f"Why: {_one_line(why, limit=1000)}",
-             f"Evidence: {_one_line(evidence, limit=1000)}"]
-    if supersedes:
-        lines.append(f"Supersedes: {supersedes}")
+             f"Rule: {rule}",
+             f"Why: {why}",
+             f"Evidence: {evidence}"]
+    if supersedes_ids:
+        lines.append("Supersedes: " + ", ".join(supersedes_ids))
     lines.append(f"Accepted: {accepted}")
     return "\n".join(lines) + "\n"
 
 
+def _append_self_check(existing_text, new_text, expected_id, block):
+    """Re-parse after appending: exactly one new entry, with the expected
+    id, clean, and byte-identical to the rendered block."""
+    old_ids = [e.get("id") for e in lc.parse(existing_text)]
+    new = lc.parse(new_text)
+    if [e.get("id") for e in new] != old_ids + [expected_id]:
+        return "append self-check failed: the new text does not parse as exactly one new entry"
+    if new[-1]["errors"] or new[-1]["raw"] != block.rstrip("\n"):
+        return "append self-check failed: the new entry does not round-trip"
+    return None
+
+
+def _input_error(name, value):
+    if not isinstance(value, str):
+        return f"{name} is missing"
+    bad = [c for c in value if lc.forbidden_char(c) and c not in "\n\r\t"]
+    if bad:
+        return (f"{name} contains a control or line-separator character "
+                f"(U+{ord(bad[0]):04X}) — refusing; retype it as plain text")
+    if not lc.clean_one_line(value):
+        return f"{name} is empty"
+    return None
+
+
+def _parse_supersedes(value, id_re):
+    """(list of ids, error or None) from a comma-separated string or list."""
+    if value is None or value == "" or value == []:
+        return [], None
+    parts = value if isinstance(value, (list, tuple)) else str(value).split(",")
+    ids = [p.strip() for p in parts if isinstance(p, str) and p.strip()]
+    if not ids:
+        return [], None
+    bad = [i for i in ids if not id_re.fullmatch(i)]
+    if bad:
+        return [], ("--supersedes takes comma-separated ids of the form "
+                    f"{'L' if id_re is lc.ID_RE_PERSONAL else 'R'}-NNN (ASCII digits)")
+    if len(set(ids)) != len(ids):
+        return [], "--supersedes names the same id twice"
+    if len(ids) > lc.MAX_SUPERSEDES:
+        return [], f"--supersedes names {len(ids)} ids, cap is {lc.MAX_SUPERSEDES}"
+    return ids, None
+
+
+def _refuse_nonregular(path):
+    """Error text if `path` exists as a symlink or non-regular file."""
+    if os.path.lexists(str(path)) and (Path(path).is_symlink()
+                                       or not lc._is_regular_nolink(path)):
+        return f"{path} is a symlink or not a regular file — refusing to write through it"
+    return None
+
+
+def _restore(path, prev_bytes):
+    """Put a lesson file back exactly as it was (or remove it if new)."""
+    if prev_bytes is None:
+        try:
+            Path(path).unlink()
+        except OSError:
+            pass
+    else:
+        Path(path).write_bytes(prev_bytes)
+
+
+def _append_ledger(ap, record):
+    """Append one approval line; returns the ledger size before the write."""
+    ap = Path(ap)
+    ap.parent.mkdir(parents=True, exist_ok=True)
+    err = _refuse_nonregular(ap)
+    if err:
+        raise OSError(err)
+    fd = os.open(str(ap), os.O_WRONLY | os.O_APPEND | os.O_CREAT
+                 | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        size = os.fstat(fd).st_size
+        os.write(fd, (json.dumps(record, sort_keys=True) + "\n").encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return size
+
+
+def _truncate_ledger(ap, size):
+    try:
+        if Path(ap).stat().st_size > size:
+            os.truncate(str(ap), size)
+    except OSError:
+        pass
+
+
+def _git(d, *args):
+    return subprocess.run(["git", "-C", str(d), *args], capture_output=True, text=True)
+
+
+def _commit_lessons(d, lid, rule):
+    """(ok, error). Commit ONLY lessons.md; a non-zero exit (a failing hook,
+    no git, nothing staged) is a failure."""
+    try:
+        add = _git(d, "add", "--", LESSONS_FILE)
+        if add.returncode != 0:
+            tail = (add.stderr or "git add failed").strip().splitlines()
+            return False, (tail[-1] if tail else "git add failed")
+        first_words = " ".join(rule.split()[:6])
+        c = _git(d, *GIT_ID, "commit", "-q", "-m", f"lesson: {lid} {first_words}",
+                 "--", LESSONS_FILE)
+        if c.returncode != 0:
+            tail = (c.stderr or c.stdout or "git commit failed").strip().splitlines()
+            return False, (tail[-1] if tail else "git commit failed")
+        return True, None
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, f"git unavailable ({e.__class__.__name__})"
+
+
+def _unstage(d):
+    if _git(d, "rev-parse", "--verify", "-q", "HEAD").returncode == 0:
+        _git(d, "reset", "-q", "HEAD", "--", LESSONS_FILE)
+    else:
+        _git(d, "rm", "--cached", "-q", "--ignore-unmatch", "--", LESSONS_FILE)
+
+
 # --- inject (SessionStart) ----------------------------------------------
-
-def _repo_lessons_path(cwd):
-    """(repo_path_or_None, repo_name_or_None) for the git repo containing
-    `cwd`. repo_path is None unless `.claude/maestro-lessons.md` exists."""
-    top = lessons_check._git_toplevel(str(cwd or os.getcwd()))
-    if top is None:
-        return None, None
-    candidate = top / REPO_LESSONS_RELPATH
-    return (candidate if candidate.is_file() else None), top.name
-
 
 def build_injection(cwd):
     """The exact `additionalContext` string for a SessionStart in `cwd`, or
-    None when there is nothing worth saying (silence is the common case)."""
+    None when there is nothing worth saying (silence is the common case).
+
+    Fail closed: if the check fails, the ONLY thing injected is a one-line
+    warning naming the validator and the first reason — never a lesson.
+    Always hard-capped at MAX_BUDGET_CHARS.
+    """
     personal_path = store_dir() / LESSONS_FILE
-    repo_path, repo_name_ = _repo_lessons_path(cwd)
+    repo_path, repo_name_ = lc.repo_lessons_path(cwd)
+    ev = lc.evaluate(personal_path, repo_path, repo_name_, approvals_path())
 
-    personal_entries = lessons_check.parse(_read_text_or_empty(personal_path))
-    repo_entries = lessons_check.parse(_read_text_or_empty(repo_path))
-    active = lessons_check.active_for(personal_entries + repo_entries, repo_name_)
+    if ev["reasons"]:
+        first = lc.clean_one_line(ev["reasons"][0], 300)
+        return lc.cap_text(
+            "MAESTRO LESSONS OFF — the lessons check failed, so NO lessons were "
+            f"injected. Run: python3 \"{lc.SCRIPT_PATH}\" — first reason: {first}")
 
+    active = lc.active_for(ev["personal"] + ev["trusted"], repo_name_)
     lines = []
     if active:
-        lines.append(lessons_check.render_injection(active))
-
-    reasons = lessons_check.check(personal_path, repo_path, repo_name_)
-    if reasons:
-        lines.append(f"LESSONS CHECK FAILED — run lessons_check.py; {reasons[0]}")
-
+        lines.append(lc.render_injection(active))
+    untrusted = len(ev["repo"]) - len(ev["trusted"])
+    if untrusted > 0:
+        lines.append(f"{untrusted} untrusted repo lesson(s) in {repo_path} were "
+                     "NOT injected — review with /maestro:lessons")
     pending = [c for c in load_candidates() if c.get("status") == "pending"]
     if pending:
         lines.append(f"{len(pending)} lesson candidate(s) pending — "
-                      "review with /maestro:lessons")
-
+                     "review with /maestro:lessons")
     if not lines:
         return None
-    return "\n".join(lines)
+    return lc.cap_text("\n".join(lines))
 
 
 def inject(payload):
     """SessionStart hook body. Never raises; returns the hook JSON dict to
     print, or None to stay silent."""
-    if not LESSONS_ON:
+    if not lessons_on():
         return None
     payload = payload if isinstance(payload, dict) else {}
     try:
@@ -435,108 +612,299 @@ def inject(payload):
 # --- accept ---------------------------------------------------------------
 
 def accept(rule, why, evidence, scope="global", supersedes=None,
-           candidates=None, d=None):
-    """Allocate the next L-NNN, append it to the personal lessons.md, and
-    validate. On failure the file is restored byte-for-byte (or removed, if
-    this call created it) and (None, reasons, None) is returned. On success
-    the store repo gets a commit, the listed candidates are marked accepted,
-    and (lid, [], lid) is returned."""
+           candidates=None, d=None, cwd=None):
+    """Only after Griffin's explicit yes to this exact entry. Allocates the
+    next L-NNN, appends it, validates the post-state (every scope's budget,
+    the approvals ledger, append-only history), records the approval, and
+    commits. On ANY failure — validation, ledger write, or commit — the file
+    is restored byte-for-byte (or removed if this call created it), the
+    index is unstaged, the approval is not written, and (None, reasons,
+    None) is returned. On success the listed candidates are marked accepted
+    and (lid, [], lid) is returned. `supersedes` is one id or a
+    comma-separated list/sequence of them (consolidation)."""
+    errs = []
+    fields = {}
+    for name, val in (("Rule", rule), ("Why", why), ("Evidence", evidence)):
+        err = _input_error(name, val)
+        if err:
+            errs.append(err)
+        else:
+            fields[name] = lc.clean_one_line(val)
+    scope = scope or "global"
+    if not isinstance(scope, str) or not lc.SCOPE_RE.fullmatch(scope):
+        errs.append("invalid scope (want 'global' or 'repo:<name>', name in [A-Za-z0-9._-])")
+    sup_ids, sup_err = _parse_supersedes(supersedes, lc.ID_RE_PERSONAL)
+    if sup_err:
+        errs.append(sup_err)
+    if errs:
+        return None, errs, None
+
     d = Path(d) if d else store_dir()
     init(d)
-    path = d / LESSONS_FILE
-    existed = path.is_file()
-    prev_bytes = path.read_bytes() if existed else None
-    existing_text = prev_bytes.decode("utf-8") if existed else ""
-
-    lid = _next_id(path if existed else None, "L-")
-    accepted = time.strftime("%Y-%m-%d")
-    block = _render_entry(lid, scope, rule, why, evidence, supersedes, accepted)
-    path.write_text(_append_entry_text(existing_text, block), encoding="utf-8")
-
-    reasons = lessons_check.check(path, None, None)
-    if reasons:
-        if existed:
-            path.write_bytes(prev_bytes)
-        else:
-            try:
-                path.unlink()
-            except OSError:
-                pass
+    with _flock(d / STORE_LOCK, REVIEW_LOCK_TRIES, REVIEW_LOCK_DELAY) as ok:
+        if not ok:
+            return None, [LOCK_BUSY], None
+        lid, reasons = _accept_locked(d, fields, scope, sup_ids, cwd)
+    if lid is None:
         return None, reasons, None
-
-    try:
-        subprocess.run(["git", "-C", str(d), "add", LESSONS_FILE],
-                       capture_output=True, check=False)
-        first_words = " ".join(rule.split()[:6])
-        subprocess.run(
-            ["git", "-C", str(d),
-             "-c", "user.email=maestro@localhost", "-c", "user.name=maestro",
-             "commit", "-q", "-m", f"lesson: {lid} {first_words}"],
-            capture_output=True, check=False)
-    except (OSError, subprocess.SubprocessError):
-        pass
 
     for cid in (candidates or []):
         try:
             mark(cid, "accepted", d=d)
-        except ValueError:
+        except (ValueError, RuntimeError):
             pass
-
     return lid, [], lid
+
+
+def _accept_locked(d, fields, scope, sup_ids, cwd):
+    path = d / LESSONS_FILE
+    err = _refuse_nonregular(path)
+    if err:
+        return None, [err]
+    prev_bytes = path.read_bytes() if path.exists() else None
+    try:
+        existing_text = prev_bytes.decode("utf-8") if prev_bytes is not None else ""
+    except UnicodeDecodeError:
+        return None, [f"{path} is not valid UTF-8 — refusing to append"]
+
+    existing = lc.parse(existing_text)
+    by_id = {e["id"]: e for e in existing if e.get("id")}
+    retired = lc.fold(existing)
+    for s in sup_ids:
+        t = by_id.get(s)
+        if t is None:
+            return None, [f"--supersedes {s}: no such lesson in {path}"]
+        if t.get("scope") != scope:
+            return None, [f"--supersedes {s}: it is scope {t.get('scope')}, the new "
+                          f"lesson is {scope} — a lesson may only supersede one "
+                          "with the same scope"]
+        if s in retired:
+            return None, [f"--supersedes {s}: already superseded by {retired[s]}"]
+
+    lid = _next_id(existing, "L-")
+    if lid is None:
+        return None, ["the L-NNN id space is exhausted"]
+    block = _render_entry(lid, scope, fields["Rule"], fields["Why"],
+                          fields["Evidence"], sup_ids, time.strftime("%Y-%m-%d"))
+    new_text = _append_entry_text(existing_text, block)
+    err = _append_self_check(existing_text, new_text, lid, block)
+    if err:
+        return None, [err]
+
+    ap = approvals_path(d)
+    records, ledger_reasons = lc.read_approvals(ap)
+    if ledger_reasons:
+        return None, ledger_reasons
+    record = lc.make_approval(lc.ledger_tail(records), lid, "personal",
+                              lc.entry_sha(block.rstrip("\n")), "accept")
+
+    repo_path, repo_name_ = lc.repo_lessons_path(cwd)
+    path.write_bytes(new_text.encode("utf-8"))
+    reasons = lc.evaluate(path, repo_path, repo_name_, ap,
+                          extra_approvals=[record])["reasons"]
+    if reasons:
+        _restore(path, prev_bytes)
+        return None, reasons
+
+    try:
+        ledger_size = _append_ledger(ap, record)
+    except OSError as e:
+        _restore(path, prev_bytes)
+        return None, [f"could not record the approval ({e}) — rolled back"]
+
+    ok, cerr = _commit_lessons(d, lid, fields["Rule"])
+    if not ok:
+        _restore(path, prev_bytes)
+        _unstage(d)
+        _truncate_ledger(ap, ledger_size)
+        return None, [f"commit to the lessons store failed — rolled back, "
+                      f"nothing accepted: {cerr}"]
+    return lid, []
 
 
 # --- publish ---------------------------------------------------------------
 
 def publish(lesson_id, cwd=None, d=None):
-    """Copy an accepted, repo-scoped lesson from the personal store into the
-    current repo's `.claude/maestro-lessons.md` as the next R-NNN. Leaves it
-    uncommitted. Returns (rid_or_None, message)."""
+    """Copy an accepted, active, repo-scoped lesson from the personal store
+    into the current repo's `.claude/maestro-lessons.md` as the next R-NNN,
+    and record the publish in the approvals ledger (with its source id).
+    Leaves the repo file uncommitted. Returns (rid_or_None, message)."""
+    if not isinstance(lesson_id, str) or not lc.ID_RE_PERSONAL.fullmatch(lesson_id):
+        return None, "publish takes a personal lesson id of the form L-NNN"
     d = Path(d) if d else store_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    with _flock(d / STORE_LOCK, REVIEW_LOCK_TRIES, REVIEW_LOCK_DELAY) as ok:
+        if not ok:
+            return None, LOCK_BUSY
+        return _publish_locked(lesson_id, cwd, d)
+
+
+def _publish_locked(lesson_id, cwd, d):
     personal_path = d / LESSONS_FILE
-    entries = lessons_check.parse(_read_text_or_empty(personal_path))
+    ap = approvals_path(d)
+    pev = lc.evaluate(personal_path, None, None, ap)
+    if pev["reasons"]:
+        return None, ("refusing to publish: the personal store fails its check\n"
+                      + "\n".join(f"- {r}" for r in pev["reasons"]))
+    entries = pev["personal"]
     entry = next((e for e in entries if e.get("id") == lesson_id), None)
     if entry is None:
         return None, f"no such lesson: {lesson_id}"
+    retired = lc.fold(entries)
+    if lesson_id in retired:
+        return None, (f"refusing to publish {lesson_id}: it was superseded by "
+                      f"{retired[lesson_id]} — publish that one instead")
 
     scope = entry.get("scope") or ""
     if not scope.startswith("repo:"):
         return None, (f"refusing to publish {lesson_id}: scope is "
-                       f"{scope!r}, not repo:<name> — global lessons stay "
-                       "in the personal store")
+                      f"{scope!r}, not repo:<name> — global lessons stay "
+                      "in the personal store")
     target_repo = scope[len("repo:"):]
 
-    top = lessons_check._git_toplevel(str(cwd or os.getcwd()))
+    top, name = lc.repo_identity(cwd)
     if top is None:
         return None, "cwd is not inside a git repository"
-    if top.name != target_repo:
+    if name != target_repo:
         return None, (f"refusing to publish {lesson_id}: scoped to "
-                       f"repo:{target_repo}, but cwd is in repo {top.name!r}")
+                      f"repo:{target_repo}, but cwd is in repo {name!r}")
+    tier = f"repo:{name}"
 
+    claude_dir = top / REPO_LESSONS_RELPATH.parent
     repo_path = top / REPO_LESSONS_RELPATH
-    existed = repo_path.is_file()
-    prev_bytes = repo_path.read_bytes() if existed else None
-    existing_text = prev_bytes.decode("utf-8") if existed else ""
+    if claude_dir.is_symlink():
+        return None, f"{claude_dir} is a symlink — refusing to write through it"
+    err = _refuse_nonregular(repo_path)
+    if err:
+        return None, err
+    prev_bytes = repo_path.read_bytes() if repo_path.exists() else None
+    try:
+        existing_text = prev_bytes.decode("utf-8") if prev_bytes is not None else ""
+    except UnicodeDecodeError:
+        return None, f"{repo_path} is not valid UTF-8 — refusing to append"
 
-    rid = _next_id(repo_path if existed else None, "R-")
+    records, ledger_reasons = lc.read_approvals(ap)
+    if ledger_reasons:
+        return None, "\n".join(ledger_reasons)
+    repo_entries = lc.parse(existing_text)
+    repo_by_id = {e["id"]: e for e in repo_entries if e.get("id")}
+    published = {}   # source L-id -> R-id currently present in this repo file
+    for r in records:
+        if r["how"] == "publish" and r["tier"] == tier and r["id"] in repo_by_id:
+            published[r.get("source")] = r["id"]
+    if lesson_id in published:
+        return None, (f"refusing to publish {lesson_id}: already published "
+                      f"as {published[lesson_id]} in {repo_path}")
+
+    repo_retired = lc.fold(repo_entries)
+    sup = []
+    for s in entry.get("supersedes_ids") or []:
+        rid_for = published.get(s)
+        if (rid_for and rid_for not in repo_retired and rid_for not in sup
+                and repo_by_id[rid_for].get("scope") == scope):
+            sup.append(rid_for)   # translated; an unpublished target is dropped
+
+    rid = _next_id(repo_entries, "R-")
+    if rid is None:
+        return None, "the R-NNN id space is exhausted"
     block = _render_entry(rid, scope, entry.get("rule"), entry.get("why"),
-                          entry.get("evidence"), entry.get("supersedes"),
-                          entry.get("accepted"))
-    repo_path.parent.mkdir(parents=True, exist_ok=True)
-    repo_path.write_text(_append_entry_text(existing_text, block), encoding="utf-8")
+                          entry.get("evidence"), sup, entry.get("accepted"))
+    new_text = _append_entry_text(existing_text, block)
+    err = _append_self_check(existing_text, new_text, rid, block)
+    if err:
+        return None, err
+    record = lc.make_approval(lc.ledger_tail(records), rid, tier,
+                              lc.entry_sha(block.rstrip("\n")), "publish",
+                              source=lesson_id)
 
-    reasons = lessons_check.check(None, repo_path, top.name)
-    if reasons:
-        if existed:
-            repo_path.write_bytes(prev_bytes)
-        else:
+    created_dir = not os.path.lexists(str(claude_dir))
+
+    def rollback():
+        _restore(repo_path, prev_bytes)
+        if created_dir:
             try:
-                repo_path.unlink()
+                claude_dir.rmdir()
             except OSError:
                 pass
-        return None, "LESSONS FAIL\n" + "\n".join(f"- {r}" for r in reasons)
 
-    return rid, (f"Published {rid} to {repo_path} — left uncommitted. "
-                 "Commit it with your work.")
+    try:
+        claude_dir.mkdir(parents=True, exist_ok=True)
+        repo_path.write_bytes(new_text.encode("utf-8"))
+    except OSError as e:
+        rollback()
+        return None, f"could not write {repo_path}: {e}"
+
+    reasons = lc.evaluate(personal_path, repo_path, name, ap,
+                          extra_approvals=[record])["reasons"]
+    if reasons:
+        rollback()
+        return None, "LESSONS FAIL\n" + "\n".join(f"- {r}" for r in reasons)
+    try:
+        _append_ledger(ap, record)
+    except OSError as e:
+        rollback()
+        return None, f"could not record the publish in the approvals ledger: {e}"
+
+    return rid, (f"Published {lesson_id} as {rid} to {repo_path} — left "
+                 "uncommitted. Commit it with your work.")
+
+
+# --- trust -----------------------------------------------------------------
+
+def list_untrusted(cwd=None, d=None):
+    """Untrusted R- entries in cwd's repo file: [{id, sha256, raw}]."""
+    d = Path(d) if d else store_dir()
+    repo_path, name = lc.repo_lessons_path(cwd)
+    if repo_path is None:
+        return []
+    ev = lc.evaluate(None, repo_path, name, approvals_path(d))
+    trusted = {e["id"] for e in ev["trusted"]}
+    return [{"id": e["id"], "sha256": e["sha256"], "raw": e["raw"],
+             "errors": list(e["errors"])}
+            for e in ev["repo"] if e.get("id") not in trusted]
+
+
+def trust(rid, sha, cwd=None, d=None):
+    """Only after Griffin was shown the entry verbatim and said yes to it.
+    Records an approval for R-NNN bound to `sha` (the sha256 printed by
+    `untrusted`); refuses if the entry's bytes no longer match. Returns
+    (rid_or_None, message)."""
+    if not isinstance(rid, str) or not lc.ID_RE_REPO.fullmatch(rid):
+        return None, "trust takes a repo lesson id of the form R-NNN"
+    if not isinstance(sha, str) or not lc.SHA_RE.fullmatch(sha):
+        return None, "--sha must be the full 64-hex sha256 printed by `untrusted`"
+    d = Path(d) if d else store_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    with _flock(d / STORE_LOCK, REVIEW_LOCK_TRIES, REVIEW_LOCK_DELAY) as ok:
+        if not ok:
+            return None, LOCK_BUSY
+        repo_path, name = lc.repo_lessons_path(cwd)
+        if repo_path is None or name is None:
+            return None, "no .claude/maestro-lessons.md in this repo"
+        ap = approvals_path(d)
+        ev = lc.evaluate(d / LESSONS_FILE, repo_path, name, ap)
+        entry = next((e for e in ev["repo"] if e.get("id") == rid), None)
+        if entry is None:
+            return None, f"no such repo lesson: {rid}"
+        if any(e.get("id") == rid for e in ev["trusted"]):
+            return None, f"{rid} is already trusted"
+        if entry["sha256"] != sha:
+            return None, (f"refusing to trust {rid}: its bytes changed since they "
+                          "were shown (sha256 mismatch) — show it again")
+        records, ledger_reasons = lc.read_approvals(ap)
+        if ledger_reasons:
+            return None, "\n".join(ledger_reasons)
+        record = lc.make_approval(lc.ledger_tail(records), rid, f"repo:{name}",
+                                  sha, "trust")
+        reasons = lc.evaluate(d / LESSONS_FILE, repo_path, name, ap,
+                              extra_approvals=[record])["reasons"]
+        if reasons:
+            return None, "LESSONS FAIL\n" + "\n".join(f"- {r}" for r in reasons)
+        try:
+            _append_ledger(ap, record)
+        except OSError as e:
+            return None, f"could not record the approval: {e}"
+    return rid, f"Trusted {rid} in {repo_path} — it will be injected from now on."
 
 
 # --- status ---------------------------------------------------------------
@@ -545,20 +913,16 @@ def status_report(cwd=None, d=None):
     """Active count/chars vs. budget for the current context, plus queue
     counters. See lessons_check for the budget constants."""
     cwd = cwd or os.getcwd()
-    personal_path = (Path(d) if d else store_dir()) / LESSONS_FILE
-    repo_path, repo_name_ = _repo_lessons_path(cwd)
-
-    personal_entries = lessons_check.parse(_read_text_or_empty(personal_path))
-    repo_entries = lessons_check.parse(_read_text_or_empty(repo_path))
-    active = lessons_check.active_for(personal_entries + repo_entries, repo_name_)
-    text = lessons_check.render_injection(active)
+    d = Path(d) if d else store_dir()
+    repo_path, repo_name_ = lc.repo_lessons_path(cwd)
+    ev = lc.evaluate(d / LESSONS_FILE, repo_path, repo_name_, approvals_path(d))
+    active = lc.active_for(ev["personal"] + ev["trusted"], repo_name_)
+    text = lc.render_injection(active)
     n_active, n_chars = len(active), len(text)
 
-    max_entries = lessons_check.MAX_BUDGET_ENTRIES
-    max_chars = lessons_check.MAX_BUDGET_CHARS
-    entries_pct = (n_active / max_entries) if max_entries else 0.0
-    chars_pct = (n_chars / max_chars) if max_chars else 0.0
-    pct = max(entries_pct, chars_pct)
+    max_entries = lc.MAX_BUDGET_ENTRIES
+    max_chars = lc.MAX_BUDGET_CHARS
+    pct = max(n_active / max_entries, n_chars / max_chars)
 
     pending = [c for c in load_candidates(d=d) if c.get("status") == "pending"]
     rejected = load_rejected(d=d)
@@ -569,9 +933,11 @@ def status_report(cwd=None, d=None):
         "max_entries": max_entries,
         "max_chars": max_chars,
         "percent": round(pct * 100, 1),
-        "near_budget": pct >= lessons_check.NEAR_BUDGET_RATIO,
+        "near_budget": pct >= lc.NEAR_BUDGET_RATIO,
         "pending": len(pending),
         "rejected": len(rejected),
+        "untrusted": len(ev["repo"]) - len(ev["trusted"]),
+        "check_failed": bool(ev["reasons"]),
         "repo": repo_name_,
     }
 
@@ -579,7 +945,8 @@ def status_report(cwd=None, d=None):
 # --- CLI --------------------------------------------------------------
 def _print_candidate_row(rec):
     print(f"{rec.get('id')}\t{rec.get('source')}\t{rec.get('fingerprint')}\t"
-          f"{rec.get('repo')}\t{rec.get('status')}\t{rec.get('text')}")
+          f"{rec.get('repo')}\t{rec.get('status')}\t{rec.get('key') or '-'}\t"
+          f"{rec.get('text')}")
 
 
 def _cmd_init(args):
@@ -589,6 +956,9 @@ def _cmd_init(args):
 
 
 def _cmd_flag(args):
+    if not lessons_on():
+        print("lessons disabled (MAESTRO_LESSONS=0) — correction not recorded")
+        return 0
     text = " ".join(args.text) if isinstance(args.text, list) else args.text
     cid = flag(args.session, text)
     if cid is None:
@@ -617,7 +987,7 @@ def _cmd_mark(args):
         return 1
     try:
         mark(args.id, args.status)
-    except ValueError as e:
+    except (ValueError, RuntimeError) as e:
         print(str(e), file=sys.stderr)
         return 1
     print(f"{args.id} -> {args.status}")
@@ -625,8 +995,12 @@ def _cmd_mark(args):
 
 
 def _cmd_reject(args):
-    reject(args.key, args.rule)
-    print(f"rejected: {args.key}")
+    try:
+        rec = reject(args.key, args.rule)
+    except RuntimeError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    print(f"rejected: {rec['key']}")
     return 0
 
 
@@ -655,21 +1029,21 @@ def _cmd_inject(args):
     return 0
 
 
+def _fail(reasons):
+    print("LESSONS FAIL", file=sys.stderr)
+    for r in reasons:
+        print(f"- {r}", file=sys.stderr)
+    return 1
+
+
 def _cmd_accept(args):
-    scope = args.scope or "global"
-    if scope != "global" and not scope.startswith("repo:"):
-        print(f"invalid scope: {scope!r} (want 'global' or 'repo:<name>')",
-             file=sys.stderr)
-        return 1
     candidates = [c for c in (args.candidates.split(",") if args.candidates else [])
-                 if c]
-    lid, reasons, _ = accept(args.rule, args.why, args.evidence, scope=scope,
+                  if c]
+    lid, reasons, _ = accept(args.rule, args.why, args.evidence,
+                             scope=args.scope or "global",
                              supersedes=args.supersedes, candidates=candidates)
     if reasons:
-        print("LESSONS FAIL", file=sys.stderr)
-        for r in reasons:
-            print(f"- {r}", file=sys.stderr)
-        return 1
+        return _fail(reasons)
     print(lid)
     return 0
 
@@ -684,16 +1058,42 @@ def _cmd_publish(args):
     return 0
 
 
+def _cmd_untrusted(args):
+    rows = list_untrusted()
+    if args.json:
+        print(json.dumps(rows))
+        return 0
+    if not rows:
+        print("no untrusted repo lessons")
+    for r in rows:
+        print(f"--- {r['id']}  sha256 {r['sha256']}")
+        print(r["raw"])
+    return 0
+
+
+def _cmd_trust(args):
+    rid, msg = trust(args.id, args.sha)
+    if rid is None:
+        print(msg, file=sys.stderr)
+        return 1
+    print(rid)
+    print(msg)
+    return 0
+
+
 def _cmd_status(args):
     rep = status_report()
     if args.json:
         print(json.dumps(rep))
     else:
         print(f"active: {rep['active']}/{rep['max_entries']} entries, "
-             f"{rep['chars']}/{rep['max_chars']} chars ({rep['percent']}%)")
+              f"{rep['chars']}/{rep['max_chars']} chars ({rep['percent']}%)")
+        if rep["check_failed"]:
+            print(f"LESSONS CHECK FAILED — run python3 \"{lc.SCRIPT_PATH}\"")
         if rep["near_budget"]:
             print("NEAR BUDGET — propose a consolidation")
         print(f"pending candidates: {rep['pending']}")
+        print(f"untrusted repo lessons: {rep['untrusted']}")
         print(f"rejected rules: {rep['rejected']}")
     return 0
 
@@ -735,13 +1135,22 @@ def build_parser():
     p.add_argument("--why", required=True)
     p.add_argument("--evidence", required=True)
     p.add_argument("--scope", default="global")
-    p.add_argument("--supersedes")
+    p.add_argument("--supersedes", help="one id or a comma-separated list")
     p.add_argument("--candidates")
     p.set_defaults(func=_cmd_accept)
 
     p = sub.add_parser("publish")
     p.add_argument("id")
     p.set_defaults(func=_cmd_publish)
+
+    p = sub.add_parser("untrusted")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=_cmd_untrusted)
+
+    p = sub.add_parser("trust")
+    p.add_argument("id")
+    p.add_argument("--sha", required=True)
+    p.set_defaults(func=_cmd_trust)
 
     p = sub.add_parser("status")
     p.add_argument("--json", action="store_true")

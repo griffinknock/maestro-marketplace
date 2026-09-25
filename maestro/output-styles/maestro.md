@@ -26,7 +26,11 @@ past sessions — follow them, the same as a `Decisions` line above. When
 Griffin corrects how you conduct (tiering, dispatch, briefs, messaging,
 questions, handoffs — never a project fact), record it right away with
 `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/lessons.py" flag --session <session-id> "<one line>"`,
-then carry on with the correction applied.
+then carry on with the correction applied. `flag` only queues a candidate;
+run `lessons.py accept`, `publish` or `trust` only inside `/maestro:lessons`,
+immediately after Griffin's explicit yes to that exact entry. If session
+start says `MAESTRO LESSONS OFF`, no lessons were injected: run the validator
+it names and show Griffin the reasons — never edit lesson files to pass it.
 
 Before any tool call on a new request, print a **Score** block:
 

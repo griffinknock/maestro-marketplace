@@ -25,7 +25,10 @@ and points at the right places. That is what you produce now.
 
    If that lists any candidates, run the `/maestro:lessons` review flow now,
    before writing the handoff — a candidate carries this session's id, and
-   this session is about to end. Skip only if Griffin says skip.
+   this session is about to end. Skip only if Griffin says skip. The
+   deadline never licenses an approval: run `accept` (or `publish`/`trust`)
+   only on Griffin's explicit yes to that exact entry — anything he has not
+   answered stays pending for the next session.
 
 4. **Write `.claude/maestro/HANDOFF.md`.** Pointers and decisions, never
    payloads — the next session reads files itself. Exactly these sections:
