@@ -157,6 +157,46 @@ def most_restrictive_wins_case():
     check("window is seven_day", d["window"] == "seven_day", d)
 
 
+def both_windows_continue_case():
+    print("\n=== both windows present, both comfortable -> continue combines cleanly ===")
+    now = 1000.0
+    # Small measured burn (0.5 pts / 100s chunk) against ample headroom and a
+    # short-ish reset horizon on both windows means the paced gap is
+    # negative for each independently -> both windows say "continue", and
+    # combining two continues must not crash (there is no wake_at at all).
+    history = [
+        pace_rec(1, "start", 0, five_used=10.0, five_resets=now + 5000,
+                 seven_used=10.0, seven_resets=now + 8000),
+        pace_rec(1, "end", 100, five_used=10.5, five_resets=now + 5000,
+                 seven_used=10.5, seven_resets=now + 8000),
+    ]
+    snapshot = snap(
+        now,
+        five_hour=reading(10.5, now + 5000),
+        seven_day=reading(10.5, now + 8000),
+    )
+    d = decide(snapshot, now, DEFAULT_POLICY, history)
+    check("continue, no crash combining two continues", d["action"] == "continue", d)
+
+
+def both_windows_sleep_mismatched_wake_at_case():
+    print("\n=== both windows sleep, one short (wake_at=None) one long (>1h) -> no crash ===")
+    # This is the exact shape that crashed _more_restrictive against the real
+    # sweep_state.py fixtures: a near five_hour reset (short sleep, no
+    # wake_at) combined with a distant seven_day reset (long sleep,
+    # wake_at set) — comparing None <= float used to blow up.
+    now = 1000.0
+    snapshot = snap(
+        now,
+        five_hour=reading(40.0, now + 3 * 3600),
+        seven_day=reading(50.0, now + 4 * 86400),
+    )
+    d = decide(snapshot, now, DEFAULT_POLICY, [])  # no history -> default burn
+    check("action is sleep, not a crash", d["action"] == "sleep", d)
+    check("window is seven_day (the longer sleep wins)", d["window"] == "seven_day", d)
+    check("delay_s clamped to [60, 3600]", 60 <= d["delay_s"] <= 3600, d)
+
+
 def zero_delta_coarse_readings_case():
     print("\n=== zero-delta coarse readings -> treated as real (zero) burn ===")
     now = 1000.0
@@ -291,6 +331,8 @@ def main():
     five_hour_headroom_below_chunk_long_wait_case()
     seven_day_headroom_below_chunk_stops_case()
     most_restrictive_wins_case()
+    both_windows_continue_case()
+    both_windows_sleep_mismatched_wake_at_case()
     zero_delta_coarse_readings_case()
     stale_reading_projected_forward_case()
     resets_at_passed_treated_fresh_case()

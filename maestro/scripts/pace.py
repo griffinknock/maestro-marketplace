@@ -177,8 +177,12 @@ _RANK = {"continue": 0, "probe": 0, "sleep": 1, "stop": 2}
 
 
 def _more_restrictive(a, b):
-    """Pick the more restrictive of two per-window verdicts. Longer sleeps
-    beat shorter ones; stop beats everything."""
+    """Pick the more restrictive of two per-window verdicts: rank first
+    (stop > sleep > continue), then — for two sleeps — the longer delay_s.
+    A continue verdict carries no wake time at all, so ranking must settle
+    ties before any wake-time-shaped field is touched; comparing delay_s
+    (always an int, always present) rather than wake_at (often None) is what
+    keeps this total and crash-free."""
     if a is None:
         return b
     if b is None:
@@ -187,13 +191,7 @@ def _more_restrictive(a, b):
     if ra != rb:
         return a if ra > rb else b
     if a["action"] == "sleep":
-        # Compare by true target wait, not the clamped delay, so a distant
-        # 5h-window sleep isn't shadowed by a nearer one incorrectly, and a
-        # closer real target wins (we want to wake as soon as any window
-        # needs re-checking).
-        wa = a.get("wake_at", a.get("_now", 0) + a["delay_s"])
-        wb = b.get("wake_at", b.get("_now", 0) + b["delay_s"])
-        return a if wa <= wb else b
+        return a if a["delay_s"] >= b["delay_s"] else b
     return a
 
 
@@ -370,7 +368,14 @@ def main(argv):
 
     now = args.now if args.now is not None else time_mod.time()
 
-    decision = decide(snapshot, now, policy, history)
+    try:
+        decision = decide(snapshot, now, policy, history)
+    except Exception as e:  # never let a real sweep's files crash the caller
+        decision = {
+            "action": "probe", "delay_s": 0, "window": None, "wake_at": None,
+            "reason": "pace.py raised %s: %s; probing instead of trusting a bad decision"
+                      % (type(e).__name__, e),
+        }
     print(json.dumps(decision))
     return 0
 
