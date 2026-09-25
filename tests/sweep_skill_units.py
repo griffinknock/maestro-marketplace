@@ -209,6 +209,25 @@ def exit_codes_case(text):
           and "fix\n     `policy.json`" not in text and "re-run `new`" not in text)
 
 
+def lease_doc_case(text):
+    print("\n=== SKILL.md — loop lease and /clear are documented ===")
+    if text is None:
+        check("skipped — no SKILL.md text", False)
+        return
+    check("skill references the 'lease' subcommand",
+          re.search(r'\$STATE"?\s+lease\b', text) is not None)
+    check("lease is renewed right before ScheduleWakeup",
+          re.search(r"right before every `ScheduleWakeup`", text) is not None
+          and "lease <slug> --in <delay_s>" in text)
+    check("lease is released when the loop ends", text.count("--release") >= 3, text.count("--release"))
+    check("lease exit 4 means another session took over — no reschedule",
+          "If `lease` itself exits 4" in text)
+    check("/clear changes the session id (open chunk or live lease -> takeover)",
+          "**`/clear` changes the session id**" in text and "loop\n  lease held by the pre-`/clear`" in text)
+    state_src = read(STATE_PY)
+    check("anchor reports the lease holder", "is leased by another session" in state_src)
+
+
 def main():
     text = frontmatter_case()
     script_surface_case(text)
@@ -216,6 +235,7 @@ def main():
     owner_case(text)
     anchor_match_case(text)
     exit_codes_case(text)
+    lease_doc_case(text)
     print("\n  " + ("PASS" if not FAILURES else f"FAIL ({len(FAILURES)}): {FAILURES}"))
     return 1 if FAILURES else 0
 

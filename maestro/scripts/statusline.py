@@ -40,8 +40,21 @@ CACHE_TTL = 4
 # `captured_at` is the later of the two windows' (kept for older readers);
 # `session_id` is whichever session wrote last and may be null — readers
 # must not rely on it.
+#
+# Freshness (`fresh_at`, per window): the last time a session that had JUST
+# received an API response reported this window. A reading only means
+# "usage now" on the tick where its session's `cost.total_api_duration_ms`
+# advanced; an idle session re-sends the rate_limits of its last response
+# forever. So `sessions` keeps {session_id: {"api_ms", "seen"}} (pruned after
+# a day), and a tick whose session's api_ms advanced refreshes `fresh_at` of
+# every window it carries — even when the value is unchanged (a cheap chunk
+# on a large plan need not move the percentage). Idle ticks never touch
+# `fresh_at`. A payload with no api duration at all (older Claude Code)
+# falls back to the old signal: `fresh_at` follows `captured_at`. Readers
+# use `fresh_at` when the key exists, else `captured_at`.
 USAGE_FILE = Path(os.environ.get("MAESTRO_USAGE_FILE")
                   or (Path.home() / ".claude" / "maestro" / "usage.json"))
+SESSION_TTL_S = 86400.0
 # Two readings of one window whose resets_at differ by at most this many
 # seconds are the SAME window: resets_at jitters by a second or so between
 # sessions and responses, and a jittered idle reading must never pass for a
@@ -82,10 +95,39 @@ def _same_window(a, b):
     return abs(a - b) <= RESET_JITTER_S
 
 
-def _merge_window(old, new, now):
+def _merge_window(old, new, now, fresh=None):
     """Merge one freshly-read rate-limit window (`new`, from `_window` — no
     `captured_at` yet) into the persisted one (`old`, may be None). Returns
-    the window to persist, always carrying `captured_at`.
+    the window to persist, always carrying `captured_at` and `fresh_at`.
+
+    `fresh`: True when this tick's session just got an API response (its
+    reading is current), False when it is idle, None when the payload has no
+    activity signal (legacy: fresh_at follows captured_at).
+    """
+    w = _merge_value(old, new, now)
+    if w is old:
+        if fresh is True and old is not None and new is not None \
+                and _same_window(_resets(old), new.get("resets_at")):
+            return {**old, "fresh_at": now}
+        return old
+    rose = w.get("captured_at") == now
+    if fresh is True or (fresh is None and rose):
+        fresh_at = now
+    elif old is not None and _same_window(_resets(old), w.get("resets_at")):
+        fresh_at = old.get("fresh_at")
+    else:
+        fresh_at = None  # a new window nobody active has confirmed yet
+    return {**w, "fresh_at": fresh_at}
+
+
+def _resets(w):
+    r = w.get("resets_at")
+    return _finite(r) if r is not None else None
+
+
+def _merge_value(old, new, now):
+    """The value/resets/captured_at part of the merge (fresh_at is carried
+    through from `old` untouched here).
 
     Contract (C1):
       - `new` is None (window absent from this payload) -> keep `old`
@@ -150,9 +192,29 @@ def snapshot_usage(payload):
     old_seven = old.get("seven_day") if isinstance(old.get("seven_day"), dict) else None
 
     now = time.time()
-    merged_five = _merge_window(old_five, five, now)
-    merged_seven = _merge_window(old_seven, seven, now)
-    if merged_five == old_five and merged_seven == old_seven:
+    sessions = old.get("sessions") if isinstance(old.get("sessions"), dict) else {}
+    new_sessions = sessions
+    fresh = None
+    sid = payload.get("session_id")
+    cost = payload.get("cost")
+    api_ms = _finite(cost.get("total_api_duration_ms")) if isinstance(cost, dict) else None
+    if isinstance(sid, str) and sid and api_ms is not None:
+        prev = sessions.get(sid)
+        prev_ms = _finite(prev.get("api_ms")) if isinstance(prev, dict) else None
+        # First sighting is NOT fresh: a session seen for the first time may
+        # be idle on an hours-old response.
+        fresh = prev_ms is not None and api_ms > prev_ms
+        if prev_ms != api_ms:
+            new_sessions = {}
+            for k, v in sessions.items():
+                seen = _finite(v.get("seen")) if isinstance(v, dict) else None
+                if seen is not None and now - seen <= SESSION_TTL_S:
+                    new_sessions[k] = v
+            new_sessions[sid] = {"api_ms": api_ms, "seen": now}
+
+    merged_five = _merge_window(old_five, five, now, fresh)
+    merged_seven = _merge_window(old_seven, seven, now, fresh)
+    if merged_five == old_five and merged_seven == old_seven and new_sessions is sessions:
         return  # nothing changed — skip the write
 
     caps = [_finite(w.get("captured_at")) for w in (merged_five, merged_seven)
@@ -160,7 +222,8 @@ def snapshot_usage(payload):
     caps = [c for c in caps if c is not None]
     rec = {"captured_at": max(caps) if caps else None,
            "session_id": payload.get("session_id"),
-           "five_hour": merged_five, "seven_day": merged_seven}
+           "five_hour": merged_five, "seven_day": merged_seven,
+           "sessions": new_sessions}
     tmp = None
     try:
         USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)

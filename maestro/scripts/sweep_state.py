@@ -83,6 +83,7 @@ MAX_RECOVERIES = 3
 USAGE_FILE_DEFAULT = str(Path.home() / ".claude" / "maestro" / "usage.json")
 SESSION_ENV = "CLAUDE_CODE_SESSION_ID"
 DEFAULT_STALE_AFTER_S = 7200.0
+LEASE_MARGIN_S = 600.0   # a loop lease outlives its wake time by this much
 
 
 # ── locking + atomic writes ──────────────────────────────────────────────
@@ -279,11 +280,13 @@ def no_owner():
 def usage_snapshot():
     """U, as defined in the pace.jsonl contract — read fresh, every call.
 
-    usage.json (written by statusline.py) carries a `captured_at` per window
-    — the last time that window's value rose. Both are kept ("captured"):
-    pace.py only counts a chunk's burn when the END reading's capture time
-    is fresh, and a frozen usage.json must not pass for a fresh one. The
-    top-level captured_at is their max (or the file's own, for older files).
+    usage.json (written by statusline.py) carries, per window, `fresh_at` —
+    the last time an actively-responding session reported it — and the
+    older `captured_at` (last time the value rose). "captured" holds each
+    window's freshness time (fresh_at when recorded, else captured_at):
+    pace.py only counts a chunk's burn when the END reading was fresh during
+    the chunk, and a frozen or idle usage.json must not pass for a fresh
+    one. The top-level captured_at is their max (or the file's own).
     """
     path = Path(os.environ.get("MAESTRO_USAGE_FILE") or USAGE_FILE_DEFAULT)
     d = read_json(path, {}) or {}
@@ -292,8 +295,19 @@ def usage_snapshot():
     five = d.get("five_hour") if isinstance(d.get("five_hour"), dict) else {}
     seven = d.get("seven_day") if isinstance(d.get("seven_day"), dict) else {}
     top = d.get("captured_at")
-    captured = {"five_hour": five.get("captured_at", top) if five else None,
-                "seven_day": seven.get("captured_at", top) if seven else None}
+
+    def fresh_time(w):
+        # `fresh_at` (the last tick a session that had just received an API
+        # response reported this window) when the statusline records it —
+        # even None, meaning "never confirmed current" — else the older
+        # value-rose `captured_at`.
+        if not w:
+            return None
+        if "fresh_at" in w:
+            return w.get("fresh_at")
+        return w.get("captured_at", top)
+
+    captured = {"five_hour": fresh_time(five), "seven_day": fresh_time(seven)}
     caps = [c for c in captured.values() if c is not None]
     return {
         "five_hour": five.get("used_percentage"),
@@ -466,6 +480,41 @@ def finding_exists(d, fid):
     return any(f.get("id") == fid for f in read_jsonl(d / "findings.jsonl"))
 
 
+# ── loop lease ───────────────────────────────────────────────────────────
+# An open chunk only proves ownership while it is open; a /loop sleeping
+# between chunks holds nothing. lease.json ({"owner", "until", "at",
+# "reason"}) closes that gap: `next` takes/renews it at every chunk start,
+# the skill renews it with `lease` right before every ScheduleWakeup (until
+# = wake time + LEASE_MARGIN_S), and `lease --release` drops it when the
+# loop ends. While it is live, `next`/`recover`/`lease` from any other
+# session exit 4 — the same takeover path as an open chunk.
+
+def read_lease(d):
+    lease = read_json(d / "lease.json")
+    if not isinstance(lease, dict) or not isinstance(lease.get("owner"), str):
+        return None
+    until = lease.get("until")
+    if isinstance(until, bool) or not isinstance(until, (int, float)) or until != until:
+        return None
+    return lease
+
+
+def write_lease(d, owner, until, reason):
+    write_json(d / "lease.json", {"owner": owner, "until": until, "at": time.time(),
+                                  "reason": reason})
+
+
+def lease_busy(d, owner, now, slug):
+    """The busy line when another session holds a live lease, else None."""
+    lease = read_lease(d)
+    if not lease or lease["owner"] == owner or lease["until"] <= now:
+        return None
+    return (f"busy: sweep leased by {lease['owner']} until {iso(lease['until'])} (its /loop is "
+            f"between chunks) — if that session is dead, take it over with `recover "
+            f"--takeover` (/maestro:sweep takeover {slug}); the lease lapses on its own "
+            f"at that time")
+
+
 # ── commands ──────────────────────────────────────────────────────────
 
 def cmd_new(args):
@@ -573,6 +622,12 @@ def cmd_next(args):
         if err:
             print(f"refused: {err}", file=sys.stderr)
             return 2
+        now = time.time()
+        busy = lease_busy(d, owner, now, args.slug)
+        if busy:
+            print(json.dumps([]))
+            print(busy, file=sys.stderr)
+            return 4
         n = args.n if args.n is not None else policy.get("chunk_size", DEFAULT_POLICY["chunk_size"])
         claimed = []
         for it in index["items"]:
@@ -608,6 +663,13 @@ def cmd_next(args):
             "items": [it["id"] for it in claimed], "usage": usage_snapshot(),
             "owner": owner,
         })
+        # Chunk start holds the loop lease (never shortening this owner's
+        # own longer lease): a chunk is how a loop proves it is alive.
+        held = read_lease(d)
+        until = now + LEASE_MARGIN_S
+        if held and held["owner"] == owner:
+            until = max(until, held["until"])
+        write_lease(d, owner, until, "chunk")
     print(json.dumps([{"id": it["id"], "label": it["label"]} for it in claimed]))
     return 0
 
@@ -875,15 +937,62 @@ def cmd_end_chunk(args):
     return 0
 
 
+def cmd_lease(args):
+    """Hold (or release) this session's loop lease. The skill calls
+    `lease S --in <delay_s>` right before every ScheduleWakeup and
+    `lease S --release` when the loop ends. The stored `until` is the
+    given time plus LEASE_MARGIN_S. Exit 4 when another session holds a
+    live lease or a fresh open chunk (take it over with recover --takeover)."""
+    d = sweep_dir(args.slug)
+    rc = require_sweep(d, args.slug)
+    if rc is not None:
+        return rc
+    owner = resolve_owner(args)
+    if owner is None:
+        return no_owner()
+    with Lock(d / ".sweep"):
+        now = time.time()
+        for ch in open_chunks(read_jsonl(d / "pace.jsonl")):
+            if ch.get("owner") != owner and now - (ch.get("at") or 0) < DEFAULT_STALE_AFTER_S:
+                print(f"busy: chunk {ch.get('chunk')} owned by {ch.get('owner')} since "
+                      f"{iso(ch.get('at'))} — if that session is dead, take it over with "
+                      f"`recover --takeover` (/maestro:sweep takeover {args.slug})",
+                      file=sys.stderr)
+                return 4
+        busy = lease_busy(d, owner, now, args.slug)
+        if busy:
+            print(busy, file=sys.stderr)
+            return 4
+        if args.release:
+            held = read_lease(d)
+            if held and held["owner"] == owner:
+                try:
+                    (d / "lease.json").unlink()
+                except OSError:
+                    pass
+            print(json.dumps({"released": True}))
+            return 0
+        base = args.until if args.until is not None else now + args.in_s
+        if base != base or base in (float("inf"), float("-inf")) or base < now:
+            print("invalid lease time: --until must be a future epoch / --in >= 0",
+                  file=sys.stderr)
+            return 2
+        until = base + LEASE_MARGIN_S
+        write_lease(d, owner, until, "wakeup")
+    print(json.dumps({"owner": owner, "until": until, "until_iso": iso(until)}))
+    return 0
+
+
 def cmd_recover(args):
     """After a crash: every `running` item -> `pending` (recoveries+1, never
     spending an attempt — `fail()` alone spends attempts), or `failed` past
     MAX_RECOVERIES; every open chunk closes with an `interrupted: true` end
     line. Refuses (exit 4) while another session's open chunk is younger
-    than --stale-after — a second session must not reclaim items another
-    session still has in flight — unless --takeover says that session is
-    dead. Every foreign chunk reclaimed (stale or taken over) is logged as a
-    `takeover` amendment."""
+    than --stale-after, or another session holds a live loop lease — a
+    second session must not reclaim items another session still has in
+    flight, nor start a loop beside one that is sleeping between chunks —
+    unless --takeover says that session is dead. Every foreign chunk or live
+    lease reclaimed is logged as a `takeover` amendment."""
     d = sweep_dir(args.slug)
     rc = require_sweep(d, args.slug)
     if rc is not None:
@@ -911,6 +1020,21 @@ def cmd_recover(args):
                           f"reclaimed automatically once older than --stale-after "
                           f"({int(stale_after)}s)", file=sys.stderr)
                     return 4
+            busy = lease_busy(d, owner, now, args.slug)
+            if busy:
+                print(busy, file=sys.stderr)
+                return 4
+
+        lease = read_lease(d)
+        if lease and lease["owner"] != owner and lease["until"] > now:
+            # Only reachable with --takeover: log it, and hold the lease
+            # ourselves so the old loop's next wakeup is refused.
+            append_jsonl(d / "amendments.jsonl", {
+                "at": now, "op": "takeover", "chunk": None,
+                "from_owner": lease["owner"], "to_owner": owner,
+                "reason": "explicit", "lease_until": lease["until"],
+            })
+            write_lease(d, owner, now + LEASE_MARGIN_S, "takeover")
 
         for ch in foreign:
             append_jsonl(d / "amendments.jsonl", {
@@ -1166,11 +1290,11 @@ def cmd_anchor(_args):
     must never take a session down with it.
 
     The resume hint goes only to a session that may resume: the one owning
-    the sweep's open chunk (payload session_id == chunk owner), or any
-    session when no chunk is open. Any other session is told the sweep is
-    owned by another session since when, and how to take it over if that
-    session is dead — it must never be handed a line that adopts a live
-    session's chunk.
+    the sweep's open chunk / live loop lease (payload session_id == owner),
+    or any session when neither is held. Any other session is told the
+    sweep is owned (open chunk) or leased (sleeping loop) by another session
+    and until/since when, and how to take it over if that session is dead —
+    it must never be handed a line that adopts a live session's sweep.
     """
     try:
         raw = sys.stdin.read()
@@ -1200,9 +1324,18 @@ def cmd_anchor(_args):
         except Exception:
             pace = []
         foreign = [r for r in open_chunks(pace) if not session or r.get("owner") != session]
+        takeover = f"Take over with /maestro:sweep takeover {p.name}"
+        lease = read_lease(p)
+        if not foreign and lease and lease["until"] > time.time() \
+                and (not session or lease["owner"] != session):
+            lines.append(
+                f"MAESTRO — sweep {p.name} ({progress}) is leased by another session "
+                f"({lease['owner']}) until {iso(lease['until'])}: its /loop is sleeping "
+                f"between chunks. Do not resume it from this session while that one is "
+                f"alive. If that session is dead: {takeover}")
+            continue
         if foreign:
             ch = max(foreign, key=lambda r: r.get("chunk") or 0)
-            takeover = f"Take over with /maestro:sweep takeover {p.name}"
             lines.append(
                 f"MAESTRO — sweep {p.name} ({progress}) is owned by another session "
                 f"({ch.get('owner')}) since {iso(ch.get('at'))}: it holds chunk "
@@ -1286,6 +1419,14 @@ def build_parser():
                     default=DEFAULT_STALE_AFTER_S)
     sp.add_argument("--takeover", action="store_true")
 
+    sp = sub.add_parser("lease")
+    sp.add_argument("slug")
+    sp.add_argument("--owner")
+    g = sp.add_mutually_exclusive_group(required=True)
+    g.add_argument("--until", type=float, default=None)
+    g.add_argument("--in", dest="in_s", type=float, default=None)
+    g.add_argument("--release", action="store_true")
+
     sp = sub.add_parser("check")
     sp.add_argument("slug")
 
@@ -1298,7 +1439,8 @@ COMMANDS = {
     "new": cmd_new, "status": cmd_status, "list": cmd_list, "next": cmd_next,
     "done": cmd_done, "fail": cmd_fail, "finding": cmd_finding, "add": cmd_add,
     "amend-plan": cmd_amend_plan, "set-policy": cmd_set_policy,
-    "end-chunk": cmd_end_chunk, "recover": cmd_recover, "check": cmd_check,
+    "end-chunk": cmd_end_chunk, "recover": cmd_recover, "lease": cmd_lease,
+    "check": cmd_check,
     "anchor": cmd_anchor,
 }
 

@@ -657,6 +657,27 @@ def projection_uses_gate_burn_case():
           d["action"] == "sleep" and "since reset" in d["reason"], d)
 
 
+def fresh_at_drives_staleness_case():
+    print("\n=== usage.json fresh_at (API activity) decides staleness, not captured_at ===")
+    now = 5000.0
+    resets = now + 10000
+    history = [
+        pace_rec(1, "start", 4000, five_used=30.0, five_resets=resets, captured_at=3990),
+        pace_rec(1, "end", 4100, five_used=30.0, five_resets=resets, captured_at=4090),
+    ]
+    # value last ROSE long ago (captured_at 1000) but an active session
+    # confirmed it just now (fresh_at 4990): current, not stale.
+    fresh = snap(now, five_hour={"used_percentage": 30.0, "resets_at": resets,
+                                 "captured_at": 1000.0, "fresh_at": 4990.0})
+    d = decide(fresh, now, DEFAULT_POLICY, history)
+    check("recent fresh_at -> reading used as-is (not 'stale')", "stale" not in d["reason"], d)
+    # fresh_at recorded but null: never confirmed by an active session.
+    never = snap(now, five_hour={"used_percentage": 30.0, "resets_at": resets,
+                                 "captured_at": 4990.0, "fresh_at": None})
+    d2 = decide(never, now, DEFAULT_POLICY, history)
+    check("fresh_at null -> treated as stale even with a recent captured_at", "stale" in d2["reason"], d2)
+
+
 def main():
     no_history_case()
     low_usage_far_from_reset_case()
@@ -695,6 +716,7 @@ def main():
     interrupted_chunks_excluded_case()
     reset_jitter_delta_case()
     projection_uses_gate_burn_case()
+    fresh_at_drives_staleness_case()
 
     print()
     if FAILURES:

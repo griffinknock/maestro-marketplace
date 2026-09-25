@@ -14,15 +14,19 @@ Inputs (see AGENTS/handoff for the sweep dir contract):
     "usage" snapshot shaped like {"five_hour": pct|None, "seven_day": pct|None,
     "captured_at": epoch|None, "captured": {"five_hour": epoch|None,
     "seven_day": epoch|None}, "resets": {"five_hour": epoch|None,
-    "seven_day": epoch|None}}. "captured" (per-window capture times) is
-    optional; without it the top-level "captured_at" stands in for both
+    "seven_day": epoch|None}}. "captured" (per-window freshness times: the
+    window's `fresh_at` from usage.json when recorded, else its captured_at)
+    is optional; without it the top-level "captured_at" stands in for both
     windows. An end record written by `recover` carries "interrupted": true.
   - usage.json: the latest raw statusline snapshot, {"captured_at": epoch,
     "session_id": str|None, "five_hour": {"used_percentage": float,
-    "resets_at": epoch, "captured_at": epoch|None} | None, "seven_day":
-    {...} | None}. Each window may carry its own "captured_at" (the last time
-    its value rose); pace.py reads the per-window value first and falls back
-    to the top-level one when a window doesn't have its own.
+    "resets_at": epoch, "captured_at": epoch|None, "fresh_at": epoch|None}
+    | None, "seven_day": {...} | None, "sessions": {...}}. "fresh_at" is the
+    last tick on which a session that had just received an API response
+    reported the window (see statusline.py) — the freshness signal, even
+    when the value did not change; a present-but-null fresh_at means never
+    confirmed current. Without "fresh_at", the window's "captured_at" (last
+    time its value rose), then the top-level one, stand in for it.
 
 Core entry point: decide(snapshot, now, policy, history) -> dict. Pure and
 deterministic — no file I/O, no clock reads beyond the passed-in `now`. The
@@ -81,10 +85,11 @@ For each window ("five_hour", "seven_day") present in `snapshot`:
        unknown — that window's contribution is "probe" (see below). If one
        or more chunks have started since `resets_at`, estimate
        `used = max(burn, gate_burn) * chunks_started_since(resets_at)`.
-     - Otherwise, if the reading is stale — its own `captured_at` predates
-       the end of the last chunk, or is more than 10 minutes old — project
-       it forward: `used + max(burn, gate_burn) *
-       chunks_started_since(captured_at)` (counting chunk *starts*, not
+     - Otherwise, if the reading is stale — its freshness time (`fresh_at`,
+       else `captured_at`) predates the end of the last chunk, is more than
+       10 minutes old, or was never confirmed (fresh_at recorded as null) —
+       project it forward: `used + max(burn, gate_burn) *
+       chunks_started_since(fresh time)` (counting chunk *starts*, not
        wall-clock time, since wall-clock time with no chunks running tells
        us nothing about burn).
      - Otherwise the raw reading is used as-is.
@@ -474,6 +479,16 @@ def decide(snapshot, now, policy, history):
         captured_at = _finite_number(reading.get("captured_at"))
         if captured_at is None:
             captured_at = _finite_number(snapshot.get("captured_at"))
+        # Freshness: `fresh_at` (last tick an actively-responding session
+        # reported this window) when the statusline records it; a recorded
+        # but null fresh_at means never confirmed current -> always stale.
+        # Older files only have the value-rose `captured_at`.
+        never_fresh = False
+        if "fresh_at" in reading:
+            fresh_at = _finite_number(reading.get("fresh_at"))
+            never_fresh = fresh_at is None
+        else:
+            fresh_at = captured_at
 
         burn, gate_burn, duration, used_default = _burn_and_duration(pairs, window)
         proj_burn = max(burn, gate_burn)
@@ -495,11 +510,14 @@ def decide(snapshot, now, policy, history):
                 % chunks_since_reset
         else:
             stale = (
-                (last_chunk_end_at is not None and captured_at is not None and captured_at < last_chunk_end_at)
-                or (captured_at is not None and (now - captured_at) > _STALE_AFTER_S)
+                never_fresh
+                or (last_chunk_end_at is not None and fresh_at is not None and fresh_at < last_chunk_end_at)
+                or (fresh_at is not None and (now - fresh_at) > _STALE_AFTER_S)
             )
             if stale:
-                chunks_since_reading = _chunks_since(history, captured_at)
+                since = fresh_at if fresh_at is not None else captured_at
+                chunks_since_reading = (_chunks_since(history, since) if since is not None
+                                        else len(_chunk_start_times(history)))
                 projected = used + proj_burn * chunks_since_reading
                 stale_note = " (stale reading, projected forward by %d chunk(s) since capture)" \
                     % chunks_since_reading

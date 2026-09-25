@@ -259,6 +259,65 @@ def frozen_usage_file_case():
           d2 is not None and "no usage signal" not in d2.get("reason", ""), d2)
 
 
+STATUSLINE = SCRIPTS / "statusline.py"
+
+
+def tick(env, sid, api_ms, five_pct, five_resets, seven_pct=20.0, seven_resets=None):
+    """One real statusline tick for session `sid` (as Claude Code would send
+    after that session's latest API response, api_ms = its total API time)."""
+    payload = {"session_id": sid, "model": {"display_name": "Sonnet"},
+               "context_window": {"used_percentage": 10},
+               "cost": {"total_cost_usd": 0.1, "total_duration_ms": 1000,
+                        "total_api_duration_ms": api_ms},
+               "rate_limits": {"five_hour": {"used_percentage": five_pct, "resets_at": five_resets},
+                               "seven_day": {"used_percentage": seven_pct,
+                                             "resets_at": seven_resets or five_resets + 5 * 86400}}}
+    subprocess.run([sys.executable, str(STATUSLINE)], input=json.dumps(payload),
+                   capture_output=True, text=True, env=env)
+
+
+def run_ticked_chunk(env, slug, sweep_dir, sid, api_ms, pct, resets):
+    run_sweep(["next", slug], env)
+    tick(env, sid, api_ms, pct, resets)   # the statusline tick during the chunk
+    for it in json.loads((sweep_dir / "index.json").read_text())["items"]:
+        if it["status"] == "running":
+            run_sweep(["done", slug, it["id"]], env)
+    run_sweep(["end-chunk", slug], env)
+
+
+def cheap_chunks_on_a_large_plan_case():
+    print("\n=== integration: cheap chunks that never move the percentage are NOT blind ===")
+    resets = time.time() + 4 * 3600
+    # Active conductor: every chunk sees a real API response (api_ms
+    # advances) but usage stays at 30.0% — a big plan, cheap items.
+    sweeps_dir = tmpdir("maestro-sweeps-")
+    usage_file = tmpdir("maestro-usage-") / "usage.json"
+    env = base_env(sweeps_dir, usage_file)
+    sweep_dir = new_sweep(env, "cheap", n_items=8, policy={"chunk_size": 1})
+    api = 1000
+    tick(env, "conductor", api, 30.0, resets)
+    for _ in range(5):
+        api += 700
+        run_ticked_chunk(env, "cheap", sweep_dir, "conductor", api, 30.0, resets)
+    d = run_pace(sweep_dir, usage_file, now=time.time())
+    check("5 cheap chunks with live API activity -> no 'no usage signal' stop",
+          d is not None and "no usage signal" not in d.get("reason", ""), d)
+    check("…and pacing continues", d is not None and d.get("action") == "continue", d)
+
+    # Same, but the only session ticking is idle (its api_ms never
+    # advances): still no signal, still stops.
+    sweeps_dir2 = tmpdir("maestro-sweeps-")
+    usage_file2 = tmpdir("maestro-usage-") / "usage.json"
+    env2 = base_env(sweeps_dir2, usage_file2)
+    sweep_dir2 = new_sweep(env2, "idle", n_items=8, policy={"chunk_size": 1})
+    tick(env2, "idle-session", 500, 30.0, resets)
+    for _ in range(4):
+        run_ticked_chunk(env2, "idle", sweep_dir2, "idle-session", 500, 30.0, resets)
+    d2 = run_pace(sweep_dir2, usage_file2, now=time.time())
+    check("an idle session's re-sent reading is still no signal -> stop",
+          d2 is not None and d2.get("action") == "stop" and "no usage signal" in d2.get("reason", ""), d2)
+
+
 def main():
     no_history_case()
     one_chunk_case()
@@ -267,6 +326,7 @@ def main():
     window_absent_case()
     no_usage_file_at_all_case()
     frozen_usage_file_case()
+    cheap_chunks_on_a_large_plan_case()
 
     print()
     if FAILURES:

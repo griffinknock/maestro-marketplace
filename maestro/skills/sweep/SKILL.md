@@ -59,18 +59,48 @@ hook JSON input" — and `sweep_state.py` reads it itself. So:
 - If a command refuses with `no owner — $CLAUDE_CODE_SESSION_ID is unset`,
   this Claude Code build doesn't export it: stop and tell Griffin — do not
   work around it with a made-up `--owner`.
-- `/clear` gives the session a new id. A chunk left open before a `/clear`
-  then belongs to "another session" — use `takeover` below.
+- **`/clear` changes the session id** (the env-vars reference: it "is
+  updated on `/clear`"). After a `/clear`, a chunk left open or a loop
+  lease held by the pre-`/clear` session belongs to "another session":
+  `recover`/`next` exit 4 until it lapses, and the way through is
+  `takeover` below — the pre-`/clear` loop is gone, so that is safe once
+  Griffin confirms it.
+
+### The loop lease
+
+An open chunk only proves ownership while it is open; a `/loop` sleeping
+between chunks holds nothing on its own. So the loop also holds a lease
+(`lease.json`: owner + until): `next` takes it at every chunk start, and
+**right before every `ScheduleWakeup`** you renew it to cover the wait:
+
+```bash
+python3 "$STATE" lease <slug> --in <delay_s>   # holds until now + delay_s + 10 min
+```
+
+When the loop ends (pace `stop`, `next` exit 3, `stop <slug>`), release
+it so another session may resume right away:
+
+```bash
+python3 "$STATE" lease <slug> --release
+```
+
+While a lease is live, `recover`, `next` and `lease` from any other
+session exit 4 (`busy: sweep leased by <owner> until <iso> …`) — the same
+takeover path as an open chunk. A dead loop's lease lapses on its own 10
+minutes after its last scheduled wake. If `lease` itself exits 4, another
+session has taken the sweep over: do not `ScheduleWakeup`; tell Griffin
+and end the loop.
 
 The SessionStart anchor (on compaction or resume) reads the hook's own
 `session_id` and prints one of two lines per active sweep:
 
-- to the session that owns the open chunk, or to any session when no
-  chunk is open: `Resume with /loop /maestro:sweep resume <slug>`
-- to any other session while a chunk is open: that the sweep is owned by
-  another session since `<time>`, ending `Take over with /maestro:sweep
-  takeover <slug>` — do not resume it; tell Griffin, and only take it over
-  if he says the other session is dead.
+- to the session that owns the open chunk / live lease, or to any session
+  when neither is held: `Resume with /loop /maestro:sweep resume <slug>`
+- to any other session: that the sweep is owned (open chunk, since
+  `<time>`) or leased (sleeping loop, until `<time>`) by another session,
+  ending `Take over with /maestro:sweep takeover <slug>` — do not resume
+  it; tell Griffin, and only take it over if he says the other session is
+  dead.
 
 Trust the anchor's line over anything you remember from before the
 compaction.
@@ -83,7 +113,7 @@ compaction.
 | 1 | `check` printed `SWEEP FAIL` | stop; report the reasons verbatim; do not proceed |
 | 2 | invalid input, refused, or `no such sweep` | stop and report the message verbatim — never retry with guessed arguments |
 | 3 | `next`: nothing pending or running — the sweep is finished | go to the final summary and end the loop |
-| 4 | owned by another live session (`busy: …`) | quote the busy line, explain `/maestro:sweep takeover <slug>` (only if that session is dead), and end — no `check`, no `next`, no `ScheduleWakeup` |
+| 4 | owned by another live session — its open chunk or live loop lease (`busy: …`) | quote the busy line, explain `/maestro:sweep takeover <slug>` (only if that session is dead), and end — no `check`, no `next`, no `ScheduleWakeup` |
 | 5 | the sweep lock is busy | touch nothing else; `ScheduleWakeup` at the minimum delay (60 s) and try the turn again |
 
 ## `new <goal>` — brainstorm-style intake
@@ -146,8 +176,9 @@ Runs only under `/loop` (see above). Each turn:
    to pending. Act on its exit code before anything else:
    - **0** → `python3 "$STATE" check <slug>`. `SWEEP FAIL` (exit 1) → stop,
      report the reasons, do not proceed.
-   - **4** (`busy: chunk <n> owned by <owner> since <iso> …`) → another
-     session holds an open chunk. Quote the busy line verbatim, tell Griffin
+   - **4** (`busy: chunk <n> owned by <owner> since <iso> …` or `busy: sweep
+     leased by <owner> until <iso> …`) → another session holds an open chunk
+     or a live loop lease. Quote the busy line verbatim, tell Griffin
      how to take over if that session is dead (`/maestro:sweep takeover
      <slug>`, then restart the loop), and end — no `check`, no `next`, no
      `ScheduleWakeup`. A foreign chunk is also reclaimed automatically once
@@ -163,7 +194,8 @@ Runs only under `/loop` (see above). Each turn:
    straight to the final summary: `python3 "$STATE" status <slug> --json`
    for the done/failed/pending counts — never hand-count from your own
    transcript — plus findings and items added. If you stopped because
-   `next` exited 3, that is the sweep's natural end: end the loop with
+   `next` exited 3, that is the sweep's natural end: release the lease
+   (`lease <slug> --release`) and end the loop with
    `ScheduleWakeup(stop: true)`, no reschedule.
 3. Otherwise ask pace. The sweep directory is `$MAESTRO_SWEEPS_DIR/<slug>` if
    that env var is set, else `<git toplevel of cwd>/.claude/maestro/sweeps/<slug>`
@@ -190,9 +222,10 @@ Runs only under `/loop` (see above). Each turn:
    **Exit `3`** (prints `[]`, writes nothing): nothing is pending or
    running. Stop claiming chunks right there — even if this is the first
    chunk of the turn — and go to step 2's final summary. **Exit `4`**
-   (prints `[]`): nothing is pending but items are still running in another
-   session's open chunk — the sweep is *not* finished; handle it like
-   `recover`'s exit 4 and end the turn.
+   (prints `[]`, claims nothing): another session holds the loop lease, or
+   nothing is pending but items are still running in another session's
+   open chunk — the sweep is *not* finished; handle it like `recover`'s
+   exit 4 and end the turn.
 
    Otherwise dispatch every claimed item as its own agent, **all in the same
    message** (§4 of the output style — this is a fan-out, not a queue), per
@@ -241,7 +274,15 @@ Runs only under `/loop` (see above). Each turn:
    reschedule-at-the-floor case, not the normal sleep math. Otherwise carry
    pace's actual last decision into step 5/6.
 
-5. **`sleep`:** call `ScheduleWakeup` with `delaySeconds` = the decision's
+   **Every `ScheduleWakeup` below that reschedules is preceded by the lease
+   renewal** for the same delay — `python3 "$STATE" lease <slug> --in
+   <delaySeconds>` — so no other session can start a loop on this sweep
+   while this one sleeps. If that exits 4, another session took the sweep
+   over: don't reschedule, tell Griffin, end. (On exit 5 skip it — the
+   chunk-start lease still covers a 60 s floor wakeup.)
+
+5. **`sleep`:** renew the lease (`lease <slug> --in <delay_s>`), then call
+   `ScheduleWakeup` with `delaySeconds` = the decision's
    `delay_s` and `reason` = the decision's `reason`. Do not invent your own
    delay — `pace.py` already clamped it to [60, 3600]; a longer real wait
    just means you get woken and immediately call `pace.py` again, which
@@ -249,13 +290,15 @@ Runs only under `/loop` (see above). Each turn:
    actually time.
 
    **Reschedule at the floor** (3-chunk bound hit while pace still says
-   `continue` or `probe`, or `sweep_state.py` exited 5): call
+   `continue` or `probe`, or `sweep_state.py` exited 5): renew the lease
+   (`lease <slug> --in 60`, skipped after an exit 5), then call
    `ScheduleWakeup(delaySeconds: 60, reason: "<why> — rescheduling at the
    minimum delay")`. State this explicitly in your summary — it is the
    transcript-size cap (or a busy lock) talking, not a usage-driven sleep,
    and 60s is `ScheduleWakeup`'s own floor, not a pace estimate.
 
-6. **`stop`:** write a short sweep handoff, then end the loop with
+6. **`stop`:** write a short sweep handoff, release the lease
+   (`python3 "$STATE" lease <slug> --release`), then end the loop with
    `ScheduleWakeup(stop: true)` — do not reschedule. Every handoff carries
    progress (done/failed/pending counts from `status --json`), the resume
    line (`/loop /maestro:sweep resume <slug>`), and a reason + remedy pair
@@ -300,16 +343,19 @@ Exit 2 means the policy was invalid and nothing changed.
 
 ## `takeover <slug>`
 
-Only when Griffin says the session that owns the open chunk is dead (the
-anchor or a `busy:` line named it). Not a loop turn — run once:
+Only when Griffin says the session that owns the open chunk or holds the
+loop lease is dead (the anchor or a `busy:` line named it — including this
+same conversation before a `/clear`). Not a loop turn — run once:
 
 ```bash
 python3 "$STATE" recover <slug> --takeover
 ```
 
 It closes the other session's open chunk as interrupted, returns its
-unreported items to pending, logs a `takeover` amendment, and makes this
-session the owner of the next chunk. Then hand Griffin the
+unreported items to pending, moves the loop lease to this session, logs a
+`takeover` amendment, and makes this session the owner of the next chunk.
+If the old loop does wake up later, its `recover`/`next` exit 4. Then hand
+Griffin the
 `/loop /maestro:sweep resume <slug>` line to restart the loop in this
 session.
 
@@ -323,7 +369,9 @@ next.
 ## `stop <slug>`
 
 Marks nothing in the sweep itself — `stop` here means *end the loop
-cleanly*, not abandon the sweep. If this turn is running under `/loop`, call
+cleanly*, not abandon the sweep. Release this session's lease
+(`python3 "$STATE" lease <slug> --release`; an exit 4 means another session
+holds it — leave it), and if this turn is running under `/loop`, call
 `ScheduleWakeup(stop: true)`. Print the counts and the resume command:
 ```
 /loop /maestro:sweep resume <slug>

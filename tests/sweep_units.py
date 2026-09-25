@@ -198,6 +198,16 @@ def stdout_unchanged_case():
 
 # ── (2) sweep_state.py lifecycle ─────────────────────────────────────────
 
+def expire_lease(d):
+    """Make a sweep's loop lease lapse (as it would once its owner's loop
+    has been dead for LEASE_MARGIN_S past its last wake time)."""
+    p = d / "lease.json"
+    if p.exists():
+        lease = json.loads(p.read_text())
+        lease["until"] = time.time() - 1
+        p.write_text(json.dumps(lease))
+
+
 def write_plan_and_items(d, labels, plan_text="# Plan\n\nDo the thing.\n"):
     plan = d / "plan.md"
     items = d / "items.txt"
@@ -384,6 +394,10 @@ def two_owner_recover_case():
     index = json.loads((d / "index.json").read_text())
     check("nothing reclaimed while busy", all(it["status"] == "running" for it in index["items"]))
 
+    r_lease = run_sweep(["recover", "s4c", "--owner", "bob", "--stale-after", "0"], env)
+    check("a stale chunk is still refused while its owner's loop lease is live",
+          r_lease.returncode == 4 and "leased by alice" in r_lease.stderr, r_lease.stderr)
+    expire_lease(d)
     r2 = run_sweep(["recover", "s4c", "--owner", "bob", "--stale-after", "0"], env)
     check("a stale owner's chunk IS reclaimed", r2.returncode == 0, r2.stderr)
     check("stale reclaim reports both items", sorted(json.loads(r2.stdout)) == ["i-0001", "i-0002"])
@@ -412,6 +426,7 @@ def end_chunk_owner_case():
               "--policy", json.dumps({"chunk_size": 1})], env)
     d = ws / "sweeps" / "s4d"
     run_sweep(["next", "s4d", "--owner", "alice"], env)
+    expire_lease(d)   # alice's loop lease would (rightly) refuse bob's next
     run_sweep(["next", "s4d", "--owner", "bob"], env)
 
     r = run_sweep(["end-chunk", "s4d", "--owner", "bob"], env)
@@ -855,9 +870,11 @@ def stranded_running_case():
     plan2, items2 = write_plan_and_items(ws2, ["only"])
     run_sweep(["new", "--slug", "s11", "--plan", str(plan2), "--items", str(items2)], env2)
     run_sweep(["next", "s11", "--owner", "sess-A"], env2)
+    expire_lease(ws2 / "sweeps" / "s11")   # isolate the running-items rule from the lease
     r = run_sweep(["next", "s11", "--owner", "sess-B"], env2)
     check("next with nothing pending but items running exits 4, not 3",
-          r.returncode == 4 and "sess-A" in r.stderr, f"rc={r.returncode} err={r.stderr}")
+          r.returncode == 4 and "sess-A" in r.stderr and "still running" in r.stderr,
+          f"rc={r.returncode} err={r.stderr}")
 
     # A legacy strand (running item, chunk already closed) is reclaimed by recover.
     pace_path = ws2 / "sweeps" / "s11" / "pace.jsonl"
@@ -1027,6 +1044,139 @@ def missing_sweep_exit_codes_case():
     check("no sweep directory was created by a typo", not (ws / "sweeps" / "typo").exists())
 
 
+# ── residuals: freshness from API activity; loop lease ──────────────────
+
+def active_payload(sid, api_ms, five_pct, five_resets=5000):
+    p = statusline_payload(five_pct=five_pct, five_resets=five_resets, sid=sid)
+    p["cost"] = {"total_cost_usd": 0.1, "total_duration_ms": 1000, "total_api_duration_ms": api_ms}
+    return p
+
+
+def fresh_from_api_activity_case():
+    print("\n=== statusline — fresh_at advances on API activity, not on rising values ===")
+    usage_file = tmpdir("maestro-usage-") / "usage.json"
+    env = base_env(usage_file=usage_file)
+
+    run_statusline(active_payload("A", 1000, 40), env)
+    rec = json.loads(usage_file.read_text())
+    check("first sighting of a session is not fresh (it may be idle)",
+          "fresh_at" in rec["five_hour"] and rec["five_hour"]["fresh_at"] is None, rec)
+    check("the session's api duration is recorded", rec.get("sessions", {}).get("A", {}).get("api_ms") == 1000, rec)
+
+    mtime = usage_file.stat().st_mtime
+    time.sleep(0.05)
+    run_statusline(active_payload("A", 1000, 40), env)
+    check("a repeat tick with no new API response writes nothing", usage_file.stat().st_mtime == mtime)
+
+    time.sleep(0.05)
+    run_statusline(active_payload("A", 1500, 40), env)
+    rec2 = json.loads(usage_file.read_text())
+    f1 = rec2["five_hour"]["fresh_at"]
+    check("API response with an UNCHANGED value still refreshes fresh_at",
+          isinstance(f1, float) and rec2["five_hour"]["used_percentage"] == 40, rec2)
+    check("…without pretending the value rose (captured_at unchanged)",
+          rec2["five_hour"]["captured_at"] == rec["five_hour"]["captured_at"], rec2)
+
+    time.sleep(0.05)
+    run_statusline(active_payload("B", 700, 40), env)      # idle session, first sighting
+    run_statusline(active_payload("B", 700, 40), env)      # still idle
+    time.sleep(0.05)
+    run_statusline(active_payload("B", 700, 41), env)      # idle, but a higher value
+    rec3 = json.loads(usage_file.read_text())
+    check("an idle session never refreshes fresh_at", rec3["five_hour"]["fresh_at"] == f1, rec3)
+    check("…though its higher value still merges (monotonic rule)",
+          rec3["five_hour"]["used_percentage"] == 41, rec3)
+
+    # pruning: a session unseen for over a day is dropped on the next write.
+    rec3["sessions"]["ancient"] = {"api_ms": 5, "seen": time.time() - 2 * 86400}
+    usage_file.write_text(json.dumps(rec3))
+    run_statusline(active_payload("A", 2000, 41), env)
+    rec4 = json.loads(usage_file.read_text())
+    check("sessions older than a day are pruned", "ancient" not in rec4["sessions"]
+          and "A" in rec4["sessions"], rec4["sessions"])
+
+    # sweep_state snapshots the freshness time as the window's capture time.
+    ws = tmpdir("maestro-ws-")
+    env2 = base_env(sweeps_dir=ws / "sweeps", usage_file=usage_file)
+    plan, items = write_plan_and_items(ws, ["a"])
+    run_sweep(["new", "--slug", "fr", "--plan", str(plan), "--items", str(items)], env2)
+    run_sweep(["next", "fr"], env2)
+    pace = [json.loads(l) for l in (ws / "sweeps" / "fr" / "pace.jsonl").read_text().splitlines() if l.strip()]
+    check("pace snapshot's per-window time is fresh_at",
+          pace[-1]["usage"]["captured"]["five_hour"] == rec4["five_hour"]["fresh_at"], pace[-1]["usage"])
+
+
+def lease_case():
+    print("\n=== sweep_state — loop lease: a sleeping loop still owns its sweep ===")
+    ws = tmpdir("maestro-ws-")
+    sweeps = ws / "sweeps"
+    env_a = base_env(sweeps_dir=sweeps, session="sess-A")
+    env_b = base_env(sweeps_dir=sweeps, session="sess-B")
+    plan, items = write_plan_and_items(ws, ["a", "b", "c"])
+    run_sweep(["new", "--slug", "s12", "--plan", str(plan), "--items", str(items),
+              "--policy", json.dumps({"chunk_size": 1})], env_a)
+    d = sweeps / "s12"
+
+    t0 = time.time()
+    run_sweep(["next", "s12"], env_a)
+    lease = json.loads((d / "lease.json").read_text())
+    check("chunk start takes the lease", lease["owner"] == "sess-A"
+          and t0 + 590 <= lease["until"] <= time.time() + 610, lease)
+    run_sweep(["done", "s12", "i-0001"], env_a)
+    run_sweep(["end-chunk", "s12"], env_a)
+
+    # A is now sleeping between chunks (no open chunk). The attack: B starts
+    # its own loop beside it.
+    r = run_sweep(["recover", "s12"], env_b)
+    check("B's recover refuses while A's lease is live (exit 4)",
+          r.returncode == 4 and "leased by sess-A" in r.stderr and "takeover" in r.stderr,
+          f"rc={r.returncode} err={r.stderr}")
+    r = run_sweep(["next", "s12"], env_b)
+    check("B's next refuses too, claiming nothing", r.returncode == 4 and r.stdout.strip() == "[]"
+          and json.loads((d / "index.json").read_text())["items"][1]["status"] == "pending",
+          f"rc={r.returncode} err={r.stderr}")
+    r = run_sweep(["lease", "s12", "--in", "60"], env_b)
+    check("B cannot take the lease", r.returncode == 4, r.stderr)
+
+    ctx_b = anchor_ctx(env_a, anchor_payload(ws, "sess-B"))
+    check("anchor tells B the sweep is leased by A, with the takeover line and no resume line",
+          "leased by another session (sess-A)" in ctx_b
+          and "Take over with /maestro:sweep takeover s12" in ctx_b and "Resume with" not in ctx_b, ctx_b)
+    ctx_a = anchor_ctx(env_a, anchor_payload(ws, "sess-A"))
+    check("anchor gives the lease holder the resume line",
+          "Resume with /loop /maestro:sweep resume s12" in ctx_a, ctx_a)
+
+    t1 = time.time()
+    r = run_sweep(["lease", "s12", "--in", "1800"], env_a)
+    lease = json.loads((d / "lease.json").read_text())
+    check("lease --in N holds until now + N + 600 s margin", r.returncode == 0
+          and t1 + 2390 <= lease["until"] <= time.time() + 2410, (r.stderr, lease))
+    r = run_sweep(["recover", "s12"], env_a)
+    check("the holder's own recover is not blocked", r.returncode == 0, r.stderr)
+    r = run_sweep(["lease", "s12", "--until", str(time.time() - 5)], env_a)
+    check("a lease time in the past is refused (exit 2)", r.returncode == 2, r.stderr)
+
+    # A dies; B takes over explicitly.
+    r = run_sweep(["recover", "s12", "--takeover"], env_b)
+    check("B's recover --takeover succeeds", r.returncode == 0, r.stderr)
+    lease = json.loads((d / "lease.json").read_text())
+    check("…and B now holds the lease", lease["owner"] == "sess-B", lease)
+    amends = [json.loads(l) for l in (d / "amendments.jsonl").read_text().splitlines() if l.strip()]
+    check("the lease takeover is logged", any(a.get("op") == "takeover" and a.get("from_owner") == "sess-A"
+                                              and a.get("lease_until") for a in amends), amends)
+    r = run_sweep(["check", "s12"], env_b)
+    check("check passes after a lease takeover", r.returncode == 0, r.stdout)
+    r = run_sweep(["next", "s12"], env_a)
+    check("A's loop waking after the takeover is refused (exit 4)", r.returncode == 4, r.stderr)
+
+    r = run_sweep(["lease", "s12", "--release"], env_b)
+    check("lease --release drops the lease", r.returncode == 0 and not (d / "lease.json").exists(), r.stderr)
+    r = run_sweep(["recover", "s12"], env_a)
+    check("with no lease and no open chunk anyone may resume", r.returncode == 0, r.stderr)
+    r = run_sweep(["lease", "typo", "--in", "60"], env_a)
+    check("lease on a missing sweep is exit 2", r.returncode == 2 and "no such sweep" in r.stderr, r.stderr)
+
+
 def main():
     usage_snapshot_case()
     usage_merge_case()
@@ -1055,6 +1205,8 @@ def main():
     policy_tamper_case()
     set_policy_case()
     missing_sweep_exit_codes_case()
+    fresh_from_api_activity_case()
+    lease_case()
     print("\n  " + ("PASS" if not FAILURES else f"FAIL ({len(FAILURES)}): {FAILURES}"))
     return 1 if FAILURES else 0
 
