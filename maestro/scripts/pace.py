@@ -66,7 +66,12 @@ For each window ("five_hour", "seven_day") present in `snapshot`:
    the start value is present (NaN/non-numeric readings count as absent),
    the window did not roll over in between (resets_at within 60s — the
    statusline jitters it by a second or so) and the used percentage did not
-   drop (a drop is discarded, not counted as negative burn). Two figures:
+   drop (a drop is discarded, not counted as negative burn). Each delta is
+   divided by the number of items that chunk claimed (its start record's
+   `items`; a record without them counts as one full chunk) and the result
+   scaled by the CURRENT `chunk_size` — raising chunk_size mid-sweep (5 ->
+   20) must not gate a 20-item chunk on a 5-item delta. Projections count
+   the items claimed since the reading the same way. Two figures:
      - `burn` (mean of the deltas, last 5) — used to space chunks out.
      - `gate_burn` (max(largest recent delta, 1.0 percentage point)) — used
        to decide whether one more chunk still fits before the ceiling, and
@@ -137,9 +142,11 @@ For each window ("five_hour", "seven_day") present in `snapshot`:
    get a reading, and say usage is unknown in the reason. Once the most
    recent >= 3 chunks in a row are unread — whether or not usage.json
    exists, since a frozen file is no signal either — probing further just
-   spends usage blind: the verdict is "stop" with reason "no usage signal —
-   run install.sh so Maestro's statusLine records rate_limits, or set
-   allow_blind", UNLESS `policy.allow_blind` is set, in which case sleep
+   spends usage blind: the verdict is "stop" with a reason starting "no
+   usage signal —" that names both causes (Maestro's statusLine not
+   installed — run install.sh — or a session where no status line renders:
+   headless -p, and possibly a backgrounded session, which the docs leave
+   unspecified), UNLESS `policy.allow_blind` is set, in which case sleep
    `blind_gap_s` between chunks instead (still clamped to [60, 3600], with
    `wake_at` for the remainder when `blind_gap_s` itself is over an hour).
    This is combined with the window verdicts like any other (stop wins).
@@ -160,6 +167,7 @@ from pathlib import Path
 # tripping the actual account limit mid-sweep.
 _DEFAULT_BURN = 5.0        # percentage points per chunk
 _DEFAULT_DURATION = 300.0  # seconds per chunk
+_DEFAULT_ITEM_BURN = 1.0   # percentage points per item (big chunks scale up)
 
 _WINDOWS = ("five_hour", "seven_day")
 _MIN_DELAY = 60
@@ -343,9 +351,31 @@ def _trailing_unread(history):
     return count
 
 
-def _window_deltas(pairs, window, limit=5):
-    """(used_delta, duration) for each completed chunk with a fresh end
-    reading for `window`, most recent last, capped to the last `limit`."""
+def _item_count(start, chunk_size):
+    """Items a chunk claimed — its start record's `items`; a record without
+    them (hand-written history) counts as one full chunk of the current
+    size."""
+    items = (start or {}).get("items")
+    return len(items) if isinstance(items, list) and items else chunk_size
+
+
+def _items_since(history, threshold_at, chunk_size):
+    """Items claimed by chunks that started at or after `threshold_at` (all
+    chunks when it is None)."""
+    total = 0
+    for start, _ in _chunks(history):
+        at = _finite_number(start.get("at"))
+        if at is None or (threshold_at is not None and at < threshold_at):
+            continue
+        total += _item_count(start, chunk_size)
+    return total
+
+
+def _window_deltas(pairs, window, chunk_size, limit=5):
+    """(used_delta PER ITEM, duration) for each completed chunk with a fresh
+    end reading for `window`, most recent last, capped to the last `limit`.
+    Per item, so a chunk_size raised mid-sweep (set-policy 5 -> 20) scales
+    the estimate instead of gating a 20-item chunk on a 5-item delta."""
     deltas = []
     for start, end in pairs:
         if not _fresh_end(start, end, window):
@@ -362,12 +392,14 @@ def _window_deltas(pairs, window, limit=5):
         e_at = _finite_number(end.get("at"))
         if s_at is None or e_at is None or e_at < s_at:
             continue
-        deltas.append((eu - su, e_at - s_at))
+        deltas.append(((eu - su) / _item_count(start, chunk_size), e_at - s_at))
     return deltas[-limit:]
 
 
-def _burn_and_duration(pairs, window):
-    """Return (burn_per_chunk, gate_burn, mean_duration, used_default: bool).
+def _burn_and_duration(pairs, window, chunk_size=None):
+    """Return (burn_per_chunk, gate_burn, mean_duration, used_default: bool),
+    both burns for a chunk of the CURRENT `chunk_size` items (per-item
+    deltas scaled up; a probe is 1 item, so this is its upper bound).
 
     `burn` is the mean delta — a robust average for spacing.
     `gate_burn` is max(largest recent delta, 1.0) — the floor used to decide
@@ -375,11 +407,12 @@ def _burn_and_duration(pairs, window):
     max(burn, gate_burn), to project readings forward), so a run of
     zero/near-zero coarse readings (or a mean pulled down by a few quiet
     chunks) can never wave a chunk through right at, or past, the ceiling."""
-    deltas = _window_deltas(pairs, window)
+    chunk_size = chunk_size or 1
+    deltas = _window_deltas(pairs, window, chunk_size)
     if not deltas:
-        gate_burn = max(_DEFAULT_BURN, 1.0)
-        return _DEFAULT_BURN, gate_burn, _DEFAULT_DURATION, True
-    burns = [d for d, _ in deltas]
+        burn = max(_DEFAULT_BURN, _DEFAULT_ITEM_BURN * chunk_size)
+        return burn, max(burn, 1.0), _DEFAULT_DURATION, True
+    burns = [d * chunk_size for d, _ in deltas]
     durations = [d for _, d in deltas]
     mean_burn = sum(burns) / len(burns)
     gate_burn = max(max(burns), 1.0)
@@ -429,9 +462,13 @@ def _blind_verdict(unread, now, allow_blind, blind_gap_s):
         }
     return {
         "action": "stop", "delay_s": 0, "window": None, "wake_at": None,
-        "reason": "no usage signal — run install.sh so Maestro's statusLine "
-                  "records rate_limits, or set allow_blind (%d chunk(s) in a row "
-                  "ended with no fresh usage reading)" % unread,
+        "reason": "no usage signal — %d chunk(s) in a row ended with no fresh usage "
+                  "reading. Run install.sh so Maestro's statusLine records rate_limits, "
+                  "or set allow_blind. The status line only runs where Claude Code "
+                  "renders one: never in a headless -p run, and the docs don't say "
+                  "whether a backgrounded (agent view) session renders it, so a sweep "
+                  "loop moved to the background may be blind even when it is installed"
+                  % unread,
     }
 
 
@@ -449,6 +486,7 @@ def decide(snapshot, now, policy, history):
     margin_s = policy.get("margin_s", 120)
     allow_blind = policy.get("allow_blind", _DEFAULT_ALLOW_BLIND)
     blind_gap_s = policy.get("blind_gap_s", _DEFAULT_BLIND_GAP_S)
+    chunk_size = policy["chunk_size"]
 
     blind = _blind_verdict(_trailing_unread(history), now, allow_blind, blind_gap_s)
 
@@ -490,8 +528,10 @@ def decide(snapshot, now, policy, history):
         else:
             fresh_at = captured_at
 
-        burn, gate_burn, duration, used_default = _burn_and_duration(pairs, window)
-        proj_burn = max(burn, gate_burn)
+        burn, gate_burn, duration, used_default = _burn_and_duration(pairs, window, chunk_size)
+        # Projections count the items actually claimed since the reading,
+        # at max(burn, gate_burn) per current-size chunk.
+        proj_item = max(burn, gate_burn) / chunk_size
         default_note = " (no history yet, using conservative default burn)" if used_default else ""
 
         reset_happened = resets_at is not None and resets_at <= now
@@ -505,7 +545,7 @@ def decide(snapshot, now, policy, history):
                 }
                 verdict = _more_restrictive(verdict, w)
                 continue
-            projected = proj_burn * chunks_since_reset
+            projected = proj_item * _items_since(history, resets_at, chunk_size)
             stale_note = " (window reset since reading; estimated from %d chunk(s) run since reset)" \
                 % chunks_since_reset
         else:
@@ -518,7 +558,7 @@ def decide(snapshot, now, policy, history):
                 since = fresh_at if fresh_at is not None else captured_at
                 chunks_since_reading = (_chunks_since(history, since) if since is not None
                                         else len(_chunk_start_times(history)))
-                projected = used + proj_burn * chunks_since_reading
+                projected = used + proj_item * _items_since(history, since, chunk_size)
                 stale_note = " (stale reading, projected forward by %d chunk(s) since capture)" \
                     % chunks_since_reading
             else:

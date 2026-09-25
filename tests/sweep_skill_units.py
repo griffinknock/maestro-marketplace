@@ -228,6 +228,58 @@ def lease_doc_case(text):
     check("anchor reports the lease holder", "is leased by another session" in state_src)
 
 
+def skill_blocks(text):
+    """SKILL.md split into instruction blocks: a new block at every blank
+    line, list item, numbered step or table row."""
+    blocks, cur = [], []
+    for line in text.splitlines():
+        starts = re.match(r"^\s*(- |\| |\d+\. )", line)
+        if not line.strip() or starts:
+            if cur:
+                blocks.append("\n".join(cur))
+            cur = [line] if line.strip() else []
+        else:
+            cur.append(line)
+    if cur:
+        blocks.append("\n".join(cur))
+    return blocks
+
+
+def terminal_paths_case(text):
+    print("\n=== SKILL.md — every terminal path names ScheduleWakeup(stop: true) ===")
+    if text is None:
+        check("skipped — no SKILL.md text", False)
+        return
+    stop_call = "ScheduleWakeup(stop: true)"
+    stop_norm = lambda b: norm(b).replace("stop: true )", "stop: true)")
+    check("SKILL.md cites the fallback-wakeup rule from the scheduled-tasks docs",
+          "https://code.claude.com/docs/en/scheduled-tasks" in text
+          and "schedules one fallback wakeup about 20 minutes later" in text)
+    check("the END procedure releases the lease, then calls the stop",
+          re.search(r"\*\*END the loop\*\*.*?lease <slug> --release.*?ScheduleWakeup\(stop: true\)",
+                    text, re.DOTALL) is not None)
+    forbidden = ["no `ScheduleWakeup`", "do not `ScheduleWakeup`", "don't reschedule, tell Griffin, end",
+                 "no\n     `ScheduleWakeup`"]
+    found = [f for f in forbidden if f in text]
+    check("no path tells you to end WITHOUT the stop call", not found, found)
+    # instructions that end the loop: "END with …", "END (…)", "and end",
+    # "stop and report", "end the loop with"
+    terminal = re.compile(r"\bEND (with|\()|\band end\b|stop and report|end the loop with", re.I)
+    missing = [norm(b)[:90] for b in skill_blocks(text)
+               if terminal.search(b) and "stop: true" not in norm(b)
+               and "## Every iteration ends" not in b and "ScheduleWakeup(stop: true)" not in stop_norm(b)
+               and not b.lstrip().startswith("#")]
+    check("every block that ends the loop names ScheduleWakeup(stop: true)", not missing, missing)
+    rows = {int(m.group(1)): m.group(0) for m in re.finditer(r"^\| ([0-9]) \|.*$", text, re.M)}
+    for code in (1, 2, 3, 4):
+        check(f"exit-code row {code} ends with {stop_call}", stop_call in rows.get(code, ""), rows.get(code))
+    check("done/fail exit 5 is retried, not dropped",
+          re.search(r"^\| 5 \|.*retry that same call", text, re.M) is not None)
+    check("the exit-5 lease claim is corrected (no 'chunk-start lease still covers')",
+          "chunk-start lease still covers" not in text)
+    check("background sessions may go blind is documented", "backgrounded (agent view)" in text)
+
+
 def main():
     text = frontmatter_case()
     script_surface_case(text)
@@ -236,6 +288,7 @@ def main():
     anchor_match_case(text)
     exit_codes_case(text)
     lease_doc_case(text)
+    terminal_paths_case(text)
     print("\n  " + ("PASS" if not FAILURES else f"FAIL ({len(FAILURES)}): {FAILURES}"))
     return 1 if FAILURES else 0
 

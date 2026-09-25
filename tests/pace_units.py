@@ -678,6 +678,46 @@ def fresh_at_drives_staleness_case():
     check("fresh_at null -> treated as stale even with a recent captured_at", "stale" in d2["reason"], d2)
 
 
+def chunk_size_raised_midsweep_case():
+    print("\n=== chunk_size raised 5 -> 20 at 77%/80% with 2%/chunk history -> not continue ===")
+    now = 10000.0
+    resets = now + 200      # reset close enough that the paced gap alone says "continue"
+    history = []
+    t = now - 5000
+    used = 67.0
+    for i in range(1, 6):   # five 5-item chunks, 2 points each (0.4 per item)
+        items = [f"i-{5 * (i - 1) + k:04d}" for k in range(1, 6)]
+        s = pace_rec(i, "start", t, five_used=used, five_resets=resets, captured_at=t - 5)
+        e = pace_rec(i, "end", t + 100, five_used=used + 2.0, five_resets=resets, captured_at=t + 90)
+        s["items"] = items
+        history += [s, e]
+        used += 2.0
+        t += 200
+    snapshot = snap(now, five_hour={"used_percentage": 77.0, "resets_at": resets,
+                                    "captured_at": now - 10, "fresh_at": now - 10})
+    d20 = decide(snapshot, now, dict(DEFAULT_POLICY, chunk_size=20), history)
+    check("a 20-item chunk (~8 points) doesn't fit in 3 points of headroom -> not continue",
+          d20["action"] != "continue", d20)
+    check("…the fit gate says so: five_hour headroom below one 20-item chunk",
+          d20["action"] == "sleep" and d20["window"] == "five_hour"
+          and "below one chunk's burn (8.0%)" in d20["reason"], d20)
+    d5 = decide(snapshot, now, dict(DEFAULT_POLICY, chunk_size=5), history)
+    check("the same history at chunk_size 5 (2 points) still fits", d5["action"] in ("continue", "sleep")
+          and "below one chunk" not in d5["reason"], d5)
+    d1 = decide(snapshot, now, dict(DEFAULT_POLICY, chunk_size=1), history)
+    check("a 1-item chunk is gated at the 1-point floor, not 2 points",
+          "below one chunk" not in d1["reason"], d1)
+
+
+def no_signal_reason_names_background_case():
+    print("\n=== no-signal stop names headless/background sessions, not only install.sh ===")
+    history = [pace_rec(i, "start", i * 100, five_used=None, seven_used=None) for i in range(1, 4)]
+    d = decide(None, 1000.0, DEFAULT_POLICY, history)
+    check("still a 'no usage signal' stop", d["action"] == "stop" and "no usage signal" in d["reason"], d)
+    check("reason mentions install.sh AND headless/background sessions",
+          "install.sh" in d["reason"] and "headless" in d["reason"] and "background" in d["reason"], d)
+
+
 def main():
     no_history_case()
     low_usage_far_from_reset_case()
@@ -717,6 +757,8 @@ def main():
     reset_jitter_delta_case()
     projection_uses_gate_burn_case()
     fresh_at_drives_staleness_case()
+    chunk_size_raised_midsweep_case()
+    no_signal_reason_names_background_case()
 
     print()
     if FAILURES:

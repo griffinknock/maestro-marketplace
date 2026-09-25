@@ -255,6 +255,11 @@ def lifecycle_case():
 
     r = run_sweep(["fail", "s1", second_id, "--reason", "flaked"], env)
     check("first fail returns to pending (attempts < max)", r.returncode == 0 and r.stdout.strip() == "pending", r.stdout)
+    r = run_sweep(["fail", "s1", second_id, "--reason", "flaked twice"], env)
+    check("a second fail on an item no longer running is refused (exit 4), no attempt spent",
+          r.returncode == 4, f"rc={r.returncode} err={r.stderr}")
+    r = run_sweep(["next", "s1", "--n", "1"], env)
+    check("the failed-once item is re-claimed", [c["id"] for c in json.loads(r.stdout)] == [second_id], r.stdout)
     r = run_sweep(["fail", "s1", second_id, "--reason", "flaked again"], env)
     check("second fail becomes failed (attempts == max_attempts)",
           r.returncode == 0 and r.stdout.strip() == "failed", r.stdout)
@@ -956,10 +961,15 @@ def policy_tamper_case():
     idx2["plan_versions"] = []
     (d2 / "index.json").write_text(json.dumps(idx2))
     r = run_sweep(["check", "t5b"], env2)
-    check("check rejects an amend_plan amendment with no plan_versions entry",
-          r.returncode == 1 and "amend_plan" in r.stdout, r.stdout)
+    check("an amend_plan logged but never recorded (a crash) is tolerated as never applied",
+          r.returncode == 0, r.stdout)
     idx2["plan_versions"] = saved
     (d2 / "index.json").write_text(json.dumps(idx2))
+    with open(d2 / "amendments.jsonl", "a") as f:
+        f.write(json.dumps(amends[-1]) + "\n")
+    r = run_sweep(["check", "t5b"], env2)
+    check("check rejects a second amend_plan amendment for an applied version",
+          r.returncode == 1 and "duplicate" in r.stdout, r.stdout)
     (d2 / "amendments.jsonl").write_text("")
     r = run_sweep(["check", "t5b"], env2)
     check("check rejects a plan version with no amend_plan amendment",
@@ -1177,6 +1187,208 @@ def lease_case():
     check("lease on a missing sweep is exit 2", r.returncode == 2 and "no such sweep" in r.stderr, r.stderr)
 
 
+# ── final re-attack: crash boundaries, zombie results, lock liveness ────
+
+CRASH_DRIVER = '''
+import os, sys
+sys.path.insert(0, os.environ["MAESTRO_SCRIPTS"])
+import sweep_state as ss
+target = sys.argv[1]
+orig = ss.atomic_write_text
+def boom(path, text):
+    if str(path).endswith(target):
+        os._exit(137)   # simulated kill -9 right before this write
+    return orig(path, text)
+ss.atomic_write_text = boom
+sys.argv = ["sweep_state.py"] + sys.argv[2:]
+sys.exit(ss.main())
+'''
+
+
+def run_crashing(target, args, env):
+    driver = tmpdir("maestro-crash-") / "crash.py"
+    driver.write_text(CRASH_DRIVER)
+    env = dict(env, MAESTRO_SCRIPTS=str(SCRIPTS))
+    return subprocess.run([sys.executable, str(driver), target, *args],
+                          capture_output=True, text=True, env=env)
+
+
+def amendments_of(d, op):
+    return [json.loads(l) for l in (d / "amendments.jsonl").read_text().splitlines()
+            if l.strip() and json.loads(l).get("op") == op]
+
+
+def set_policy_crash_case():
+    print("\n=== sweep_state — set-policy survives a crash at every write boundary ===")
+    for target in ("policy.v2.json", "amendments.jsonl", "policy.json", "index.json"):
+        ws = tmpdir("maestro-ws-")
+        env = base_env(sweeps_dir=ws / "sweeps")
+        plan, items = write_plan_and_items(ws, ["one"])
+        run_sweep(["new", "--slug", "c1", "--plan", str(plan), "--items", str(items)], env)
+        d = ws / "sweeps" / "c1"
+        req = json.dumps({"deviation": "locked"})
+        r = run_crashing(target, ["set-policy", "c1", "--json", req], env)
+        check(f"[{target}] the simulated crash happened", r.returncode == 137, r.returncode)
+        r = run_sweep(["recover", "c1"], env)
+        check(f"[{target}] recover after the crash exits 0", r.returncode == 0, r.stderr)
+        r = run_sweep(["check", "c1"], env)
+        check(f"[{target}] check passes after the crash + recover", r.returncode == 0, r.stdout)
+        r = run_sweep(["set-policy", "c1", "--json", req], env)
+        check(f"[{target}] retrying the same set-policy succeeds", r.returncode == 0, r.stderr)
+        r = run_sweep(["check", "c1"], env)
+        check(f"[{target}] check passes after the retry", r.returncode == 0, r.stdout)
+        index = json.loads((d / "index.json").read_text())
+        check(f"[{target}] exactly one policy change recorded, one set_policy amendment",
+              len(index["policy_versions"]) == 2 and len(amendments_of(d, "set_policy")) == 1,
+              (index["policy_versions"], amendments_of(d, "set_policy")))
+        check(f"[{target}] the change is in force",
+              json.loads((d / "policy.json").read_text())["deviation"] == "locked")
+
+    # A crash after logging, then a DIFFERENT request: the orphan (never
+    # applied) is tolerated, the new one applies.
+    ws = tmpdir("maestro-ws-")
+    env = base_env(sweeps_dir=ws / "sweeps")
+    plan, items = write_plan_and_items(ws, ["one"])
+    run_sweep(["new", "--slug", "c2", "--plan", str(plan), "--items", str(items)], env)
+    d = ws / "sweeps" / "c2"
+    run_crashing("policy.json", ["set-policy", "c2", "--json", json.dumps({"deviation": "locked"})], env)
+    r = run_sweep(["set-policy", "c2", "--json", json.dumps({"chunk_size": 3})], env)
+    check("a different request after the crash succeeds", r.returncode == 0, r.stderr)
+    r = run_sweep(["check", "c2"], env)
+    check("check tolerates the never-applied orphan amendment", r.returncode == 0, r.stdout)
+    pol = json.loads((d / "policy.json").read_text())
+    check("the orphan was not applied; the new request was",
+          pol["deviation"] == "additive" and pol["chunk_size"] == 3, pol)
+    run_sweep(["finding", "c2", "--text", "x"], env)
+    r = run_sweep(["add", "c2", "--label", "more", "--from-finding", "f-0001"], env)
+    r = run_sweep(["check", "c2"], env)
+    check("the deviation timeline ignores the never-applied orphan (add under additive passes)",
+          r.returncode == 0, r.stdout)
+
+
+def amend_plan_crash_case():
+    print("\n=== sweep_state — amend-plan survives a crash at every write boundary ===")
+    for target in ("plan.v2.md", "amendments.jsonl", "index.json"):
+        ws = tmpdir("maestro-ws-")
+        env = base_env(sweeps_dir=ws / "sweeps")
+        plan, items = write_plan_and_items(ws, ["one"])
+        run_sweep(["new", "--slug", "c3", "--plan", str(plan), "--items", str(items),
+                  "--policy", json.dumps({"deviation": "autonomous"})], env)
+        d = ws / "sweeps" / "c3"
+        run_sweep(["finding", "c3", "--text", "gap"], env)
+        newplan = ws / "p2.md"
+        newplan.write_text("# v2\n")
+        args = ["amend-plan", "c3", "--file", str(newplan), "--from-finding", "f-0001"]
+        r = run_crashing(target, args, env)
+        check(f"[{target}] the simulated crash happened", r.returncode == 137, r.returncode)
+        r = run_sweep(["check", "c3"], env)
+        check(f"[{target}] check passes right after the crash", r.returncode == 0, r.stdout)
+        r = run_sweep(args, env)
+        check(f"[{target}] retrying the same amend-plan succeeds", r.returncode == 0, r.stderr)
+        r = run_sweep(["check", "c3"], env)
+        check(f"[{target}] check passes after the retry", r.returncode == 0, r.stdout)
+        index = json.loads((d / "index.json").read_text())
+        check(f"[{target}] one plan version, one amend_plan amendment",
+              len(index["plan_versions"]) == 1 and len(amendments_of(d, "amend_plan")) == 1,
+              (index["plan_versions"], amendments_of(d, "amend_plan")))
+
+
+def zombie_results_case():
+    print("\n=== sweep_state — a zombie loop's late done/fail can't land (concern a) ===")
+    ws = tmpdir("maestro-ws-")
+    sweeps = ws / "sweeps"
+    env_a = base_env(sweeps_dir=sweeps, session="sess-A")
+    env_b = base_env(sweeps_dir=sweeps, session="sess-B")
+    plan, items = write_plan_and_items(ws, ["a", "b"])
+    run_sweep(["new", "--slug", "z1", "--plan", str(plan), "--items", str(items),
+              "--policy", json.dumps({"chunk_size": 1})], env_a)
+    d = sweeps / "z1"
+    run_sweep(["next", "z1"], env_a)                       # A claims i-0001
+    run_sweep(["recover", "z1", "--takeover"], env_b)      # A declared dead
+    r = run_sweep(["done", "z1", "i-0001"], env_a)
+    check("A's late done on a reclaimed item exits 4", r.returncode == 4, f"rc={r.returncode} err={r.stderr}")
+    r = run_sweep(["fail", "z1", "i-0001", "--reason", "late"], env_a)
+    check("A's late fail exits 4 too", r.returncode == 4, r.stderr)
+    it = find(d, "i-0001")
+    check("…nothing changed: still pending, no attempt spent",
+          it["status"] == "pending" and it["attempts"] == 0, it)
+    run_sweep(["next", "z1"], env_b)                       # B re-claims i-0001
+    r = run_sweep(["done", "z1", "i-0001"], env_a)
+    check("A's done can't finish B's running item", r.returncode == 4
+          and find(d, "i-0001")["status"] == "running", r.stderr)
+    r = run_sweep(["done", "z1", "i-0001"], env_b)
+    check("B, the owner, records it", r.returncode == 0 and find(d, "i-0001")["status"] == "done", r.stderr)
+
+
+def results_renew_lease_case():
+    print("\n=== sweep_state — done/fail/end-chunk renew the owner's lease (concern b) ===")
+    ws = tmpdir("maestro-ws-")
+    env = base_env(sweeps_dir=ws / "sweeps")
+    plan, items = write_plan_and_items(ws, ["a", "b"])
+    run_sweep(["new", "--slug", "r1", "--plan", str(plan), "--items", str(items)], env)
+    d = ws / "sweeps" / "r1"
+    run_sweep(["next", "r1"], env)
+    for cmd in (["done", "r1", "i-0001"], ["fail", "r1", "i-0002", "--reason", "x"], ["end-chunk", "r1"]):
+        lease = json.loads((d / "lease.json").read_text())
+        lease["until"] = time.time() + 5                     # a long chunk: lease nearly lapsed
+        (d / "lease.json").write_text(json.dumps(lease))
+        t = time.time()
+        r = run_sweep(cmd, env)
+        until = json.loads((d / "lease.json").read_text())["until"]
+        check(f"{cmd[0]} renews the lease to >= now + 10 min", r.returncode == 0 and until >= t + 590,
+              (r.stderr, until - t))
+
+
+def lock_holder_liveness_case():
+    print("\n=== sweep_state — a lock is broken only when its holder is gone (concern d) ===")
+    import socket
+    ws = tmpdir("maestro-ws-")
+    env = base_env(sweeps_dir=ws / "sweeps")
+    env["MAESTRO_LOCK_TIMEOUT_S"] = "0.3"
+    plan, items = write_plan_and_items(ws, ["a", "b"])
+    run_sweep(["new", "--slug", "k1", "--plan", str(plan), "--items", str(items),
+              "--policy", json.dumps({"chunk_size": 1})], env)
+    d = ws / "sweeps" / "k1"
+    lock = Path(str(d / ".sweep") + ".lock")
+
+    def plant(pid, age):
+        lock.mkdir()
+        (lock / "holder").write_text(json.dumps({"pid": pid, "host": socket.gethostname(),
+                                                 "at": time.time() - age}))
+        os.utime(lock, (time.time() - age, time.time() - age))
+
+    # A live holder whose lock LOOKS old (the laptop slept mid-command).
+    plant(os.getpid(), 1000)
+    r = run_sweep(["next", "k1"], env)
+    check("an old-looking lock with a live holder is NOT broken (exit 5)", r.returncode == 5,
+          f"rc={r.returncode} err={r.stderr}")
+    check("…and nothing was claimed", find(d, "i-0001")["status"] == "pending")
+    (lock / "holder").unlink()
+    lock.rmdir()
+
+    # A dead holder: broken even though the lock is fresh.
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    plant(dead.pid, 0)
+    r = run_sweep(["next", "k1"], env)
+    check("a lock whose holder pid is dead is broken", r.returncode == 0, f"rc={r.returncode} err={r.stderr}")
+    check("the lock is released afterwards", not lock.exists())
+
+
+def next_n_zero_case():
+    print("\n=== sweep_state — next --n 0 is invalid (concern e) ===")
+    ws = tmpdir("maestro-ws-")
+    env = base_env(sweeps_dir=ws / "sweeps")
+    plan, items = write_plan_and_items(ws, ["a"])
+    run_sweep(["new", "--slug", "n0", "--plan", str(plan), "--items", str(items)], env)
+    for n in ("0", "-3"):
+        r = run_sweep(["next", "n0", "--n", n], env)
+        check(f"next --n {n} exits 2", r.returncode == 2, f"rc={r.returncode} err={r.stderr}")
+    check("nothing claimed, no chunk written",
+          find(ws / "sweeps" / "n0", "i-0001")["status"] == "pending"
+          and (ws / "sweeps" / "n0" / "pace.jsonl").read_text() == "")
+
+
 def main():
     usage_snapshot_case()
     usage_merge_case()
@@ -1207,6 +1419,12 @@ def main():
     missing_sweep_exit_codes_case()
     fresh_from_api_activity_case()
     lease_case()
+    set_policy_crash_case()
+    amend_plan_crash_case()
+    zombie_results_case()
+    results_renew_lease_case()
+    lock_holder_liveness_case()
+    next_n_zero_case()
     print("\n  " + ("PASS" if not FAILURES else f"FAIL ({len(FAILURES)}): {FAILURES}"))
     return 1 if FAILURES else 0
 

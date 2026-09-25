@@ -52,6 +52,8 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -79,6 +81,11 @@ OP_ALLOWED = {
 AMENDMENT_OPS = ("add_item", "amend_plan", "set_policy", "takeover")
 LOCK_STALE = float(os.environ.get("MAESTRO_LOCK_STALE_S", "10.0"))
 LOCK_TIMEOUT_S = float(os.environ.get("MAESTRO_LOCK_TIMEOUT_S", "4.0"))
+# A holder on another host (shared filesystem) is presumed gone after this.
+LOCK_HARD_STALE_S = float(os.environ.get("MAESTRO_LOCK_HARD_STALE_S", "3600"))
+# A same-host holder whose pid is "alive" this long after locking is taken to
+# be pid reuse (e.g. after a reboot), not a live holder.
+LOCK_PID_REUSE_S = 86400.0
 MAX_RECOVERIES = 3
 USAGE_FILE_DEFAULT = str(Path.home() / ".claude" / "maestro" / "usage.json")
 SESSION_ENV = "CLAUDE_CODE_SESSION_ID"
@@ -94,48 +101,109 @@ class LockTimeout(Exception):
     catches this once, for every command, and exits 5."""
 
 
+HOST = socket.gethostname()
+
+
+def pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OverflowError):
+        return True
+    except (TypeError, ValueError, OSError):
+        return False
+    return True
+
+
 class Lock:
-    """mkdir-to-acquire / rmdir-to-release — the same pattern as ledger.py's
+    """mkdir-to-acquire — the same directory-lock convention as ledger.py's
     `_Lock`, so a sweep directory and a ledger session dir can never deadlock
     each other by disagreeing on a convention.
 
+    The lock directory holds a `holder` file ({"pid", "host", "at"}). A lock
+    is broken as stale only when its holder is provably gone: same host and
+    that pid is no longer alive, or (different host, or a pid alive for an
+    implausibly long time — pid reuse) its mtime is very old. A bare mtime
+    age is NOT enough: across a laptop sleep every lock looks old while its
+    holder is merely suspended. Only a holder-less lock (a legacy one, or
+    one caught between mkdir and the holder write) falls back to the short
+    mtime rule (`LOCK_STALE`).
+
     On sustained contention (`LOCK_TIMEOUT_S`, default 4s) this raises
-    `LockTimeout` instead of returning unlocked — a prior version fell
-    through silently after its retry budget ran out, letting two callers
-    mutate the same sweep at once. Callers check the sweep exists first
-    (`require_sweep`), so a typo'd slug is "no such sweep", never "busy".
+    `LockTimeout` instead of returning unlocked. Callers check the sweep
+    exists first (`require_sweep`), so a typo'd slug is "no such sweep",
+    never "busy".
     """
 
     def __init__(self, target):
         self.p = Path(str(target) + ".lock")
         self.held = False
 
+    def _holder(self):
+        try:
+            h = json.loads((self.p / "holder").read_text())
+            return h if isinstance(h, dict) else None
+        except (OSError, ValueError):
+            return None
+
+    def _stale(self):
+        try:
+            age = time.time() - self.p.stat().st_mtime
+        except OSError:
+            return False
+        h = self._holder()
+        if h is None:
+            return age > LOCK_STALE
+        if h.get("host") == HOST:
+            return not pid_alive(h.get("pid")) or age > LOCK_PID_REUSE_S
+        return age > LOCK_HARD_STALE_S
+
+    def _break(self):
+        # Rename first (atomic): of two contenders that both judged it stale,
+        # only one moves it; the other's rename fails and it just retries.
+        tomb = self.p.with_name(f"{self.p.name}.stale{os.getpid()}.{time.time_ns()}")
+        try:
+            os.rename(self.p, tomb)
+        except OSError:
+            return
+        shutil.rmtree(tomb, ignore_errors=True)
+
     def __enter__(self):
         deadline = time.time() + LOCK_TIMEOUT_S
         while time.time() < deadline:
             try:
                 self.p.mkdir()
-                self.held = True
-                return self
             except FileExistsError:
-                try:
-                    if time.time() - self.p.stat().st_mtime > LOCK_STALE:
-                        self.p.rmdir()
-                        continue
-                except OSError:
-                    pass
+                if self._stale():
+                    self._break()
+                    continue
                 time.sleep(0.02)
+                continue
             except OSError:
                 break
+            self.held = True
+            try:
+                (self.p / "holder").write_text(json.dumps(
+                    {"pid": os.getpid(), "host": HOST, "at": time.time()}))
+            except OSError:
+                pass
+            return self
         raise LockTimeout(f"refused: could not acquire lock (busy): {self.p}")
 
     def __exit__(self, *_):
         if self.held:
-            self.held = False       # released once; re-entry must not rmdir twice
-            try:
-                self.p.rmdir()
-            except OSError:
-                pass
+            self.held = False       # released once; re-entry must not remove twice
+            h = self._holder()
+            if h is None or (h.get("pid") == os.getpid() and h.get("host") == HOST):
+                try:
+                    (self.p / "holder").unlink()
+                except OSError:
+                    pass
+                try:
+                    self.p.rmdir()
+                except OSError:
+                    pass
         return False
 
 
@@ -610,6 +678,9 @@ def cmd_next(args):
     rc = require_sweep(d, args.slug)
     if rc is not None:
         return rc
+    if args.n is not None and args.n < 1:
+        print(f"invalid --n {args.n}: a chunk claims at least one item", file=sys.stderr)
+        return 2
     owner = resolve_owner(args)
     if owner is None:
         return no_owner()
@@ -674,11 +745,42 @@ def cmd_next(args):
     return 0
 
 
+def not_mine(d, it, owner):
+    """Why `owner` may not record a result for item `it`, or None. A result
+    only lands on an item that is `running` in an open chunk this owner
+    holds: a zombie loop's late `done`/`fail` must never finish (or spend an
+    attempt on) an item that was reclaimed and re-claimed by another loop."""
+    holders = [c for c in open_chunks(read_jsonl(d / "pace.jsonl"))
+               if it.get("id") in (c.get("items") or [])]
+    if it.get("status") == "running" and any(c.get("owner") == owner for c in holders):
+        return None
+    where = (f"chunk {holders[-1].get('chunk')} owned by {holders[-1].get('owner')}"
+             if holders else "no open chunk")
+    return (f"refused: {it.get('id')} is not running in an open chunk owned by this session "
+            f"(status {it.get('status')}, {where}) — its result was not recorded")
+
+
+def renew_lease(d, owner, now):
+    """A result from the loop's owner proves it alive: extend its lease to at
+    least now + LEASE_MARGIN_S (never shortening it, never touching another
+    session's live lease)."""
+    held = read_lease(d)
+    if held and held["owner"] != owner and held["until"] > now:
+        return
+    until = now + LEASE_MARGIN_S
+    if held and held["owner"] == owner:
+        until = max(until, held["until"])
+    write_lease(d, owner, until, "result")
+
+
 def cmd_done(args):
     d = sweep_dir(args.slug)
     rc = require_sweep(d, args.slug)
     if rc is not None:
         return rc
+    owner = resolve_owner(args)
+    if owner is None:
+        return no_owner()
     with Lock(d / ".sweep"):
         index = read_json(d / "index.json")
         if index is None:
@@ -688,10 +790,15 @@ def cmd_done(args):
         if it is None:
             print(f"no such item: {args.item}", file=sys.stderr)
             return 2
+        why = not_mine(d, it, owner)
+        if why:
+            print(why, file=sys.stderr)
+            return 4
         it["status"] = "done"
         if args.note:
             it["note"] = args.note
         write_json(d / "index.json", index)
+        renew_lease(d, owner, time.time())
     return 0
 
 
@@ -700,6 +807,9 @@ def cmd_fail(args):
     rc = require_sweep(d, args.slug)
     if rc is not None:
         return rc
+    owner = resolve_owner(args)
+    if owner is None:
+        return no_owner()
     with Lock(d / ".sweep"):
         index = read_json(d / "index.json")
         if index is None:
@@ -709,6 +819,10 @@ def cmd_fail(args):
         if it is None:
             print(f"no such item: {args.item}", file=sys.stderr)
             return 2
+        why = not_mine(d, it, owner)
+        if why:
+            print(why, file=sys.stderr)
+            return 4
         policy, err = load_policy(d, index)
         if err:
             print(f"refused: {err}", file=sys.stderr)
@@ -718,6 +832,7 @@ def cmd_fail(args):
         it["note"] = args.reason
         it["status"] = "pending" if it["attempts"] < max_attempts else "failed"
         write_json(d / "index.json", index)
+        renew_lease(d, owner, time.time())
         status = it["status"]
     print(status)
     return 0
@@ -809,17 +924,24 @@ def cmd_amend_plan(args):
             return 2
         sha = sha256_of(new_text)
         # plan.md is implicitly v1; the first amendment is v2.
-        vn = len(index.get("plan_versions", [])) + 2
+        plan_versions = index.get("plan_versions", [])
+        vn = len(plan_versions) + 2
         fname = f"plan.v{vn}.md"
+        tip = plan_versions[-1].get("sha256") if plan_versions else index.get("plan_sha256")
         now = time.time()
         atomic_write_text(d / fname, new_text)   # plan.md itself is never touched
         # Amendment before index (same reasoning as `add`): a crash between
-        # the two leaves an amendment with no plan_versions entry, which
-        # `check` reports — never a plan version nobody logged.
-        append_jsonl(d / "amendments.jsonl", {
-            "at": now, "op": "amend_plan", "sha256": sha, "file": fname,
-            "from_finding": args.from_finding, "policy": deviation,
-        })
+        # the two leaves an amendment with no plan_versions entry — logged
+        # but never applied, which `check` tolerates. A retry of the same
+        # amendment completes that one instead of logging a second.
+        dangling = [a for a in read_jsonl(d / "amendments.jsonl")
+                    if a.get("op") == "amend_plan" and a.get("sha256") == sha
+                    and a.get("file") == fname and a.get("from_sha256", tip) == tip]
+        if not dangling:
+            append_jsonl(d / "amendments.jsonl", {
+                "at": now, "op": "amend_plan", "sha256": sha, "file": fname,
+                "from_sha256": tip, "from_finding": args.from_finding, "policy": deviation,
+            })
         index.setdefault("plan_versions", []).append({
             "sha256": sha, "file": fname, "at": now,
             "from_finding": args.from_finding,
@@ -853,6 +975,9 @@ def cmd_set_policy(args):
         if index is None:
             print(f"no such sweep: {args.slug}", file=sys.stderr)
             return 2
+        # A set-policy that crashed after writing policy.json but before
+        # index.json is finished first — policy.json already carries it.
+        complete_half_applied_policy(d, index)
         current, err = load_policy(d, index)
         if current is not None:
             new_policy = merge_policy(current, override)
@@ -872,25 +997,26 @@ def cmd_set_policy(args):
             print(json.dumps({"unchanged": True, "policy": new_policy}))
             return 0
 
-        versions = index.get("policy_versions")
-        if not isinstance(versions, list) or not versions:
-            # A sweep created before policy versioning: its policy.json is
-            # v1 — preserved when it still verifies, else only its hash is.
-            versions = [{"version": 1, "file": None,
-                         "sha256": index.get("policy_sha256"), "at": index.get("created")}]
-            if current is not None:
-                atomic_write_text(d / "policy.v1.json", (d / "policy.json").read_text())
-                versions[0]["file"] = "policy.v1.json"
+        versions = policy_versions_or_legacy(d, index, trusted=current is not None)
         vn = int(versions[-1].get("version") or len(versions)) + 1
         fname = f"policy.v{vn}.json"
         now = time.time()
         atomic_write_text(d / fname, text)
-        append_jsonl(d / "amendments.jsonl", {
-            "at": now, "op": "set_policy", "version": vn, "file": fname,
-            "sha256": sha, "from_sha256": index.get("policy_sha256"),
-            "deviation": new_policy["deviation"],
-            "from_deviation": current.get("deviation") if current else None,
-        })
+        # Retry of a set-policy that crashed after logging its amendment:
+        # complete THAT amendment rather than logging a second one.
+        dangling = [a for a in read_jsonl(d / "amendments.jsonl")
+                    if a.get("op") == "set_policy" and a.get("sha256") == sha
+                    and a.get("from_sha256") == index.get("policy_sha256")
+                    and a.get("file") == fname]
+        if dangling:
+            vn = dangling[-1].get("version", vn)
+        else:
+            append_jsonl(d / "amendments.jsonl", {
+                "at": now, "op": "set_policy", "version": vn, "file": fname,
+                "sha256": sha, "from_sha256": index.get("policy_sha256"),
+                "deviation": new_policy["deviation"],
+                "from_deviation": current.get("deviation") if current else None,
+            })
         atomic_write_text(d / "policy.json", text)
         versions.append({"version": vn, "file": fname, "sha256": sha, "at": now})
         index["policy_versions"] = versions
@@ -898,6 +1024,65 @@ def cmd_set_policy(args):
         write_json(d / "index.json", index)
     print(json.dumps({"version": vn, "policy": new_policy}))
     return 0
+
+
+def policy_versions_or_legacy(d, index, trusted):
+    """index.policy_versions, or — for a sweep created before policy
+    versioning — a synthesized v1 entry (preserving policy.json as
+    policy.v1.json when it still verifies, else keeping only its hash)."""
+    versions = index.get("policy_versions")
+    if isinstance(versions, list) and versions:
+        return versions
+    versions = [{"version": 1, "file": None,
+                 "sha256": index.get("policy_sha256"), "at": index.get("created")}]
+    if trusted:
+        atomic_write_text(d / "policy.v1.json", (d / "policy.json").read_text())
+        versions[0]["file"] = "policy.v1.json"
+    return versions
+
+
+def complete_half_applied_policy(d, index):
+    """Finish a set-policy that crashed after writing policy.json but before
+    index.json: its amendment is logged (from_sha256 == the index's current
+    policy_sha256), its version file and policy.json both hash to its
+    sha256, but the index never recorded it. Without this, every command
+    would refuse the "edited" policy.json forever. Returns True if it
+    completed one. Never touches a set-policy that never reached
+    policy.json — that one was not applied, and `check` tolerates it."""
+    try:
+        text = (d / "policy.json").read_text()
+    except OSError:
+        return False
+    sha = sha256_of(text)
+    if sha == index.get("policy_sha256"):
+        return False
+    cands = [a for a in read_jsonl(d / "amendments.jsonl")
+             if a.get("op") == "set_policy" and a.get("sha256") == sha
+             and a.get("from_sha256") == index.get("policy_sha256")]
+    if not cands:
+        return False
+    a = cands[-1]
+    fname = a.get("file")
+    try:
+        if not fname or sha256_of((d / fname).read_text()) != sha:
+            return False
+    except OSError:
+        return False
+    try:
+        if validate_policy(json.loads(text)):
+            return False
+    except ValueError:
+        return False
+    versions = policy_versions_or_legacy(d, index, trusted=False)
+    if versions[0].get("file") is None and (d / "policy.v1.json").exists() \
+            and sha256_of((d / "policy.v1.json").read_text()) == versions[0].get("sha256"):
+        versions[0]["file"] = "policy.v1.json"
+    versions.append({"version": a.get("version") or len(versions) + 1, "file": fname,
+                     "sha256": sha, "at": a.get("at")})
+    index["policy_versions"] = versions
+    index["policy_sha256"] = sha
+    write_json(d / "index.json", index)
+    return True
 
 
 def cmd_end_chunk(args):
@@ -933,6 +1118,7 @@ def cmd_end_chunk(args):
             "chunk": ch.get("chunk"), "event": "end", "at": time.time(),
             "usage": usage_snapshot(), "interrupted": False, "returned": returned,
         })
+        renew_lease(d, owner, time.time())
     print(json.dumps(returned))
     return 0
 
@@ -1006,6 +1192,9 @@ def cmd_recover(args):
         if index is None:
             print(f"no such sweep: {args.slug}", file=sys.stderr)
             return 2
+        # Crash recovery covers a set-policy that died between policy.json
+        # and index.json, too (otherwise every command refuses policy.json).
+        complete_half_applied_policy(d, index)
 
         pace = read_jsonl(d / "pace.jsonl")
         chunks = open_chunks(pace)
@@ -1094,13 +1283,12 @@ def policy_chain_reasons(d, index, amendments):
     if versions is None:
         # Pre-versioning sweep: policy.json is v1 and nothing may have
         # changed it.
-        if set_policy:
-            reasons.append("set_policy amendment(s) recorded but index.json has no policy_versions")
         policy = read_json(d / "policy.json")
         dev = policy.get("deviation") if isinstance(policy, dict) else None
-        return reasons, [dev]
+        # A set_policy logged but never recorded (crashed) is tolerated.
+        return reasons, [dev], set()
     if not isinstance(versions, list) or not versions:
-        return ["policy_versions is empty or malformed"], [None]
+        return ["policy_versions is empty or malformed"], [None], set()
 
     devs = []
     for i, v in enumerate(versions):
@@ -1133,15 +1321,36 @@ def policy_chain_reasons(d, index, amendments):
 
     if versions[-1].get("sha256") != index.get("policy_sha256"):
         reasons.append("policy_sha256 is not the latest policy version's sha256")
-    if len(set_policy) != len(versions) - 1:
-        reasons.append(f"{len(set_policy)} set_policy amendment(s) for "
-                       f"{len(versions) - 1} policy change(s) in policy_versions")
-    for i, a in enumerate(set_policy[:len(versions) - 1]):
-        before, after = versions[i], versions[i + 1]
-        if a.get("sha256") != after.get("sha256") or a.get("from_sha256") != before.get("sha256"):
-            reasons.append(f"set_policy amendment {i + 1} does not match policy versions "
-                           f"{i + 1} -> {i + 2}")
-    return reasons, devs
+    chain = [(versions[i - 1].get("sha256"), versions[i].get("sha256"),
+              f"policy version {i + 1}") for i in range(1, len(versions))]
+    applied, pair_reasons = pair_amendments(set_policy, chain, "set_policy")
+    reasons += pair_reasons
+    return reasons, devs, applied
+
+
+def pair_amendments(amends, chain, what):
+    """Pair logged amendments with recorded versions, in order, by (from_sha,
+    sha): `chain` is [(from_sha, sha, label)] for each recorded version. An
+    amendment that pairs with no version is tolerated only when it was never
+    applied — its sha is no recorded version's (a command that crashed after
+    logging it, or a retry that chose different content). A second
+    amendment for an applied version, or a version with no amendment, fails.
+    Returns (ids of the amendments that were applied, reasons)."""
+    reasons, applied, k = [], set(), 0
+    recorded = {sha for _, sha, _ in chain}
+    for a in amends:
+        if k < len(chain):
+            frm, sha, _ = chain[k]
+            if a.get("sha256") == sha and a.get("from_sha256", frm) == frm:
+                applied.add(id(a))
+                k += 1
+                continue
+        if a.get("sha256") in recorded:
+            reasons.append(f"a {what} amendment for {str(a.get('sha256'))[:12]} is a duplicate "
+                           f"or out of order")
+    for _, _, label in chain[k:]:
+        reasons.append(f"{label} has no matching {what} amendment")
+    return applied, reasons
 
 
 def cmd_check(args):
@@ -1220,18 +1429,17 @@ def cmd_check(args):
     if unlogged:
         reasons.append(f"item(s) beyond the original count have no add_item amendment: {unlogged}")
 
-    # Plan versions <-> amend_plan amendments, one-for-one and in order.
+    # Plan versions <-> amend_plan amendments, paired in order by (from, sha).
     plan_amends = [a for a in amendments if a.get("op") == "amend_plan"]
     plan_versions = index.get("plan_versions", [])
-    if len(plan_amends) != len(plan_versions):
-        reasons.append(f"{len(plan_amends)} amend_plan amendment(s) for "
-                       f"{len(plan_versions)} plan version(s) in plan_versions")
-    for i, (a, v) in enumerate(zip(plan_amends, plan_versions)):
-        if a.get("sha256") != v.get("sha256"):
-            reasons.append(f"amend_plan amendment {i + 1} does not match plan version "
-                           f"{v.get('file')}")
+    plan_chain, prev = [], index.get("plan_sha256")
+    for v in plan_versions:
+        plan_chain.append((prev, v.get("sha256"), f"plan version {v.get('file')}"))
+        prev = v.get("sha256")
+    _, plan_reasons = pair_amendments(plan_amends, plan_chain, "amend_plan")
+    reasons += plan_reasons
 
-    chain_reasons, devs = policy_chain_reasons(d, index, amendments)
+    chain_reasons, devs, applied_policy = policy_chain_reasons(d, index, amendments)
     reasons += chain_reasons
 
     try:
@@ -1251,7 +1459,8 @@ def cmd_check(args):
             reasons.append(f"amendment {i} has an unknown op: {op!r}")
             continue
         if op == "set_policy":
-            version_idx += 1
+            if id(a) in applied_policy:   # a never-applied one changed nothing
+                version_idx += 1
             continue
         if op not in OP_ALLOWED:
             continue
@@ -1383,11 +1592,13 @@ def build_parser():
     sp.add_argument("slug")
     sp.add_argument("item")
     sp.add_argument("--note")
+    sp.add_argument("--owner")
 
     sp = sub.add_parser("fail")
     sp.add_argument("slug")
     sp.add_argument("item")
     sp.add_argument("--reason", required=True)
+    sp.add_argument("--owner")
 
     sp = sub.add_parser("finding")
     sp.add_argument("slug")
