@@ -29,7 +29,11 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 PLUGIN = REPO / "maestro" / "scripts"
 ENV = {**os.environ, "MAESTRO_CAFFEINATE": "0", "MAESTRO_QUIET": "1",
-       "MAESTRO_REORCH_LLM": "0", "MAESTRO_NTFY_TOPIC": ""}
+       "MAESTRO_REORCH_LLM": "0", "MAESTRO_NTFY_TOPIC": "",
+       # Off by default so a replay never writes a candidate into the real
+       # ~/.claude/maestro/lessons store; lessons_capture_units.py turns it
+       # back on explicitly, scoped to its own temp store dir.
+       "MAESTRO_LESSONS": "0"}
 
 # Which events each script is actually wired to in maestro/hooks/hooks.json.
 # Replaying a wiring that does not ship would prove nothing.
