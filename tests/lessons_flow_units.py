@@ -213,16 +213,28 @@ def inject_fail_closed_case():
 
 
 def inject_cap_case():
-    print("\n=== #1 inject output is hard-capped at the budget ===")
-    store, repo = tmp_store(), git_repo()
+    print("\n=== N2 status lines never evict an approved lesson; output bounded ===")
+    store, repo = tmp_store(), git_repo(prefix="some-cloned-repo-with-a-rather-long-name-")
     p = write_lessons_file(store / "lessons.md", [
         entry(f"L-{i:03d}", "global", rule="r" * 236) for i in range(1, 25)])
     approve(ledger(store), p)
+    block_len = len(lc.render_injection(lc.parse(p.read_text())))
+    check("setup: the lessons block alone is just under budget",
+          lc.MAX_BUDGET_CHARS - 60 < block_len <= lc.MAX_BUDGET_CHARS, block_len)
+    write_lessons_file(repo / ".claude" / "maestro-lessons.md",
+                       [entry("R-001", f"repo:{repo.name}", rule="Untrusted teammate rule.")])
     for i in range(3):
         lessons._new_candidate(store, "s", str(repo), "correction", None, None, f"c{i}")
     ctx = inject_ctx(repo, store) or ""
-    check("lessons are injected", "L-024" in ctx or "L-023" in ctx, ctx[:100])
-    check("total additionalContext <= MAX_BUDGET_CHARS", len(ctx) <= lc.MAX_BUDGET_CHARS, len(ctx))
+    check("all 24 approved lessons injected",
+          all(f"- L-{i:03d}: " in ctx for i in range(1, 25)), ctx[-300:])
+    check("the untrusted line is present", "1 untrusted repo lesson(s)" in ctx, ctx[-300:])
+    check("the pending line is present", "3 lesson candidate(s) pending" in ctx, ctx[-300:])
+    check("lessons block itself within MAX_BUDGET_CHARS",
+          ctx.index("\n1 untrusted") <= lc.MAX_BUDGET_CHARS)
+    check("whole output far below the 10,000-char spill point", len(ctx) < 8000, len(ctx))
+    big = lc.clean_one_line("x" * 5000, lessons.STATUS_LINE_CHARS)
+    check("each status line is bounded", len(big) == lessons.STATUS_LINE_CHARS)
 
 
 def inject_lessons_off_case():
@@ -806,7 +818,7 @@ def repair_case():
     check("dry run plans to remove exactly the unapproved entry",
           ok and plan["removed"].strip() == entry("L-003", "global",
                                                   rule="Nobody approved this.").strip()
-          and plan["ledger_removed"] == [], plan)
+          and "ledger_removed" not in plan, plan)
     check("dry run changes nothing", p.read_bytes() != after_approved)
     r = cli(["repair"], store)
     check("CLI dry run shows the text and the sha",
@@ -828,25 +840,22 @@ def repair_case():
     ctx = inject_ctx(repo, store) or ""
     check("lessons inject again", "Approved, not yet committed." in ctx, ctx)
 
-    # Crash shape 2: an approval whose entry never made it to the file.
+    # An approval whose entry is not in the file is NEVER removed by repair.
     store2 = tmp_store()
     acc(store2, "Only committed rule.")
-    ledger_before = ledger(store2).read_bytes()
     records, _ = lc.read_approvals(ledger(store2))
     with open(ledger(store2), "a") as f:
         f.write(json.dumps(lc.make_approval(lc.ledger_tail(records), "L-002", "personal",
                                             "a" * 64, "accept")) + "\n")
-    check("orphan approval fails the check",
-          any("L-002" in x and "missing" in x for x in
-              lc.check(store2 / "lessons.md", None, None, ledger(store2))))
-    ok, plan, _ = lessons.repair(d=store2)
-    check("plan removes only that ledger line",
-          ok and plan["cut"] is None and len(plan["ledger_removed"]) == 1
-          and '"L-002"' in plan["ledger_removed"][0], plan)
-    ok, _, msg = lessons.repair(apply=True, sha=plan["sha"], d=store2)
-    check("applied", ok, msg)
-    check("ledger back to its exact prior bytes", ledger(store2).read_bytes() == ledger_before)
-    check("store validates", lc.check(store2 / "lessons.md", None, None, ledger(store2)) == [])
+    ledger_before = ledger(store2).read_bytes()
+    ok, plan, msg = lessons.repair(d=store2)
+    check("an orphan approval is refused, not removed",
+          not ok and "missing" in msg and plan["cut"] is None, msg)
+    ok, _, msg = lessons.repair(apply=True, sha="0" * 64, d=store2)
+    check("--apply refuses too", not ok and ledger(store2).read_bytes() == ledger_before, msg)
+    r = cli(["repair"], store2)
+    check("dry run output never contains raw ledger JSON",
+          '"sha256"' not in r.stdout + r.stderr, r.stdout + r.stderr)
 
     # Never: committed deletions, committed edits, committed unapproved entries.
     store3 = tmp_store()
@@ -859,7 +868,7 @@ def repair_case():
     lb = ledger(store3).read_bytes()
     ok, plan, msg = lessons.repair(d=store3)
     check("an approval for a once-committed id is never removed",
-          plan["ledger_removed"] == [] and plan["cut"] is None, plan)
+          plan["cut"] is None and "missing" in (plan["problem"] or ""), plan)
     check("ledger untouched", ledger(store3).read_bytes() == lb)
 
     store4 = tmp_store()
@@ -878,8 +887,204 @@ def repair_case():
         f.write("\n" + entry("L-002", "global", rule="Committed but unapproved.") + "\n")
     git(store5, "commit", "-q", "-am", "hand commit")
     ok, plan, msg = lessons.repair(d=store5)
-    check("a committed unapproved entry is not removable",
-          plan["cut"] is None and plan["ledger_removed"] == [], plan)
+    check("a committed unapproved entry is not removable", plan["cut"] is None, plan)
+
+    # N3: the adversary's attack — reset an approved lesson away, then
+    # "repair" the dangling approval. It must refuse.
+    store6, repo6 = tmp_store(), git_repo()
+    acc(store6, "keep me")
+    acc(store6, "Never merge without the adversary pass.")
+    git(store6, "reset", "-q", "--hard", "HEAD~1")
+    lb, fb = ledger(store6).read_bytes(), (store6 / "lessons.md").read_bytes()
+    ctx = inject_ctx(repo6, store6) or ""
+    check("inject is off and does NOT suggest repair",
+          "MAESTRO LESSONS OFF" in ctx and "repair" not in ctx, ctx)
+    ok, plan, msg = lessons.repair(d=store6)
+    check("repair refuses to drop the L-002 approval",
+          not ok and "L-002" in msg and "reflog" in msg, msg)
+    r = cli(["repair", "--apply", "--sha", "0" * 64], store6)
+    check("--apply refuses", r.returncode != 0, r.stdout)
+    check("ledger and file untouched",
+          ledger(store6).read_bytes() == lb and (store6 / "lessons.md").read_bytes() == fb)
+    check("the store still fails (the approved lesson is still missing)",
+          any("L-002" in x and "missing" in x
+              for x in lc.check(store6 / "lessons.md", None, None, ledger(store6))))
+
+    # The dry run shows the rule text being removed.
+    store7 = tmp_store()
+    acc(store7, "Committed.")
+    with open(store7 / "lessons.md", "a") as f:
+        f.write("\n" + entry("L-002", "global", rule="Dangling unapproved rule.") + "\n")
+    r = cli(["repair"], store7)
+    check("dry run lists the rule text being removed",
+          "L-002: Dangling unapproved rule." in r.stdout, r.stdout)
+
+
+def history_budget_case():
+    print("\n=== N1 the repo-file history walk is bounded; inject stays fast ===")
+
+    def fast_history(repo, n, relpath=".claude/maestro-lessons.md"):
+        out = bytearray()
+        body = "# Maestro lessons\n"
+        for i in range(n):
+            body += f"<!-- {i} -->\n"
+            data = body.encode()
+            out += (f"commit refs/heads/main\nmark :{i + 1}\n"
+                    f"committer t <t@example.com> {1700000000 + i} +0000\ndata 1\nx\n").encode()
+            if i:
+                out += f"from :{i}\n".encode()
+            out += f"M 100644 inline {relpath}\ndata {len(data)}\n".encode() + data + b"\n"
+        r = subprocess.run(["git", "-C", str(repo), "fast-import", "--quiet"], input=bytes(out),
+                           capture_output=True)
+        assert r.returncode == 0, r.stderr
+        git(repo, "reset", "-q", "--hard")
+
+    def timed_inject(repo, store):
+        t0 = time.time()
+        ctx = inject_ctx(repo, store) or ""
+        return ctx, time.time() - t0
+
+    store = tmp_store()
+    acc(store, "Personal rule, always.")
+    repo = git_repo(prefix="hist-")
+    fast_history(repo, 3000)
+    ctx, dt = timed_inject(repo, store)
+    check("3000-commit repo file, no trust for it: walk skipped, fast",
+          dt < 3 and "Personal rule, always." in ctx and "REPO LESSONS OFF" not in ctx,
+          (round(dt, 2), ctx[:200]))
+
+    records, _ = lc.read_approvals(ledger(store))
+    with open(ledger(store), "a") as f:
+        f.write(json.dumps(lc.make_approval(lc.ledger_tail(records), "R-001",
+                                            f"repo:{repo.name}", "b" * 64, "trust")) + "\n")
+    ctx, dt = timed_inject(repo, store)
+    check("with a trust record the walk runs, hits its cap, and only the repo tier is off",
+          dt < 5 and "Personal rule, always." in ctx and "REPO LESSONS OFF" in ctx
+          and "commits" in ctx, (round(dt, 2), ctx[-300:]))
+
+    repo2 = git_repo(prefix="hist-small-")
+    fast_history(repo2, 1200)
+    records, _ = lc.read_approvals(ledger(store))
+    with open(ledger(store), "a") as f:
+        f.write(json.dumps(lc.make_approval(lc.ledger_tail(records), "R-001",
+                                            f"repo:{repo2.name}", "b" * 64, "trust")) + "\n")
+    ctx, dt = timed_inject(repo2, store)
+    check("1200 commits under the cap: verified within budget, repo tier on",
+          dt < 5 and "REPO LESSONS OFF" not in ctx and "Personal rule, always." in ctx,
+          (round(dt, 2), ctx[-300:]))
+
+    repo3 = git_repo(prefix="hist-big-")
+    big = repo3 / ".claude" / "maestro-lessons.md"
+    big.parent.mkdir()
+    with open(big, "w") as f:
+        f.write("# x\n" + ("<!-- padding -->\n" * 1_900_000))   # ~30 MB
+    ctx, dt = timed_inject(repo3, store)
+    check("a 30 MB repo file is refused quickly; personal lessons still inject",
+          dt < 3 and "REPO LESSONS OFF" in ctx and "Personal rule, always." in ctx,
+          (round(dt, 2), ctx[-300:]))
+
+    store2 = tmp_store()
+    (store2 / "lessons.md").write_text("# x\n" + ("<!-- p -->\n" * 150_000))
+    ctx, dt = timed_inject(repo3, store2)
+    check("an oversized personal file is refused quickly (everything off)",
+          dt < 3 and "MAESTRO LESSONS OFF" in ctx and "bytes" in ctx, (round(dt, 2), ctx[:200]))
+
+
+def superseded_copy_case():
+    print("\n=== N4 a superseded lesson is not resurrected through its published copy ===")
+    store, repo = tmp_store(), git_repo()
+    scope = f"repo:{repo.name}"
+    l1, _, _ = acc(store, "Old rule, published.", scope=scope)
+    rid, msg = lessons.publish(l1, cwd=str(repo), d=store)
+    check("published", rid == "R-001", msg)
+    l2, reasons, _ = acc(store, "New rule replaces it.", scope=scope, supersedes=l1)
+    check("superseded in the personal store", l2 == "L-002", reasons)
+    ctx = inject_ctx(repo, store) or ""
+    check("the retired rule's copy is not injected",
+          "Old rule, published." not in ctx and "- L-002: New rule replaces it." in ctx
+          and "1 active" in ctx, ctx)
+    rep = lessons.status_report(cwd=str(repo), d=store)
+    check("status agrees", rep["active"] == 1, rep)
+
+
+def ledger_fields_case():
+    print("\n=== N5 every ledger field is inside the chain ===")
+    store, repo = tmp_store(), git_repo()
+    acc(store, "Global rule.")
+    l2, _, _ = acc(store, "Repo rule.", scope=f"repo:{repo.name}")
+    rid, _ = lessons.publish(l2, cwd=str(repo), d=store)
+    check("setup ok", rid == "R-001")
+    good = ledger(store).read_text()
+    for field, value in (("source", "L-001"), ("how", "trust"), ("at", "1999-01-01T00:00:00Z"),
+                         ("tier", "repo:elsewhere")):
+        lines = good.splitlines()
+        rec = json.loads(lines[-1])
+        rec[field] = value
+        lines[-1] = json.dumps(rec, sort_keys=True)
+        ledger(store).write_text("\n".join(lines) + "\n")
+        reasons = lc.check(store / "lessons.md", None, None, ledger(store))
+        check(f"editing '{field}' breaks the chain", any("chain" in r for r in reasons), reasons)
+        ctx = inject_ctx(repo, store) or ""
+        check(f"...and turns everything off ({field})", "MAESTRO LESSONS OFF" in ctx, ctx[:120])
+    ledger(store).write_text(good)
+    check("restored ledger verifies", lc.check(store / "lessons.md", None, None, ledger(store)) == [])
+
+    # published_copies: same scope and identical Rule text, or it is no copy.
+    personal = lc.parse("\n\n".join([entry("L-001", "global", rule="Keep asking."),
+                                     entry("L-002", "repo:x", rule="Repo rule.")]))
+    trusted = lc.parse("\n\n".join([entry("R-001", "repo:x", rule="Keep asking."),
+                                    entry("R-002", "repo:x", rule="Different text.")]))
+    recs = [lc.make_approval("", "R-001", "repo:x", trusted[0]["sha256"], "publish", source="L-001"),
+            lc.make_approval("", "R-002", "repo:x", trusted[1]["sha256"], "publish", source="L-002")]
+    check("a copy must share scope and Rule text with its source",
+          lc.published_copies(trusted, recs, "x", personal) == {}, lc.published_copies(trusted, recs, "x", personal))
+
+
+def preview_binding_case():
+    print("\n=== docs(a) accept/publish show the exact block and bind to its sha ===")
+    store, repo = tmp_store(), git_repo()
+    scope = f"repo:{repo.name}"
+    acc(store, "First.", scope=scope)
+    r = cli(["accept", "--rule", "Second.", "--why", "w", "--evidence", "e", "--scope", scope,
+             "--supersedes", "L-001", "--preview"], store)
+    check("--preview prints the exact heading, fields and sha, writes nothing",
+          r.returncode == 0 and f"## L-002 · scope: {scope}" in r.stdout
+          and "Supersedes: L-001" in r.stdout and "sha256 " in r.stdout
+          and "L-002" not in (store / "lessons.md").read_text(), r.stdout + r.stderr)
+    sha = r.stdout.split("sha256 ")[1].split(")")[0]
+    block = r.stdout.split("\n", 1)[1]
+    r = cli(["accept", "--rule", "Second, edited.", "--why", "w", "--evidence", "e",
+             "--scope", scope, "--supersedes", "L-001", "--sha", sha], store)
+    check("a different text with that sha is refused", r.returncode != 0 and "sha256" in r.stderr,
+          r.stderr)
+    r = cli(["accept", "--rule", "Second.", "--why", "w", "--evidence", "e", "--scope", scope,
+             "--supersedes", "L-001", "--sha", sha], store)
+    check("the shown text with its sha is accepted", r.stdout.strip() == "L-002", r.stderr)
+    check("what landed is byte-for-byte what was shown",
+          (store / "lessons.md").read_text().endswith(block), block)
+    r = cli(["publish", "L-002", "--preview"], store, cwd=repo)
+    check("publish --preview shows the exact R- block",
+          r.returncode == 0 and f"## R-001 · scope: {scope}" in r.stdout
+          and not (repo / ".claude").exists(), r.stdout + r.stderr)
+    psha = r.stdout.split("sha256 ")[1].split(")")[0]
+    r = cli(["publish", "L-002", "--sha", "0" * 64], store, cwd=repo)
+    check("publish with a wrong sha is refused", r.returncode != 0, r.stdout)
+    r = cli(["publish", "L-002", "--sha", psha], store, cwd=repo)
+    check("publish with the shown sha works", r.returncode == 0, r.stderr)
+
+
+def docs_case():
+    print("\n=== docs(b,c) approval questions have no default pick; honesty stated ===")
+    lessons_md = (REPO / "maestro" / "commands" / "lessons.md").read_text()
+    style = (REPO / "maestro" / "output-styles" / "maestro.md").read_text()
+    check("no pre-marked Approve pick", '"label": "Approve", "pick": true' not in lessons_md)
+    check("review shows the exact block via --preview", "--preview" in lessons_md)
+    check("output style excludes lessons approvals from low-stakes picking",
+          "accept" in style.split("If the answer is genuinely low-stakes")[1][:600])
+    check("lessons.md states the ledger's limits", "tamper-evident" in lessons_md
+          and "forgery" in lessons_md)
+    check("lessons_check.py docstring states them", "TAMPER-EVIDENT" in (lc.__doc__ or "")
+          and "forgery" in (lc.__doc__ or ""))
 
 
 # --------------------------------------------------------------------------
@@ -942,6 +1147,11 @@ def main():
         tier_isolation_case()
         published_dedupe_case()
         repair_case()
+        history_budget_case()
+        superseded_copy_case()
+        ledger_fields_case()
+        preview_binding_case()
+        docs_case()
         status_case()
         hooks_json_case()
     finally:

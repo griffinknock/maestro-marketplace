@@ -66,7 +66,8 @@ CLI:
   lessons.py inject                     (SessionStart hook; reads stdin)
   lessons.py accept --rule R --why W --evidence E [--scope global|repo:<name>]
                     [--supersedes ID[,ID...]] [--candidates c-..,c-..]
-  lessons.py publish ID
+                    [--preview | --sha SHA256]
+  lessons.py publish ID [--preview | --sha SHA256]
   lessons.py untrusted [--json]
   lessons.py trust R-NNN --sha SHA256
   lessons.py repair [--apply --sha SHA256]
@@ -111,6 +112,7 @@ CAPTURE_LOCK_TRIES, CAPTURE_LOCK_DELAY = 5, 0.02     # <= ~0.1 s, then skip
 REVIEW_LOCK_TRIES, REVIEW_LOCK_DELAY = 50, 0.1       # <= ~5 s, then error
 LOCK_BUSY = ("lessons store is locked by another accept/publish/trust — "
              "nothing was written; try again in a moment")
+STATUS_LINE_CHARS = 600      # each status line after the lessons block
 GIT_ID = ["-c", "user.email=maestro@localhost", "-c", "user.name=maestro"]
 
 # Repo-name lookups are one `git rev-parse` per distinct cwd; cache them.
@@ -579,7 +581,7 @@ def build_injection(cwd):
         hint = ""
         try:
             plan = repair_plan(d)
-            if plan["problem"] is None and (plan["removed"] or plan["ledger_removed"]):
+            if plan["problem"] is None and plan["cut"] is not None:
                 hint = (" — this looks like an unapproved uncommitted tail left by an "
                         "interrupted accept: review it with "
                         f"python3 \"{Path(__file__).resolve()}\" repair")
@@ -589,10 +591,14 @@ def build_injection(cwd):
             "MAESTRO LESSONS OFF — the lessons check failed, so NO lessons were "
             f"injected. Run: python3 \"{lc.SCRIPT_PATH}\" — first reason: {first}{hint}")
 
-    lines = []
+    # The lessons block is capped on its own (validation already keeps it
+    # within budget); status lines follow it, each bounded, so a status line
+    # can never evict an approved lesson. Worst case stays far below the
+    # 10,000-char point where Claude Code spills context to a file.
+    blocks, lines = [], []
     active = lc.active_set(ev, repo_name_)
     if active:
-        lines.append(lc.render_injection(active))
+        blocks.append(lc.cap_text(lc.render_injection(active)))
     if ev["repo_reasons"]:
         first = lc.clean_one_line(ev["repo_reasons"][0], 300)
         lines.append(f"REPO LESSONS OFF — {repo_path} failed the lessons check, so none "
@@ -607,9 +613,10 @@ def build_injection(cwd):
     if pending:
         lines.append(f"{len(pending)} lesson candidate(s) pending — "
                      "review with /maestro:lessons")
-    if not lines:
+    lines = [lc.clean_one_line(ln, STATUS_LINE_CHARS) for ln in lines]
+    if not blocks and not lines:
         return None
-    return lc.cap_text("\n".join(lines))
+    return "\n".join(blocks + lines)
 
 
 def inject(payload):
@@ -635,17 +642,7 @@ def inject(payload):
 
 # --- accept ---------------------------------------------------------------
 
-def accept(rule, why, evidence, scope="global", supersedes=None,
-           candidates=None, d=None, cwd=None):
-    """Only after Griffin's explicit yes to this exact entry. Allocates the
-    next L-NNN, appends it, validates the post-state (every scope's budget,
-    the approvals ledger, append-only history), records the approval, and
-    commits. On ANY failure — validation, ledger write, or commit — the file
-    is restored byte-for-byte (or removed if this call created it), the
-    index is unstaged, the approval is not written, and (None, reasons,
-    None) is returned. On success the listed candidates are marked accepted
-    and (lid, [], lid) is returned. `supersedes` is one id or a
-    comma-separated list/sequence of them (consolidation)."""
+def _accept_inputs(rule, why, evidence, scope, supersedes):
     errs = []
     fields = {}
     for name, val in (("Rule", rule), ("Why", why), ("Evidence", evidence)):
@@ -660,6 +657,42 @@ def accept(rule, why, evidence, scope="global", supersedes=None,
     sup_ids, sup_err = _parse_supersedes(supersedes, lc.ID_RE_PERSONAL)
     if sup_err:
         errs.append(sup_err)
+    return fields, scope, sup_ids, errs
+
+
+def accept_preview(rule, why, evidence, scope="global", supersedes=None, d=None):
+    """The exact entry block `accept` would append right now — heading with
+    id and scope, Rule, Why, Evidence, Supersedes, Accepted — and its
+    sha256, without writing anything. Returns (info_or_None, reasons) with
+    info = {"id", "block", "sha"}. Show Griffin the block; pass the sha to
+    accept(expect_sha=...) so what lands is exactly what he approved."""
+    fields, scope, sup_ids, errs = _accept_inputs(rule, why, evidence, scope, supersedes)
+    if errs:
+        return None, errs
+    d = Path(d) if d else store_dir()
+    plan, reasons = _accept_plan(d, fields, scope, sup_ids)
+    if plan is None:
+        return None, reasons
+    return {"id": plan["lid"], "block": plan["block"], "sha": plan["sha"]}, []
+
+
+def accept(rule, why, evidence, scope="global", supersedes=None,
+           candidates=None, d=None, cwd=None, expect_sha=None):
+    """Only after Griffin's explicit yes to this exact entry. Allocates the
+    next L-NNN, appends it, validates the post-state (every scope's budget,
+    the approvals ledger, append-only history), records the approval, and
+    commits. On ANY failure — validation, ledger write, or commit — the file
+    is restored byte-for-byte (or removed if this call created it), the
+    index is unstaged, the approval is not written, and (None, reasons,
+    None) is returned. On success the listed candidates are marked accepted
+    and (lid, [], lid) is returned. `supersedes` is one id or a
+    comma-separated list/sequence of them (consolidation). With
+    `expect_sha` (from accept_preview), refuses unless the block about to be
+    appended is byte-for-byte the one Griffin was shown."""
+    fields, scope, sup_ids, errs = _accept_inputs(rule, why, evidence, scope, supersedes)
+    if expect_sha is not None and not (isinstance(expect_sha, str)
+                                       and lc.SHA_RE.fullmatch(expect_sha)):
+        errs.append("--sha must be the full 64-hex sha256 printed by --preview")
     if errs:
         return None, errs, None
 
@@ -668,7 +701,7 @@ def accept(rule, why, evidence, scope="global", supersedes=None,
     with _flock(d / STORE_LOCK, REVIEW_LOCK_TRIES, REVIEW_LOCK_DELAY) as ok:
         if not ok:
             return None, [LOCK_BUSY], None
-        lid, reasons = _accept_locked(d, fields, scope, sup_ids, cwd)
+        lid, reasons = _accept_locked(d, fields, scope, sup_ids, cwd, expect_sha)
     if lid is None:
         return None, reasons, None
 
@@ -680,7 +713,8 @@ def accept(rule, why, evidence, scope="global", supersedes=None,
     return lid, [], lid
 
 
-def _accept_locked(d, fields, scope, sup_ids, cwd):
+def _accept_plan(d, fields, scope, sup_ids):
+    """(plan, reasons): the block to append and the text around it."""
     path = d / LESSONS_FILE
     err = _refuse_nonregular(path)
     if err:
@@ -714,6 +748,20 @@ def _accept_locked(d, fields, scope, sup_ids, cwd):
     err = _append_self_check(existing_text, new_text, lid, block)
     if err:
         return None, [err]
+    return {"lid": lid, "block": block, "sha": lc.entry_sha(block.rstrip("\n")),
+            "new_text": new_text, "prev_bytes": prev_bytes}, []
+
+
+def _accept_locked(d, fields, scope, sup_ids, cwd, expect_sha=None):
+    plan, reasons = _accept_plan(d, fields, scope, sup_ids)
+    if plan is None:
+        return None, reasons
+    if expect_sha is not None and plan["sha"] != expect_sha:
+        return None, ["the entry that would be appended is not the one that was "
+                      "shown (sha256 mismatch) — preview again and re-ask"]
+    path = d / LESSONS_FILE
+    lid, block, new_text, prev_bytes = (plan["lid"], plan["block"], plan["new_text"],
+                                        plan["prev_bytes"])
 
     ap = approvals_path(d)
     records, ledger_reasons = lc.read_approvals(ap)
@@ -750,7 +798,17 @@ def _accept_locked(d, fields, scope, sup_ids, cwd):
 
 # --- publish ---------------------------------------------------------------
 
-def publish(lesson_id, cwd=None, d=None):
+def publish_preview(lesson_id, cwd=None, d=None):
+    """The exact R- block `publish` would append (translated Supersedes
+    included) and its sha256, without writing. Returns (info_or_None, msg)."""
+    if not isinstance(lesson_id, str) or not lc.ID_RE_PERSONAL.fullmatch(lesson_id):
+        return None, "publish takes a personal lesson id of the form L-NNN"
+    d = Path(d) if d else store_dir()
+    rid, msg, info = _publish_locked(lesson_id, cwd, d, preview=True)
+    return info, msg
+
+
+def publish(lesson_id, cwd=None, d=None, expect_sha=None):
     """Copy an accepted, active, repo-scoped lesson from the personal store
     into the current repo's `.claude/maestro-lessons.md` as the next R-NNN,
     and record the publish in the approvals ledger (with its source id).
@@ -759,59 +817,68 @@ def publish(lesson_id, cwd=None, d=None):
         return None, "publish takes a personal lesson id of the form L-NNN"
     d = Path(d) if d else store_dir()
     d.mkdir(parents=True, exist_ok=True)
+    if expect_sha is not None and not (isinstance(expect_sha, str)
+                                       and lc.SHA_RE.fullmatch(expect_sha)):
+        return None, "--sha must be the full 64-hex sha256 printed by --preview"
     with _flock(d / STORE_LOCK, REVIEW_LOCK_TRIES, REVIEW_LOCK_DELAY) as ok:
         if not ok:
             return None, LOCK_BUSY
-        return _publish_locked(lesson_id, cwd, d)
+        rid, msg, _ = _publish_locked(lesson_id, cwd, d, expect_sha=expect_sha)
+        return rid, msg
 
 
-def _publish_locked(lesson_id, cwd, d):
+def _publish_locked(lesson_id, cwd, d, preview=False, expect_sha=None):
+    rid, msg, info = _publish_core(lesson_id, cwd, d, preview, expect_sha)
+    return rid, msg, info
+
+
+def _publish_core(lesson_id, cwd, d, preview, expect_sha):
     personal_path = d / LESSONS_FILE
     ap = approvals_path(d)
     pev = lc.evaluate(personal_path, None, None, ap)
     if pev["reasons"]:
         return None, ("refusing to publish: the personal store fails its check\n"
-                      + "\n".join(f"- {r}" for r in pev["reasons"]))
+                      + "\n".join(f"- {r}" for r in pev["reasons"])), None
     entries = pev["personal"]
     entry = next((e for e in entries if e.get("id") == lesson_id), None)
     if entry is None:
-        return None, f"no such lesson: {lesson_id}"
+        return None, f"no such lesson: {lesson_id}", None
     retired = lc.fold(entries)
     if lesson_id in retired:
         return None, (f"refusing to publish {lesson_id}: it was superseded by "
-                      f"{retired[lesson_id]} — publish that one instead")
+                      f"{retired[lesson_id]} — publish that one instead"), None
 
     scope = entry.get("scope") or ""
     if not scope.startswith("repo:"):
         return None, (f"refusing to publish {lesson_id}: scope is "
                       f"{scope!r}, not repo:<name> — global lessons stay "
-                      "in the personal store")
+                      "in the personal store"), None
     target_repo = scope[len("repo:"):]
 
     top, name = lc.repo_identity(cwd)
     if top is None:
-        return None, "cwd is not inside a git repository"
+        return None, "cwd is not inside a git repository", None
     if name != target_repo:
         return None, (f"refusing to publish {lesson_id}: scoped to "
-                      f"repo:{target_repo}, but cwd is in repo {name!r}")
+                      f"repo:{target_repo}, but cwd is in repo {name!r}"), None
     tier = f"repo:{name}"
 
     claude_dir = top / REPO_LESSONS_RELPATH.parent
     repo_path = top / REPO_LESSONS_RELPATH
     if claude_dir.is_symlink():
-        return None, f"{claude_dir} is a symlink — refusing to write through it"
+        return None, f"{claude_dir} is a symlink — refusing to write through it", None
     err = _refuse_nonregular(repo_path)
     if err:
-        return None, err
+        return None, err, None
     prev_bytes = repo_path.read_bytes() if repo_path.exists() else None
     try:
         existing_text = prev_bytes.decode("utf-8") if prev_bytes is not None else ""
     except UnicodeDecodeError:
-        return None, f"{repo_path} is not valid UTF-8 — refusing to append"
+        return None, f"{repo_path} is not valid UTF-8 — refusing to append", None
 
     records, ledger_reasons = lc.read_approvals(ap)
     if ledger_reasons:
-        return None, "\n".join(ledger_reasons)
+        return None, "\n".join(ledger_reasons), None
     repo_entries = lc.parse(existing_text)
     repo_by_id = {e["id"]: e for e in repo_entries if e.get("id")}
     published = {}   # source L-id -> R-id currently present in this repo file
@@ -820,7 +887,7 @@ def _publish_locked(lesson_id, cwd, d):
             published[r.get("source")] = r["id"]
     if lesson_id in published:
         return None, (f"refusing to publish {lesson_id}: already published "
-                      f"as {published[lesson_id]} in {repo_path}")
+                      f"as {published[lesson_id]} in {repo_path}"), None
 
     repo_retired = lc.fold(repo_entries)
     sup = []
@@ -832,16 +899,21 @@ def _publish_locked(lesson_id, cwd, d):
 
     rid = _next_id(repo_entries, "R-")
     if rid is None:
-        return None, "the R-NNN id space is exhausted"
+        return None, "the R-NNN id space is exhausted", None
     block = _render_entry(rid, scope, entry.get("rule"), entry.get("why"),
                           entry.get("evidence"), sup, entry.get("accepted"))
     new_text = _append_entry_text(existing_text, block)
     err = _append_self_check(existing_text, new_text, rid, block)
     if err:
-        return None, err
-    record = lc.make_approval(lc.ledger_tail(records), rid, tier,
-                              lc.entry_sha(block.rstrip("\n")), "publish",
-                              source=lesson_id)
+        return None, err, None
+    block_sha = lc.entry_sha(block.rstrip("\n"))
+    if preview:
+        return None, "", {"id": rid, "block": block, "sha": block_sha}
+    if expect_sha is not None and block_sha != expect_sha:
+        return None, ("the entry that would be appended is not the one that was "
+                      "shown (sha256 mismatch) — preview again and re-ask"), None
+    record = lc.make_approval(lc.ledger_tail(records), rid, tier, block_sha,
+                              "publish", source=lesson_id)
 
     created_dir = not os.path.lexists(str(claude_dir))
 
@@ -858,21 +930,21 @@ def _publish_locked(lesson_id, cwd, d):
         repo_path.write_bytes(new_text.encode("utf-8"))
     except OSError as e:
         rollback()
-        return None, f"could not write {repo_path}: {e}"
+        return None, f"could not write {repo_path}: {e}", None
 
     reasons = lc.evaluate(personal_path, repo_path, name, ap,
                           extra_approvals=[record])["reasons"]
     if reasons:
         rollback()
-        return None, "LESSONS FAIL\n" + "\n".join(f"- {r}" for r in reasons)
+        return None, "LESSONS FAIL\n" + "\n".join(f"- {r}" for r in reasons), None
     try:
         _append_ledger(ap, record)
     except OSError as e:
         rollback()
-        return None, f"could not record the publish in the approvals ledger: {e}"
+        return None, f"could not record the publish in the approvals ledger: {e}", None
 
     return rid, (f"Published {lesson_id} as {rid} to {repo_path} — left "
-                 "uncommitted. Commit it with your work.")
+                 "uncommitted. Commit it with your work."), None
 
 
 # --- trust -----------------------------------------------------------------
@@ -947,37 +1019,21 @@ def _head_bytes(d):
         return b""
 
 
-def _ever_committed_ids(d):
-    """Every entry id that appears in any committed version of lessons.md."""
-    ids = set()
-    log = _git(d, "log", "--format=%H", "--", LESSONS_FILE)
-    for h in [x for x in log.stdout.split("\n") if x]:
-        r = subprocess.run(["git", "-C", str(d), "show", f"{h}:{LESSONS_FILE}"],
-                           capture_output=True)
-        if r.returncode == 0:
-            ids.update(e["id"] for e in lc.parse(r.stdout.decode("utf-8", "replace"))
-                       if e.get("id"))
-    return ids
-
-
 def repair_plan(d=None):
     """What `repair --apply` would remove, computed read-only. Returns
-    {"problem": str|None, "cut": int|None, "removed": str, "ledger_cut":
-    int|None, "ledger_removed": [str], "sha": str}.
+    {"problem": str|None, "cut": int|None, "removed": str, "rules": [str],
+    "sha": str}.
 
-    Removable, and ONLY this:
-      - in lessons.md: the uncommitted bytes beyond HEAD, starting at the
-        first uncommitted entry nobody approved — provided every entry after
-        it is also unapproved (committed bytes and approved entries are
-        never touched; a mixed tail is left for a human);
-      - in the ledger: trailing `accept` lines for ids that are in neither
-        the kept lessons.md nor ANY committed version of it (an approval
-        whose entry was never committed). Trailing only, so the chain of
-        the lines kept still verifies.
+    Removable, and ONLY this: the uncommitted bytes of lessons.md beyond
+    HEAD, starting at the first uncommitted entry nobody approved, when
+    every entry after it is also unapproved. Never committed bytes, never an
+    approved entry, and never the approvals ledger: an approval is only ever
+    added. If an approved lesson is missing (deleted, reset away), repair
+    refuses — the ledger holds only its sha, so the text can't be rebuilt;
+    the remedy is restoring the entry (e.g. from `git reflog` in the store).
     """
     d = Path(d) if d else store_dir()
-    plan = {"problem": None, "cut": None, "removed": "", "ledger_cut": None,
-            "ledger_removed": [], "sha": ""}
+    plan = {"problem": None, "cut": None, "removed": "", "rules": [], "sha": ""}
     path = d / LESSONS_FILE
     ap = approvals_path(d)
     err = _refuse_nonregular(path) or _refuse_nonregular(ap)
@@ -1005,6 +1061,7 @@ def repair_plan(d=None):
         offsets.append(pos)
         pos += len(ln.encode("utf-8")) + 1
     approved = {(r["id"], r["sha256"]) for r in records if r["tier"] == "personal"}
+    approved_ids = {r["id"] for r in records if r["tier"] == "personal"}
     entries = lc.parse(text)
     for e in entries:
         e["_start"] = offsets[e["line"] - 1]
@@ -1024,26 +1081,19 @@ def repair_plan(d=None):
         cut = tail[k]["_start"]
         while cut > len(head) and working[cut - 2:cut] == b"\n\n":
             cut -= 1
+    kept_ids = {e.get("id") for e in entries if cut is None or e["_start"] < cut}
+    missing = sorted(approved_ids - kept_ids)
+    if missing:
+        plan["problem"] = (f"approved lesson(s) {', '.join(missing)} missing from lessons.md "
+                           "— repair never removes an approval, and it cannot rebuild the "
+                           "text (the ledger holds only its sha). Restore the entry, e.g. "
+                           "from `git reflog` in the store, then re-check.")
+        return plan
+    if cut is not None:
         plan["cut"] = cut
         plan["removed"] = working[cut:].decode("utf-8")
-
-    kept_ids = {e.get("id") for e in entries if cut is None or e["_start"] < cut}
-    committed = _ever_committed_ids(d) if records else set()
-    n = len(records)
-    while n > 0:
-        r = records[n - 1]
-        if (r["tier"] == "personal" and r["how"] == "accept"
-                and r["id"] not in kept_ids and r["id"] not in committed):
-            n -= 1
-        else:
-            break
-    if n < len(records):
-        lines = ap.read_bytes().decode("utf-8").split("\n")
-        plan["ledger_removed"] = lines[n:len(records)]
-        plan["ledger_cut"] = sum(len(x.encode("utf-8")) + 1 for x in lines[:n])
-
-    blob = (plan["removed"] + "\0" + "\n".join(plan["ledger_removed"])).encode("utf-8")
-    plan["sha"] = hashlib.sha256(blob).hexdigest()
+        plan["rules"] = [f"{e.get('id')}: {e.get('rule')}" for e in tail[k:]]
+    plan["sha"] = hashlib.sha256(plan["removed"].encode("utf-8")).hexdigest()
     return plan
 
 
@@ -1063,18 +1113,15 @@ def repair(apply=False, sha=None, d=None):
         plan = repair_plan(d)
         if plan["problem"]:
             return False, plan, plan["problem"]
-        if plan["cut"] is None and plan["ledger_cut"] is None:
+        if plan["cut"] is None:
             return True, plan, "nothing to repair"
         if plan["sha"] != sha:
             return False, plan, ("refusing: what would be removed changed since it was "
                                  "shown (sha256 mismatch) — show the dry run again")
-        path, ap = d / LESSONS_FILE, approvals_path(d)
-        if plan["cut"] is not None:
-            path.write_bytes(path.read_bytes()[:plan["cut"]])
-            if _git(d, "diff", "--cached", "--quiet", "--", LESSONS_FILE).returncode != 0:
-                _unstage(d)
-        if plan["ledger_cut"] is not None:
-            os.truncate(str(ap), plan["ledger_cut"])
+        path = d / LESSONS_FILE
+        path.write_bytes(path.read_bytes()[:plan["cut"]])
+        if _git(d, "diff", "--cached", "--quiet", "--", LESSONS_FILE).returncode != 0:
+            _unstage(d)
     reasons = lc.evaluate(d / LESSONS_FILE, None, None, approvals_path(d))["personal_reasons"]
     msg = "repaired." + ("" if not reasons else
                          " The store still fails its check:\n" + "\n".join(f"- {r}" for r in reasons))
@@ -1212,12 +1259,26 @@ def _fail(reasons):
     return 1
 
 
+def _print_preview(info):
+    print(f"--- exact entry to append (sha256 {info['sha']}):")
+    print(info["block"], end="")
+
+
 def _cmd_accept(args):
+    if args.preview:
+        info, reasons = accept_preview(args.rule, args.why, args.evidence,
+                                       scope=args.scope or "global",
+                                       supersedes=args.supersedes)
+        if info is None:
+            return _fail(reasons)
+        _print_preview(info)
+        return 0
     candidates = [c for c in (args.candidates.split(",") if args.candidates else [])
                   if c]
     lid, reasons, _ = accept(args.rule, args.why, args.evidence,
                              scope=args.scope or "global",
-                             supersedes=args.supersedes, candidates=candidates)
+                             supersedes=args.supersedes, candidates=candidates,
+                             expect_sha=args.sha)
     if reasons:
         return _fail(reasons)
     print(lid)
@@ -1225,7 +1286,14 @@ def _cmd_accept(args):
 
 
 def _cmd_publish(args):
-    rid, msg = publish(args.id)
+    if args.preview:
+        info, msg = publish_preview(args.id)
+        if info is None:
+            print(msg, file=sys.stderr)
+            return 1
+        _print_preview(info)
+        return 0
+    rid, msg = publish(args.id, expect_sha=args.sha)
     if rid is None:
         print(msg, file=sys.stderr)
         return 1
@@ -1260,26 +1328,23 @@ def _cmd_trust(args):
 def _print_plan(plan, d):
     d = Path(d) if d else store_dir()
     print(f"repair plan (sha256 {plan['sha']}):")
-    if plan["cut"] is not None:
-        print(f"--- remove from {d / LESSONS_FILE} (uncommitted, never approved):")
-        print(plan["removed"], end="" if plan["removed"].endswith("\n") else "\n")
-    if plan["ledger_removed"]:
-        print(f"--- remove from {approvals_path(d)} (approvals whose entry was never committed):")
-        for ln in plan["ledger_removed"]:
-            print(ln)
+    print("rules that would be removed (uncommitted, never approved):")
+    for r in plan["rules"]:
+        print(f"  - {r}")
+    print(f"--- exact bytes to remove from the end of {d / LESSONS_FILE}:")
+    print(plan["removed"], end="" if plan["removed"].endswith("\n") else "\n")
 
 
 def _cmd_repair(args):
     ok, plan, msg = repair(apply=args.apply, sha=args.sha)
-    if plan is not None and plan.get("problem") is None and (
-            plan["cut"] is not None or plan["ledger_cut"] is not None):
+    if plan is not None and plan.get("problem") is None and plan["cut"] is not None:
         _print_plan(plan, None)
     if not ok:
         print(msg, file=sys.stderr)
         return 1
     if args.apply:
         print(msg)
-    elif plan["cut"] is None and plan["ledger_cut"] is None:
+    elif plan["cut"] is None:
         print("nothing to repair")
     else:
         print("Apply only after Griffin's explicit yes to exactly this, with:")
@@ -1343,10 +1408,15 @@ def build_parser():
     p.add_argument("--scope", default="global")
     p.add_argument("--supersedes", help="one id or a comma-separated list")
     p.add_argument("--candidates")
+    p.add_argument("--preview", action="store_true",
+                   help="print the exact entry block and its sha256; write nothing")
+    p.add_argument("--sha", help="refuse unless the appended block has this sha256")
     p.set_defaults(func=_cmd_accept)
 
     p = sub.add_parser("publish")
     p.add_argument("id")
+    p.add_argument("--preview", action="store_true")
+    p.add_argument("--sha")
     p.set_defaults(func=_cmd_publish)
 
     p = sub.add_parser("untrusted")

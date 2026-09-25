@@ -46,7 +46,14 @@ default). One JSON line per approval:
    exact bytes, heading line through last field line joined by \\n>,
    "how": "accept"|"publish"|"trust", "at", ["source": <L-id, publish only>],
    "prev": <previous line's chain, "" for the first>,
-   "chain": sha256(prev + id + sha256)}
+   "chain": sha256(prev + canonical JSON of every other field)}
+
+The chain covers every field of every record, so editing, reordering or
+cutting a line out of the middle is detected. What the ledger is, plainly:
+TAMPER-EVIDENT against accidental or naive edits (a hand edit, a script that
+rewrites a file, a git history rewrite). It is NOT a defense against
+deliberate forgery by code that has write access to ~/.claude: there is no
+secret, so such code can append a forged entry and recompute the chain.
 
 Only `lessons.py accept`, `publish` and `trust` append to it. The validator
 requires: the chain verifies; every personal entry has an approval with the
@@ -54,6 +61,13 @@ same id and sha (an unapproved or altered entry FAILS); every approved
 personal id is still present (a deletion FAILS even if git history was
 rewritten). A repo-file entry without a matching approval is UNTRUSTED: a
 warning here, and never injected.
+
+Cost is bounded so the SessionStart hook always answers: lesson files over
+MAX_FILE_BYTES are refused, and the append-only history walk runs in three
+git processes under a shared time budget, a commit cap and a byte cap. The
+repo file's walk is skipped when the ledger holds no approval for that repo
+(nothing from it can be injected); if a walk runs out of budget, that tier
+fails — for the repo tier that turns off only the repo file.
 
 Repo identity is the basename of the MAIN working tree, resolved through
 `git rev-parse --git-common-dir`, so a linked worktree shares its repo's
@@ -95,6 +109,10 @@ MAX_BUDGET_ENTRIES = 24
 MAX_BUDGET_CHARS = 6000
 MAX_SUPERSEDES = MAX_BUDGET_ENTRIES
 NEAR_BUDGET_RATIO = 0.8
+MAX_FILE_BYTES = 1_000_000        # a lesson file is refused above this
+HISTORY_BUDGET_S = 4.0            # shared by both tiers' history walks
+MAX_HISTORY_COMMITS = 2000        # commits touching one lesson file
+MAX_HISTORY_BYTES = 32_000_000    # total bytes of its historical versions
 
 # fullmatch + explicit [0-9]: `\d` would accept fullwidth and other Unicode
 # digits, and `$` would accept a trailing newline.
@@ -279,6 +297,9 @@ def _read_lesson_file(path, label, fail):
         fail(f"{label} lessons file {p} is not a regular file — refusing to read it")
         return None
     try:
+        if os.lstat(str(p)).st_size > MAX_FILE_BYTES:
+            fail(f"{label} lessons file {p} is over {MAX_FILE_BYTES} bytes — refusing to read it")
+            return None
         data = p.read_bytes()
     except OSError as e:
         fail(f"{label} lessons file {p} is unreadable ({e.__class__.__name__})")
@@ -372,8 +393,16 @@ def approvals_path(store=None):
     return Path(store if store else default_store_dir()).parent / APPROVALS_FILE
 
 
-def chain_of(prev, id_, sha):
-    return hashlib.sha256((prev + id_ + sha).encode("utf-8")).hexdigest()
+def _canonical(rec):
+    return json.dumps({k: v for k, v in rec.items() if k != "chain"},
+                      sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def chain_of(rec):
+    """sha256 of the previous chain plus the canonical JSON of every field
+    of this record except `chain` itself — id, tier, sha256, how, at,
+    source, prev: nothing in a record sits outside the chain."""
+    return hashlib.sha256((rec.get("prev", "") + _canonical(rec)).encode("utf-8")).hexdigest()
 
 
 def make_approval(prev, id_, tier, sha, how, **extra):
@@ -381,7 +410,7 @@ def make_approval(prev, id_, tier, sha, how, **extra):
            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     rec.update(extra)
     rec["prev"] = prev
-    rec["chain"] = chain_of(prev, id_, sha)
+    rec["chain"] = chain_of(rec)
     return rec
 
 
@@ -402,7 +431,10 @@ def _valid_record(rec):
                 and SHA_RE.fullmatch(rec["sha256"])
                 and rec["how"] in HOWS
                 and (tier == "personal") == rec["id"].startswith("L-")
-                and (tier == "personal") == (rec["how"] == "accept"))
+                and (tier == "personal") == (rec["how"] == "accept")
+                and (rec["how"] != "publish"
+                     or (isinstance(rec.get("source"), str)
+                         and ID_RE_PERSONAL.fullmatch(rec["source"]))))
 
 
 def read_approvals(path):
@@ -429,7 +461,7 @@ def read_approvals(path):
             return records, [f"{where}: not JSON — ledger chain broken"]
         if not _valid_record(rec):
             return records, [f"{where}: malformed approval record — ledger chain broken"]
-        if rec["prev"] != prev or rec["chain"] != chain_of(prev, rec["id"], rec["sha256"]):
+        if rec["prev"] != prev or rec["chain"] != chain_of(rec):
             return records, [f"{where}: hash chain does not verify — the ledger "
                              "was edited, reordered, or cut in the middle"]
         prev = rec["chain"]
@@ -538,22 +570,36 @@ def _budget_contexts(entries, repo_name):
     return [None] + sorted(names)
 
 
-def published_copies(trusted, records, repo_name):
-    """Personal L- ids that have a trusted, published R- copy in this repo's
-    file (ledger `publish` record with that R- id, sha and `source`). In that
-    repo the R- copy is injected and counted instead of the L- original."""
+def published_copies(trusted, records, repo_name, personal_entries=()):
+    """{R-id: L-id} for trusted R- entries in this repo's file that are a
+    published copy of a personal lesson: a ledger `publish` record with that
+    R- id, sha and `source`, where the source lesson exists with scope
+    repo:<this repo> and exactly the same Rule text."""
     if not repo_name:
-        return frozenset()
+        return {}
     tier = f"repo:{repo_name}"
-    covered = set()
+    by_id = {e["id"]: e for e in personal_entries if e.get("id")}
+    norm = lambda t: " ".join((t or "").split())
+    copies = {}
     for e in trusted:
         for r in records:
             src = r.get("source")
-            if (r.get("how") == "publish" and r["tier"] == tier and r["id"] == e["id"]
+            if not (r.get("how") == "publish" and r["tier"] == tier and r["id"] == e["id"]
                     and r["sha256"] == e["sha256"] and isinstance(src, str)
                     and ID_RE_PERSONAL.fullmatch(src)):
-                covered.add(src)
-    return frozenset(covered)
+                continue
+            orig = by_id.get(src)
+            if orig and orig.get("scope") == tier and norm(orig.get("rule")) == norm(e.get("rule")):
+                copies[e["id"]] = src
+    return copies
+
+
+def hidden_ids(copies, personal_entries):
+    """Ids that must not be injected in this repo: a personal original whose
+    published copy replaces it, and a published copy whose personal source
+    has been superseded (the copy must not resurrect a retired rule)."""
+    retired = fold(personal_entries)
+    return frozenset(set(copies.values()) | {r for r, src in copies.items() if src in retired})
 
 
 def injectable(pool, repo_name, covered=frozenset()):
@@ -699,7 +745,7 @@ def _existing_ancestor(path):
     return p
 
 
-def _check_append_only(path, fail):
+def _check_append_only(path, fail, deadline=None):
     """A lesson file's committed history, plus its current working content,
     must form a strictly-increasing chain of byte prefixes. Any edit,
     delete, reorder, or whitespace/line-ending change of existing bytes
@@ -709,9 +755,22 @@ def _check_append_only(path, fail):
     of "erase what was accepted" move this check exists to catch, so it is
     always a break, never treated as a fresh start.
 
+    Bounded: three git processes (log, cat-file --batch-check, cat-file
+    --batch), all under `deadline`, at most MAX_HISTORY_COMMITS commits and
+    MAX_HISTORY_BYTES of historical content. Running out of any of them is a
+    failure of this file's tier, never a hang.
+
     A path with no git history at all (never committed, nothing to lose) is
     out of scope for this check — the approvals ledger still anchors it.
     """
+    if deadline is None:
+        deadline = time.monotonic() + HISTORY_BUDGET_S
+    over = (f"append-only history of {Path(path).name} could not be verified "
+            "within the hook budget")
+
+    def left():
+        return deadline - time.monotonic()
+
     top = _git_toplevel(_existing_ancestor(path))
     if top is None:
         return  # never touched a git repo
@@ -721,18 +780,56 @@ def _check_append_only(path, fail):
     except ValueError:
         return
 
-    log = subprocess.run(
-        ["git", "-C", str(top), "log", "--format=%H", "--reverse", "--", relpath],
-        capture_output=True, text=True)
-    hashes = [h for h in log.stdout.split("\n") if h]
-    if not hashes:
-        return  # no history for this path — untracked/never existed
+    try:
+        if left() <= 0:
+            raise subprocess.TimeoutExpired("git", 0)
+        log = subprocess.run(
+            ["git", "-C", str(top), "log", "--format=%H", "--reverse", "--", relpath],
+            capture_output=True, text=True, timeout=left())
+        hashes = [h for h in log.stdout.split("\n") if h]
+        if not hashes:
+            return  # no history for this path — untracked/never existed
+        if len(hashes) > MAX_HISTORY_COMMITS:
+            fail(f"{over}: {len(hashes)} commits touch it (cap {MAX_HISTORY_COMMITS})")
+            return
+        specs = "".join(f"{h}:{relpath}\n" for h in hashes).encode("utf-8")
+        if left() <= 0:
+            raise subprocess.TimeoutExpired("git", 0)
+        chk = subprocess.run(["git", "-C", str(top), "cat-file", "--batch-check"],
+                             input=specs, capture_output=True, timeout=left())
+        total = 0
+        for line in chk.stdout.split(b"\n"):
+            parts = line.split(b" ")
+            if len(parts) == 3 and parts[1] == b"blob":
+                total += int(parts[2])
+        if total > MAX_HISTORY_BYTES:
+            fail(f"{over}: {total} bytes of history (cap {MAX_HISTORY_BYTES})")
+            return
+        if left() <= 0:
+            raise subprocess.TimeoutExpired("git", 0)
+        cat = subprocess.run(["git", "-C", str(top), "cat-file", "--batch"],
+                             input=specs, capture_output=True, timeout=left())
+    except subprocess.TimeoutExpired:
+        fail(f"{over}: out of time")
+        return
+    except (OSError, subprocess.SubprocessError):
+        return
 
     contents = []  # (label, bytes | None); None means absent at that step
+    out, pos = cat.stdout, 0
     for h in hashes:
-        show = subprocess.run(["git", "-C", str(top), "show", f"{h}:{relpath}"],
-                              capture_output=True)
-        contents.append((h, show.stdout if show.returncode == 0 else None))
+        nl = out.find(b"\n", pos)
+        if nl < 0:
+            fail(f"{over}: git cat-file output was cut short")
+            return
+        header = out[pos:nl].split(b" ")
+        pos = nl + 1
+        if len(header) == 3 and header[1] == b"blob":
+            size = int(header[2])
+            contents.append((h, out[pos:pos + size]))
+            pos += size + 1
+        else:
+            contents.append((h, None))   # "<spec> missing": absent at that commit
 
     try:
         working = path.read_bytes() if _is_regular_nolink(path) else None
@@ -775,7 +872,8 @@ def _check_append_only(path, fail):
             return
 
 
-def evaluate(personal, repo, repo_name, approvals=None, extra_approvals=()):
+def evaluate(personal, repo, repo_name, approvals=None, extra_approvals=(),
+             deadline=None):
     """Full validation, reported per tier. Returns a dict:
       personal_reasons  failures of the personal file, the approvals ledger,
                         or the personal-only budget — these turn EVERYTHING
@@ -791,8 +889,9 @@ def evaluate(personal, repo, repo_name, approvals=None, extra_approvals=()):
       trusted           repo entries with a matching approval — empty when
                         the repo tier failed; the only repo entries that may
                         ever be injected
-      covered           personal ids whose trusted published copy replaces
-                        them in this repo (see published_copies)
+      covered           ids hidden from injection in this repo: personal
+                        originals replaced by their published copy, and
+                        copies whose personal source was superseded
     `extra_approvals` are records validated as if already appended — used by
     accept/publish/trust to check the post-state before writing the ledger.
     """
@@ -830,15 +929,22 @@ def evaluate(personal, repo, repo_name, approvals=None, extra_approvals=()):
     trusted = _check_approvals(personal_entries, personal is not None,
                                repo_entries, repo_name, records, pfail, warn)
 
-    for p, fail in ((personal, pfail), (repo, rfail)):
-        if p is None:
+    if deadline is None:
+        deadline = time.monotonic() + HISTORY_BUDGET_S
+    # The repo file's history only protects TRUSTED entries; with no
+    # approval for this repo in the ledger nothing from it can be injected,
+    # so its (possibly huge) history is not walked at all.
+    repo_tier = f"repo:{repo_name}" if repo_name else None
+    walk_repo = repo_tier is not None and any(r["tier"] == repo_tier for r in records)
+    for p, fail, walk in ((personal, pfail, True), (repo, rfail, walk_repo)):
+        if p is None or not walk:
             continue
         p = Path(p)
         if os.path.lexists(str(p)) and not _is_regular_nolink(p):
             continue  # already refused above; never read through it
         if p.parent.name == ".claude" and p.parent.is_symlink():
             continue
-        _check_append_only(p, fail)
+        _check_append_only(p, fail, deadline)
 
     pbudget = []
     _check_budget(personal_entries, repo_name, pbudget.append)
@@ -846,7 +952,8 @@ def evaluate(personal, repo, repo_name, approvals=None, extra_approvals=()):
 
     if rreasons:
         trusted = []          # a broken repo file contributes nothing
-    covered = published_copies(trusted, records, repo_name)
+    covered = hidden_ids(published_copies(trusted, records, repo_name, personal_entries),
+                         personal_entries)
     if trusted and not pbudget:
         _check_budget(personal_entries + trusted, repo_name, rbudget.append, covered)
         rreasons.extend(rbudget)

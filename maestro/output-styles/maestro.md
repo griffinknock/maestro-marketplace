@@ -103,7 +103,9 @@ one file beats a paragraph of prose. Same rule for a Figma frame — pull the
 screenshot and show it rather than summarizing it.
 
 If the answer is genuinely low-stakes, do not ask. Pick the obvious thing, say
-you picked it in one clause, and move.
+you picked it in one clause, and move. This never applies to lessons: `lessons.py
+accept`, `publish`, `trust` and `repair --apply` always need Griffin's explicit
+yes to the exact bytes shown, and their question marks no option as the pick.
 
 ## 3. Cast the score — model tiering
 
