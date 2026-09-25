@@ -142,8 +142,9 @@ def resume_prompt_case(text):
     # there can't be threaded through next/recover/end-chunk later in the
     # same loop. This deliberately does NOT require every occurrence to
     # carry --owner: the literal SessionStart anchor quote (see
-    # anchor_match_case) has no --owner by design, since sweep_state.py
-    # itself doesn't print one yet.
+    # anchor_match_case) only carries --owner once a chunk has actually
+    # started — with no chunk started yet, sweep_state.py has no owner to
+    # recover and prints the bare form instead.
     owner_run_count = text.count("/loop /maestro:sweep run <slug> --owner <owner>")
     owner_resume_count = text.count("/loop /maestro:sweep resume <slug> --owner <owner>")
     check("skill tells Griffin to type '/loop /maestro:sweep run <slug> "
@@ -177,38 +178,64 @@ def anchor_match_case(text):
         check("skipped — no SKILL.md text", False)
         return
     state_src = read(STATE_PY)
-    m = re.search(r'Resume with (/loop /maestro:sweep resume \{[^}]+\}|/loop /maestro:sweep resume \S+)', state_src)
-    check("sweep_state.py anchor prints a 'Resume with /loop /maestro:sweep resume ...' line",
-          m is not None, state_src)
-    if not m:
+
+    # cmd_anchor builds its resume line in two documented forms: with
+    # --owner once a chunk has started (owner comes from pace.jsonl's
+    # latest start record), and without one when none has started yet.
+    # Adjacent f-string literals split across lines are implicit
+    # concatenation in Python source, so merge them before extracting the
+    # literal "Resume with ..." text each branch actually prints.
+    func_m = re.search(r"def cmd_anchor\b.*?(?=\ndef )", state_src, re.DOTALL)
+    check("found cmd_anchor in sweep_state.py", func_m is not None)
+    if not func_m:
         return
-    anchor_line = m.group(1)
+    merged = re.sub(r'"\s*\n\s*f"', "", func_m.group(0))
+    resume_lines = re.findall(r"Resume with [^\"]+", merged)
+    check("sweep_state.py's cmd_anchor builds exactly two resume-line forms "
+          "(with --owner and without)",
+          len(resume_lines) == 2, resume_lines)
+    if len(resume_lines) != 2:
+        return
+
+    canonical = sorted(
+        line.replace("{p.name}", "<slug>").replace("{owner}", "<owner>").strip()
+        for line in resume_lines
+    )
+    canonical_with_owner = next(c for c in canonical if "--owner" in c)
+    canonical_without_owner = next(c for c in canonical if "--owner" not in c)
+    check("one form carries --owner and the other doesn't",
+          canonical_with_owner != canonical_without_owner, canonical)
     check("anchor's subcommand ('resume') is documented in the skill as an "
           "entry point (wrapped by /loop)",
-          "/maestro:sweep resume" in anchor_line and "/loop /maestro:sweep resume <slug>" in text,
-          anchor_line)
+          "/loop /maestro:sweep resume <slug>" in text, canonical)
 
     # The bug this case exists to catch: SKILL.md previously *quoted* the
-    # anchor's printed text with the wrong shape (missing /loop) even
-    # though "/loop /maestro:sweep resume <slug>" also appeared elsewhere
-    # in the doc — the substring check above passed either way and missed
-    # it. Build the exact canonical anchor string from sweep_state.py
-    # (normalizing its {p.name} placeholder to the skill's <slug>) and
-    # require every backtick-quoted "Resume with ..." string in SKILL.md —
+    # anchor's printed text with the wrong shape (missing /loop, or a form
+    # sweep_state.py doesn't actually print) even though
+    # "/loop /maestro:sweep resume <slug>" also appeared elsewhere in the
+    # doc — a mere substring check would pass either way and miss it.
+    # Require every backtick-quoted "Resume with ..." string in SKILL.md —
     # i.e. every place the skill quotes what the anchor prints, not every
-    # place it tells Griffin to type a resume command — to match it
-    # exactly, whitespace/newlines aside.
-    canonical_anchor = "Resume with " + anchor_line.replace("{p.name}", "<slug>")
+    # place it tells Griffin to type a resume command — to match one of
+    # the two canonical forms exactly, whitespace/newlines aside.
     quoted = re.findall(r"`(Resume\s+with\s+[^`]+)`", text)
     check("SKILL.md quotes at least one anchor string", len(quoted) >= 1, quoted)
     mismatched = []
     for q in quoted:
         normalized = re.sub(r"\s+", " ", q).strip()
-        if normalized != canonical_anchor:
+        if normalized not in (canonical_with_owner, canonical_without_owner):
             mismatched.append(normalized)
     check("every backtick-quoted 'Resume with ...' string in SKILL.md "
-          "matches sweep_state.py's actual anchor format exactly",
-          not mismatched, f"expected {canonical_anchor!r}, got {mismatched!r}")
+          "matches one of sweep_state.py's two actual anchor forms exactly",
+          not mismatched,
+          f"expected one of {(canonical_with_owner, canonical_without_owner)!r}, "
+          f"got {mismatched!r}")
+    check("SKILL.md quotes the with-owner anchor form at least once",
+          any(re.sub(r"\s+", " ", q).strip() == canonical_with_owner for q in quoted),
+          quoted)
+    check("SKILL.md quotes the without-owner anchor form at least once",
+          any(re.sub(r"\s+", " ", q).strip() == canonical_without_owner for q in quoted),
+          quoted)
 
 
 def main():

@@ -607,6 +607,58 @@ def anchor_case():
     check("anchor never raises on malformed stdin", r4.returncode == 0)
 
 
+def anchor_owner_case():
+    print("\n=== sweep_state — anchor carries the latest chunk's owner ===")
+    ws = tmpdir("maestro-ws-")
+    sweeps = ws / "sweeps"
+    env = base_env(sweeps_dir=sweeps)
+    plan, items = write_plan_and_items(ws, ["a", "b"])
+    run_sweep(["new", "--slug", "s8", "--plan", str(plan), "--items", str(items)], env)
+    payload = json.dumps({"cwd": str(ws), "hook_event_name": "SessionStart", "source": "resume"})
+
+    # No chunk has started yet -> no --owner in the resume line.
+    r0 = run_sweep(["anchor"], env, input_text=payload)
+    out0 = json.loads(r0.stdout)
+    ctx0 = out0["hookSpecificOutput"]["additionalContext"]
+    check("anchor with no chunks omits --owner",
+          "resume s8" in ctx0 and "--owner" not in ctx0, ctx0)
+
+    # First chunk claimed by owner-a.
+    run_sweep(["next", "s8", "--n", "1", "--owner", "owner-a"], env)
+    r1 = run_sweep(["anchor"], env, input_text=payload)
+    ctx1 = json.loads(r1.stdout)["hookSpecificOutput"]["additionalContext"]
+    check("anchor carries the sole chunk's owner",
+          "resume s8 --owner owner-a" in ctx1, ctx1)
+
+    # Second chunk claimed by owner-b (a later/different session) -> latest wins.
+    run_sweep(["next", "s8", "--n", "1", "--owner", "owner-b"], env)
+    r2 = run_sweep(["anchor"], env, input_text=payload)
+    ctx2 = json.loads(r2.stdout)["hookSpecificOutput"]["additionalContext"]
+    check("anchor's owner is the latest start record's, not the first",
+          "resume s8 --owner owner-b" in ctx2 and "owner-a" not in ctx2, ctx2)
+
+
+def anchor_corrupt_pace_case():
+    print("\n=== sweep_state — anchor never raises on corrupt pace.jsonl ===")
+    ws = tmpdir("maestro-ws-")
+    sweeps = ws / "sweeps"
+    env = base_env(sweeps_dir=sweeps)
+    plan, items = write_plan_and_items(ws, ["a", "b"])
+    run_sweep(["new", "--slug", "s9", "--plan", str(plan), "--items", str(items)], env)
+    run_sweep(["next", "s9", "--n", "1", "--owner", "owner-a"], env)
+
+    pace_path = sweeps / "s9" / "pace.jsonl"
+    pace_path.write_text(pace_path.read_text() + "not json at all\n")
+
+    payload = json.dumps({"cwd": str(ws), "hook_event_name": "SessionStart", "source": "resume"})
+    r = run_sweep(["anchor"], env, input_text=payload)
+    check("anchor exits 0 with a corrupt pace.jsonl line", r.returncode == 0, r.stderr)
+    out = json.loads(r.stdout)
+    ctx = out["hookSpecificOutput"]["additionalContext"]
+    check("anchor still resolves the owner from the valid start record despite the corrupt line",
+          "resume s9 --owner owner-a" in ctx, ctx)
+
+
 def main():
     usage_snapshot_case()
     usage_merge_case()
@@ -626,6 +678,8 @@ def main():
     lock_timeout_case()
     atomic_writes_case()
     anchor_case()
+    anchor_owner_case()
+    anchor_corrupt_pace_case()
     print("\n  " + ("PASS" if not FAILURES else f"FAIL ({len(FAILURES)}): {FAILURES}"))
     return 1 if FAILURES else 0
 
