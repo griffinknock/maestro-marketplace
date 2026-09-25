@@ -6,55 +6,95 @@ fixed interval.
 Inputs (see AGENTS/handoff for the sweep dir contract):
   - policy.json: {"ceilings": {"five_hour": 80, "seven_day": 90},
                   "deviation": "additive", "chunk_size": 5,
-                  "margin_s": 120, "max_attempts": 2}
+                  "margin_s": 120, "max_attempts": 2,
+                  "allow_blind": false, "blind_gap_s": 900}
+    `allow_blind`/`blind_gap_s` are optional (defaults shown); every other
+    key is required — see "Policy validation" below.
   - pace.jsonl: append-only, two lines per chunk (start/end), each carrying a
     "usage" snapshot shaped like {"five_hour": pct|None, "seven_day": pct|None,
     "captured_at": epoch|None, "resets": {"five_hour": epoch|None,
     "seven_day": epoch|None}}.
   - usage.json: the latest raw statusline snapshot, {"captured_at": epoch,
     "session_id": str, "five_hour": {"used_percentage": float, "resets_at":
-    epoch} | None, "seven_day": {...} | None}.
+    epoch, "captured_at": epoch|None} | None, "seven_day": {...} | None}.
+    Each window may carry its own "captured_at" (fresher than the top-level
+    one, e.g. when one window was re-read more recently); pace.py reads the
+    per-window value first and falls back to the top-level one when a window
+    doesn't have its own.
 
 Core entry point: decide(snapshot, now, policy, history) -> dict. Pure and
 deterministic — no file I/O, no clock reads beyond the passed-in `now`. The
 CLI at the bottom does the I/O and prints one JSON decision line.
+
+## Policy validation
+
+`policy` must be a non-empty object carrying every key above except
+`allow_blind`/`blind_gap_s` (which default to `false`/`900`), with:
+  - ceilings.five_hour / ceilings.seven_day (when present): numbers in (0, 100]
+  - deviation: one of locked|additive|adaptive|autonomous
+  - chunk_size: int >= 1
+  - margin_s: int >= 0
+  - max_attempts: int >= 1
+  - allow_blind: bool
+  - blind_gap_s: int >= 60
+A missing, empty, or malformed policy never falls through to a pacing
+decision that might spend usage — `decide()` returns `stop` with
+`"policy invalid: <reason>"` before looking at any reading. Real sweeps
+built via `sweep_state.py new` always merge onto a full `DEFAULT_POLICY`, so
+this only fires for a hand-broken or absent policy.json.
 
 ## Decision semantics
 
 For each window ("five_hour", "seven_day") present in `snapshot`:
 
 1. **Burn estimate.** Walk `history` (a flat list of pace.jsonl records) for
-   completed chunks: a "start" record immediately followed by an "end" record
-   for the same chunk number, where both usage readings for this window are
-   present and no reset happened in between (the reset epoch is unchanged and
-   the used percentage did not drop between start and end — a drop or reset
-   change means the window rolled over mid-chunk and that delta is discarded,
-   not counted as negative burn). Burn per chunk = mean of (end.used -
-   start.used) over the most recent such deltas (last 5). A zero delta is
-   kept — used_percentage is coarse and genuinely can read the same twice in
-   a row; the mean over several chunks is what makes that data rather than
-   noise. Chunk duration = mean of (end.at - start.at) over the same set.
-   With zero eligible deltas, fall back to a conservative default burn (see
-   `_DEFAULT_BURN`) and duration (see `_DEFAULT_DURATION`), and the reason
-   must say the estimate is a conservative default (no history).
+   completed chunks: a "start" record immediately followed by an "end"
+   record for the same chunk number, where both usage readings for this
+   window are present (NaN/non-numeric readings count as absent) and no
+   reset happened in between (the reset epoch is unchanged and the used
+   percentage did not drop between start and end — a drop or reset change
+   means the window rolled over mid-chunk and that delta is discarded, not
+   counted as negative burn). Two burn figures come out of this history:
+     - `burn` (mean of the deltas, last 5) — a robust average used to space
+       chunks out and to project a stale reading forward.
+     - `gate_burn` (max(largest recent delta, 1.0 percentage point)) — used
+       only to decide whether one more chunk still fits before the ceiling.
+       The mean under-states the gate: a single big recent chunk (or a run
+       of zero-delta coarse readings averaging near zero) must not let a
+       chunk start right at, or past, the ceiling.
+   Chunk duration = mean of (end.at - start.at) over the same deltas used
+   for `burn`. With zero eligible deltas, fall back to a conservative
+   default burn/gate (see `_DEFAULT_BURN`) and duration (see
+   `_DEFAULT_DURATION`), and the reason must say the estimate is a
+   conservative default (no history).
 
-2. **Freshness / projection.** If this window's snapshot reading is stale
-   (its `captured_at` predates the end of the last completed chunk), project
-   it forward: used + burn * chunks_elapsed_since_that_reading, using mean
-   chunk duration to convert elapsed wall time into a chunk count. If the
-   window's `resets_at` has already passed relative to `now`, treat it as
-   fresh at 0% used regardless of the raw reading, and say so in the reason
-   ("stale reading, already past reset").
+2. **Freshness / projection.** A usage reading is a LOWER BOUND on current
+   usage, never an exact one once time has passed:
+     - If this window's `resets_at` has already passed relative to `now`,
+       the reading predates the reset and tells us nothing about the new
+       window. If no chunk has *started* since `resets_at`, usage is
+       unknown — that window's contribution is "probe" (see below). If one
+       or more chunks have started since `resets_at`, estimate
+       `used = burn * chunks_started_since(resets_at)`.
+     - Otherwise, if the reading is stale — its own `captured_at` predates
+       the end of the last completed chunk, or is more than 10 minutes old
+       — project it forward: `used + burn * chunks_started_since(captured_at)`
+       (counting chunk *starts*, not wall-clock time, since wall-clock time
+       with no chunks running tells us nothing about burn).
+     - Otherwise the raw reading is used as-is.
 
 3. **Headroom.** headroom = ceiling - projected_used. If headroom is less
-   than one chunk's burn, that window can't safely run another chunk:
+   than one chunk's `gate_burn`, that window can't safely run another
+   chunk:
      - five_hour -> sleep until resets_at + margin_s (a bounded wait worth
        taking).
      - seven_day -> stop (a weekly reset is too far off to sleep through;
        hand off to the next session/skill invocation instead).
 
-4. **Otherwise, pace to land at/under the ceiling by resets_at:**
-     chunks_affordable = headroom / burn
+4. **Otherwise, pace to land at/under the ceiling by resets_at** (skipped,
+   falling through to a plain "continue", when there is no reset horizon to
+   pace against — `resets_at` absent or already passed):
+     chunks_affordable = headroom / burn   # mean burn, not gate_burn
      spacing = (resets_at - now) / chunks_affordable   # target gap between
                                                           # chunk *starts*
      gap = spacing - mean_chunk_duration                # gap is BETWEEN chunks
@@ -63,8 +103,8 @@ For each window ("five_hour", "seven_day") present in `snapshot`:
 
 5. **Combine windows**: evaluate every present window independently, then
    take the most restrictive verdict: stop > sleep (longer sleep wins over a
-   shorter one) > continue. `window` on the returned decision names which
-   window drove the verdict.
+   shorter one) > {continue, probe}. `window` on the returned decision names
+   which window drove the verdict.
 
 6. **Clamping & long waits.** Any sleep delay is clamped to [60, 3600]
    (ScheduleWakeup's own bounds). A true target beyond 3600s away is
@@ -80,12 +120,20 @@ For each window ("five_hour", "seven_day") present in `snapshot`:
    in it, the account may be API-key-billed (no rate_limits at all) or the
    statusline simply hasn't captured a reading yet. Return "probe": run one
    more (small) chunk to get a reading, and say usage is unknown in the
-   reason. If history already shows >= 3 chunks with a start reading of
-   None/absent for both windows (i.e. we've probed and never gotten a
-   reading), give up probing and fall back to "continue" with a reason that
-   says pacing is blind for this account — sleeping blindly buys nothing.
+   reason. Once history shows >= 3 chunks started with no reading at all for
+   either window, probing further just spends usage blind for no signal —
+   return "stop" with reason "no usage signal — run install.sh so Maestro's
+   statusLine records rate_limits, or set allow_blind", UNLESS
+   `policy.allow_blind` is set, in which case sleep `blind_gap_s` between
+   chunks instead (still clamped to [60, 3600], with `wake_at` for the
+   remainder when `blind_gap_s` itself is over an hour).
+
+Any unexpected exception while computing a decision is never allowed to
+fall back to a default that spends usage — the CLI catches it and returns
+"stop" with the error text in the reason.
 """
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -101,10 +149,85 @@ _WINDOWS = ("five_hour", "seven_day")
 _MIN_DELAY = 60
 _MAX_DELAY = 3600
 _BLIND_PROBE_LIMIT = 3
+_STALE_AFTER_S = 600.0  # 10 minutes
+
+_REQUIRED_POLICY_KEYS = ("ceilings", "deviation", "chunk_size", "margin_s", "max_attempts")
+_DEVIATIONS = {"locked", "additive", "adaptive", "autonomous"}
+_DEFAULT_ALLOW_BLIND = False
+_DEFAULT_BLIND_GAP_S = 900
 
 
 def _clamp_delay(seconds):
     return max(_MIN_DELAY, min(_MAX_DELAY, int(round(seconds))))
+
+
+def _is_bool(v):
+    return isinstance(v, bool)
+
+
+def _is_int(v):
+    return isinstance(v, int) and not _is_bool(v)
+
+
+def _is_number(v):
+    return isinstance(v, (int, float)) and not _is_bool(v)
+
+
+def _finite_number(v):
+    """Coerce a reading to a real, finite float — or None. Guards every
+    used_percentage read against NaN and non-numeric junk so a bad reading
+    is treated as an absent one rather than raising or silently poisoning a
+    mean/projection with NaN."""
+    if not _is_number(v):
+        return None
+    v = float(v)
+    if math.isnan(v) or math.isinf(v):
+        return None
+    return v
+
+
+def _validate_policy(policy):
+    """Return an error string if `policy` fails the contract, else None."""
+    if not isinstance(policy, dict) or not policy:
+        return "missing or empty policy"
+
+    for key in _REQUIRED_POLICY_KEYS:
+        if key not in policy:
+            return "missing required key %r" % key
+
+    ceilings = policy.get("ceilings")
+    if not isinstance(ceilings, dict):
+        return "ceilings must be an object"
+    for window in _WINDOWS:
+        if window in ceilings:
+            v = ceilings[window]
+            if not _is_number(v) or not (0 < v <= 100):
+                return "ceilings.%s must be a number in (0, 100]" % window
+
+    if policy.get("deviation") not in _DEVIATIONS:
+        return "deviation must be one of %s" % sorted(_DEVIATIONS)
+
+    chunk_size = policy.get("chunk_size")
+    if not _is_int(chunk_size) or chunk_size < 1:
+        return "chunk_size must be an int >= 1"
+
+    margin_s = policy.get("margin_s")
+    if not _is_int(margin_s) or margin_s < 0:
+        return "margin_s must be an int >= 0"
+
+    max_attempts = policy.get("max_attempts")
+    if not _is_int(max_attempts) or max_attempts < 1:
+        return "max_attempts must be an int >= 1"
+
+    if "allow_blind" in policy and not _is_bool(policy["allow_blind"]):
+        return "allow_blind must be a bool"
+
+    if "blind_gap_s" in policy:
+        blind_gap_s = policy["blind_gap_s"]
+        if not _is_int(blind_gap_s) or blind_gap_s < 60:
+            return "blind_gap_s must be an int >= 60"
+
+    return None
 
 
 def _completed_chunks(history):
@@ -123,13 +246,41 @@ def _completed_chunks(history):
     return pairs
 
 
+def _chunk_start_times(history):
+    return sorted(
+        rec.get("at", 0) for rec in (history or [])
+        if isinstance(rec, dict) and rec.get("event") == "start"
+    )
+
+
+def _chunks_since(history, threshold_at):
+    """Count of chunks that *started* at or after `threshold_at`. Used to
+    turn a stale or post-reset reading into a burn-based estimate instead of
+    a wall-clock guess — only actual chunk activity can have spent usage."""
+    if threshold_at is None:
+        return 0
+    return sum(1 for at in _chunk_start_times(history) if at >= threshold_at)
+
+
+def _count_blind_starts(history):
+    """Chunks started with no usage reading at all for either window."""
+    count = 0
+    for rec in history or []:
+        if not isinstance(rec, dict) or rec.get("event") != "start":
+            continue
+        usage = rec.get("usage") or {}
+        if usage.get("five_hour") is None and usage.get("seven_day") is None:
+            count += 1
+    return count
+
+
 def _window_deltas(pairs, window, limit=5):
     """(used_delta, duration) for each completed chunk with usable readings
     for `window`, most recent last, capped to the last `limit`."""
     deltas = []
     for start, end in pairs:
-        su = (start.get("usage") or {}).get(window)
-        eu = (end.get("usage") or {}).get(window)
+        su = _finite_number((start.get("usage") or {}).get(window))
+        eu = _finite_number((end.get("usage") or {}).get(window))
         if su is None or eu is None:
             continue
         s_resets = ((start.get("usage") or {}).get("resets") or {}).get(window)
@@ -146,31 +297,22 @@ def _window_deltas(pairs, window, limit=5):
 
 
 def _burn_and_duration(pairs, window):
-    """Return (burn_per_chunk, mean_duration, used_default: bool)."""
+    """Return (burn_per_chunk, gate_burn, mean_duration, used_default: bool).
+
+    `burn` is the mean delta — a robust average for spacing/projection.
+    `gate_burn` is max(largest recent delta, 1.0) — the floor used only to
+    decide whether one more chunk still fits before the ceiling, so a run of
+    zero/near-zero coarse readings (or a mean pulled down by a few quiet
+    chunks) can never wave a chunk through right at, or past, the ceiling."""
     deltas = _window_deltas(pairs, window)
     if not deltas:
-        return _DEFAULT_BURN, _DEFAULT_DURATION, True
+        gate_burn = max(_DEFAULT_BURN, 1.0)
+        return _DEFAULT_BURN, gate_burn, _DEFAULT_DURATION, True
     burns = [d for d, _ in deltas]
     durations = [d for _, d in deltas]
-    return sum(burns) / len(burns), sum(durations) / len(durations), False
-
-
-def _projected_used(reading_pct, reading_captured_at, resets_at, now, burn, duration, last_chunk_end_at):
-    """Project a possibly-stale used_percentage forward to `now`. Returns
-    (projected_pct, stale: bool, fresh_after_reset: bool)."""
-    if resets_at is not None and resets_at <= now:
-        return 0.0, True, True
-
-    stale = last_chunk_end_at is not None and reading_captured_at is not None \
-        and reading_captured_at < last_chunk_end_at
-    if not stale:
-        return reading_pct, False, False
-
-    elapsed = max(0.0, last_chunk_end_at - reading_captured_at) if last_chunk_end_at else 0.0
-    # also account for time since the last chunk ended, if any
-    elapsed += max(0.0, now - (last_chunk_end_at or reading_captured_at))
-    chunks_elapsed = elapsed / duration if duration > 0 else 0.0
-    return reading_pct + burn * chunks_elapsed, True, False
+    mean_burn = sum(burns) / len(burns)
+    gate_burn = max(max(burns), 1.0)
+    return mean_burn, gate_burn, sum(durations) / len(durations), False
 
 
 _RANK = {"continue": 0, "probe": 0, "sleep": 1, "stop": 2}
@@ -178,11 +320,11 @@ _RANK = {"continue": 0, "probe": 0, "sleep": 1, "stop": 2}
 
 def _more_restrictive(a, b):
     """Pick the more restrictive of two per-window verdicts: rank first
-    (stop > sleep > continue), then — for two sleeps — the longer delay_s.
-    A continue verdict carries no wake time at all, so ranking must settle
-    ties before any wake-time-shaped field is touched; comparing delay_s
-    (always an int, always present) rather than wake_at (often None) is what
-    keeps this total and crash-free."""
+    (stop > sleep > {continue, probe}), then — for two sleeps — the longer
+    delay_s. A continue/probe verdict carries no wake time at all, so
+    ranking must settle ties before any wake-time-shaped field is touched;
+    comparing delay_s (always an int, always present) rather than wake_at
+    (often None) is what keeps this total and crash-free."""
     if a is None:
         return b
     if b is None:
@@ -198,22 +340,36 @@ def _more_restrictive(a, b):
 def decide(snapshot, now, policy, history):
     """Pure pacing decision. See module docstring for full semantics."""
     policy = policy or {}
+    policy_error = _validate_policy(policy)
+    if policy_error:
+        return {
+            "action": "stop", "delay_s": 0, "window": None, "wake_at": None,
+            "reason": "policy invalid: %s" % policy_error,
+        }
+
     ceilings = policy.get("ceilings") or {}
     margin_s = policy.get("margin_s", 120)
+    allow_blind = policy.get("allow_blind", _DEFAULT_ALLOW_BLIND)
+    blind_gap_s = policy.get("blind_gap_s", _DEFAULT_BLIND_GAP_S)
 
     if not snapshot or not any(snapshot.get(w) for w in _WINDOWS):
-        blind_attempts = 0
-        for rec in history or []:
-            if rec.get("event") != "start":
-                continue
-            usage = rec.get("usage") or {}
-            if usage.get("five_hour") is None and usage.get("seven_day") is None:
-                blind_attempts += 1
+        blind_attempts = _count_blind_starts(history)
         if blind_attempts >= _BLIND_PROBE_LIMIT:
+            if allow_blind:
+                target = now + blind_gap_s
+                return {
+                    "action": "sleep",
+                    "delay_s": _clamp_delay(blind_gap_s),
+                    "window": None,
+                    "wake_at": target if blind_gap_s > _MAX_DELAY else None,
+                    "reason": "no usage signal after %d chunks; allow_blind is set, "
+                              "sleeping %ds between chunks instead of running unpaced"
+                              % (blind_attempts, blind_gap_s),
+                }
             return {
-                "action": "continue", "delay_s": 0, "window": None, "wake_at": None,
-                "reason": "no rate_limits after %d chunks; pacing is blind, running unpaced"
-                          % blind_attempts,
+                "action": "stop", "delay_s": 0, "window": None, "wake_at": None,
+                "reason": "no usage signal — run install.sh so Maestro's statusLine "
+                          "records rate_limits, or set allow_blind",
             }
         return {
             "action": "probe", "delay_s": 0, "window": None, "wake_at": None,
@@ -230,25 +386,48 @@ def decide(snapshot, now, policy, history):
         if reading is None or ceiling is None:
             continue
 
-        used = reading.get("used_percentage")
+        used = _finite_number(reading.get("used_percentage"))
         if used is None:
             continue
         resets_at = reading.get("resets_at")
-        captured_at = snapshot.get("captured_at")
+        captured_at = reading.get("captured_at")
+        if captured_at is None:
+            captured_at = snapshot.get("captured_at")
 
-        burn, duration, used_default = _burn_and_duration(pairs, window)
-
-        projected, stale, fresh_after_reset = _projected_used(
-            used, captured_at, resets_at, now, burn, duration, last_chunk_end_at,
-        )
-
+        burn, gate_burn, duration, used_default = _burn_and_duration(pairs, window)
         default_note = " (no history yet, using conservative default burn)" if used_default else ""
-        stale_note = " (stale reading, already past reset — treating as fresh)" if fresh_after_reset \
-            else (" (stale reading, projected forward)" if stale else "")
+
+        reset_happened = resets_at is not None and resets_at <= now
+        if reset_happened:
+            chunks_since_reset = _chunks_since(history, resets_at)
+            if chunks_since_reset == 0:
+                w = {
+                    "action": "probe", "delay_s": 0, "window": window, "wake_at": None,
+                    "reason": "%s window reset since the last reading and no chunk has run "
+                              "since; usage unknown, probing for a fresh reading" % window,
+                }
+                verdict = _more_restrictive(verdict, w)
+                continue
+            projected = burn * chunks_since_reset
+            stale_note = " (window reset since reading; estimated from %d chunk(s) run since reset)" \
+                % chunks_since_reset
+        else:
+            stale = (
+                (last_chunk_end_at is not None and captured_at is not None and captured_at < last_chunk_end_at)
+                or (captured_at is not None and (now - captured_at) > _STALE_AFTER_S)
+            )
+            if stale:
+                chunks_since_reading = _chunks_since(history, captured_at)
+                projected = used + burn * chunks_since_reading
+                stale_note = " (stale reading, projected forward by %d chunk(s) since capture)" \
+                    % chunks_since_reading
+            else:
+                projected = used
+                stale_note = ""
 
         headroom = ceiling - projected
 
-        if headroom < burn:
+        if headroom < gate_burn:
             if window == "five_hour":
                 target = (resets_at or now) + margin_s
                 delay = target - now
@@ -258,8 +437,7 @@ def decide(snapshot, now, policy, history):
                     "window": window,
                     "wake_at": target if delay > _MAX_DELAY else None,
                     "reason": "five_hour headroom (%.1f%%) below one chunk's burn (%.1f%%)%s%s; "
-                              "sleeping until reset + margin" % (headroom, burn, default_note, stale_note),
-                    "_now": now,
+                              "sleeping until reset + margin" % (headroom, gate_burn, default_note, stale_note),
                 }
             else:
                 w = {
@@ -269,20 +447,19 @@ def decide(snapshot, now, policy, history):
                     "wake_at": None,
                     "reason": "seven_day headroom (%.1f%%) below one chunk's burn (%.1f%%)%s%s; "
                               "weekly reset too far off to wait, handing off"
-                              % (headroom, burn, default_note, stale_note),
-                    "_now": now,
+                              % (headroom, gate_burn, default_note, stale_note),
                 }
             verdict = _more_restrictive(verdict, w)
             continue
 
         if resets_at is None or resets_at <= now:
             # No reset horizon to pace against (shouldn't normally happen
-            # since fresh_after_reset handles the passed case) — just go.
+            # since the reset_happened branch above handles the passed case
+            # unless it fell through with a comfortable estimate) — just go.
             w = {
                 "action": "continue", "delay_s": 0, "window": window, "wake_at": None,
                 "reason": "%s headroom (%.1f%%) comfortable, no reset horizon to pace against%s%s"
                           % (window, headroom, default_note, stale_note),
-                "_now": now,
             }
             verdict = _more_restrictive(verdict, w)
             continue
@@ -297,7 +474,6 @@ def decide(snapshot, now, policy, history):
                 "action": "continue", "delay_s": 0, "window": window, "wake_at": None,
                 "reason": "%s paced gap (%.0fs) under 60s; continuing now%s%s"
                           % (window, gap, default_note, stale_note),
-                "_now": now,
             }
         else:
             target = now + gap
@@ -308,7 +484,6 @@ def decide(snapshot, now, policy, history):
                 "wake_at": target if gap > _MAX_DELAY else None,
                 "reason": "%s pacing to stay under %.0f%% by reset: sleeping %.0fs (of %.0fs target)%s%s"
                           % (window, ceiling, min(gap, _MAX_DELAY), gap, default_note, stale_note),
-                "_now": now,
             }
         verdict = _more_restrictive(verdict, w)
 
@@ -318,7 +493,6 @@ def decide(snapshot, now, policy, history):
             "reason": "no window had both a ceiling and a reading; probing for a usable snapshot",
         }
 
-    verdict.pop("_now", None)
     return verdict
 
 
@@ -370,10 +544,10 @@ def main(argv):
 
     try:
         decision = decide(snapshot, now, policy, history)
-    except Exception as e:  # never let a real sweep's files crash the caller
+    except Exception as e:  # a pacing bug must never spend usage blind
         decision = {
-            "action": "probe", "delay_s": 0, "window": None, "wake_at": None,
-            "reason": "pace.py raised %s: %s; probing instead of trusting a bad decision"
+            "action": "stop", "delay_s": 0, "window": None, "wake_at": None,
+            "reason": "pace.py raised %s: %s; stopping rather than trusting a bad decision"
                       % (type(e).__name__, e),
         }
     print(json.dumps(decision))
