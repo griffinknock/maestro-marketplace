@@ -28,18 +28,29 @@ CACHE_TTL = 4
 # script runs every 3s in a live status line, so the write has to be cheap
 # and, above all, invisible: it must never change what gets printed and must
 # never raise.
+#
+# usage.json shape (C1): {"five_hour": {"used_percentage", "resets_at",
+# "captured_at"} | None, "seven_day": {...} | None} — each window carries its
+# OWN captured_at. This is what makes cross-session merging correct: every
+# open session's statusline writes every 3s, so an idle session sitting on
+# an hours-old, lower reading of the SAME window (same resets_at) must never
+# overwrite a fresher, higher reading from another session just because it
+# re-sends with a newer wall-clock time.
 USAGE_FILE = Path(os.environ.get("MAESTRO_USAGE_FILE")
                   or (Path.home() / ".claude" / "maestro" / "usage.json"))
-USAGE_FRESH = 60.0
 
 
 def _window(w):
-    """One rate-limit window -> `{"used_percentage", "resets_at"}` or None."""
+    """One rate-limit window -> `{"used_percentage", "resets_at"}` or None.
+    NaN/non-numeric `used_percentage` is treated as absent — this reading
+    must never merge in."""
     if not isinstance(w, dict) or "used_percentage" not in w:
         return None
     try:
         pct = float(w.get("used_percentage"))
     except (TypeError, ValueError):
+        return None
+    if pct != pct:  # NaN
         return None
     resets = w.get("resets_at")
     try:
@@ -49,13 +60,45 @@ def _window(w):
     return {"used_percentage": pct, "resets_at": resets}
 
 
+def _merge_window(old, new, now):
+    """Merge one freshly-read rate-limit window (`new`, from `_window` — no
+    `captured_at` yet) into the persisted one (`old`, may be None). Returns
+    the window to persist, always carrying `captured_at`.
+
+    Contract (C1):
+      - `new` is None (window absent from this payload) -> keep `old`
+        untouched; a payload missing a window must never remove/null it.
+      - same `resets_at` as `old` -> keep max(used_percentage); captured_at
+        only updates (to `now`) when the new value is strictly greater than
+        the existing one — an idle session re-sending an hours-old, lower
+        (or equal, unchanged) reading must not revive its timestamp and
+        look fresh, and a truly-unchanged tick must not force a write.
+      - `new.resets_at` newer than `old.resets_at` -> replace outright (a new
+        window has begun).
+      - `new.resets_at` older than `old.resets_at` -> ignore (a stale
+        cross-window race; never regress).
+    """
+    if new is None:
+        return old
+    if old is None:
+        return {**new, "captured_at": now}
+    old_resets, new_resets = old.get("resets_at"), new.get("resets_at")
+    if new_resets == old_resets:
+        if new["used_percentage"] > old.get("used_percentage", float("-inf")):
+            return {**new, "captured_at": now}
+        return old
+    if new_resets is not None and (old_resets is None or new_resets > old_resets):
+        return {**new, "captured_at": now}
+    return old
+
+
 def snapshot_usage(payload):
     """Persist this tick's rate-limit reading, if any. Best-effort, silent.
 
     Never writes when `rate_limits` is absent — a session between API
     responses must not clobber a good reading left by another session. Skips
-    the write when nothing changed and the file on disk is still fresh, so a
-    3s-interval status line does not thrash the disk once usage is stable.
+    the write when the merge changes nothing, so a 3s-interval status line
+    does not thrash the disk once usage is stable.
     """
     rl = payload.get("rate_limits")
     if not isinstance(rl, dict):
@@ -64,24 +107,42 @@ def snapshot_usage(payload):
     seven = _window(rl.get("seven_day"))
     if five is None and seven is None:
         return
+
+    old = {}
     try:
         if USAGE_FILE.is_file():
-            age = time.time() - USAGE_FILE.stat().st_mtime
-            if age < USAGE_FRESH:
-                old = json.loads(USAGE_FILE.read_text())
-                if old.get("five_hour") == five and old.get("seven_day") == seven:
-                    return
+            old = json.loads(USAGE_FILE.read_text())
+            if not isinstance(old, dict):
+                old = {}
     except (OSError, json.JSONDecodeError):
-        pass
-    rec = {"captured_at": time.time(), "session_id": payload.get("session_id"),
-           "five_hour": five, "seven_day": seven}
+        old = {}
+    old_five = old.get("five_hour") if isinstance(old.get("five_hour"), dict) else None
+    old_seven = old.get("seven_day") if isinstance(old.get("seven_day"), dict) else None
+
+    now = time.time()
+    merged_five = _merge_window(old_five, five, now)
+    merged_seven = _merge_window(old_seven, seven, now)
+    if merged_five == old_five and merged_seven == old_seven:
+        return  # nothing changed — skip the write
+
+    rec = {"session_id": payload.get("session_id"),
+           "five_hour": merged_five, "seven_day": merged_seven}
+    tmp = None
     try:
         USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = USAGE_FILE.with_name(USAGE_FILE.name + f".tmp{os.getpid()}")
         tmp.write_text(json.dumps(rec))
         os.replace(tmp, USAGE_FILE)
+        tmp = None
     except OSError:
         pass
+    finally:
+        # A failed os.replace used to leak this tmp file on every tick.
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def link(text, url):
