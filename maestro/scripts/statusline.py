@@ -20,6 +20,69 @@ FG = {
 PORT = os.environ.get("MAESTRO_PORT", "7717")
 CACHE_TTL = 4
 
+# ── usage snapshot ──────────────────────────────────────────────────────
+# Claude Code's statusLine payload carries `rate_limits` (Pro/Max, after the
+# first API response of a session): five_hour / seven_day / spend_limit, each
+# optional. This is the only place that reading arrives, so it is persisted
+# here for `sweep_state.py` (and `pace.py`) to read pacing from — but this
+# script runs every 3s in a live status line, so the write has to be cheap
+# and, above all, invisible: it must never change what gets printed and must
+# never raise.
+USAGE_FILE = Path(os.environ.get("MAESTRO_USAGE_FILE")
+                  or (Path.home() / ".claude" / "maestro" / "usage.json"))
+USAGE_FRESH = 60.0
+
+
+def _window(w):
+    """One rate-limit window -> `{"used_percentage", "resets_at"}` or None."""
+    if not isinstance(w, dict) or "used_percentage" not in w:
+        return None
+    try:
+        pct = float(w.get("used_percentage"))
+    except (TypeError, ValueError):
+        return None
+    resets = w.get("resets_at")
+    try:
+        resets = float(resets) if resets is not None else None
+    except (TypeError, ValueError):
+        resets = None
+    return {"used_percentage": pct, "resets_at": resets}
+
+
+def snapshot_usage(payload):
+    """Persist this tick's rate-limit reading, if any. Best-effort, silent.
+
+    Never writes when `rate_limits` is absent — a session between API
+    responses must not clobber a good reading left by another session. Skips
+    the write when nothing changed and the file on disk is still fresh, so a
+    3s-interval status line does not thrash the disk once usage is stable.
+    """
+    rl = payload.get("rate_limits")
+    if not isinstance(rl, dict):
+        return
+    five = _window(rl.get("five_hour"))
+    seven = _window(rl.get("seven_day"))
+    if five is None and seven is None:
+        return
+    try:
+        if USAGE_FILE.is_file():
+            age = time.time() - USAGE_FILE.stat().st_mtime
+            if age < USAGE_FRESH:
+                old = json.loads(USAGE_FILE.read_text())
+                if old.get("five_hour") == five and old.get("seven_day") == seven:
+                    return
+    except (OSError, json.JSONDecodeError):
+        pass
+    rec = {"captured_at": time.time(), "session_id": payload.get("session_id"),
+           "five_hour": five, "seven_day": seven}
+    try:
+        USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = USAGE_FILE.with_name(USAGE_FILE.name + f".tmp{os.getpid()}")
+        tmp.write_text(json.dumps(rec))
+        os.replace(tmp, USAGE_FILE)
+    except OSError:
+        pass
+
 
 def link(text, url):
     return f"\033]8;;{url}\033\\{text}\033]8;;\033\\"
@@ -80,6 +143,10 @@ def census(cwd):
 
 def main():
     d = json.loads(sys.stdin.read() or "{}")
+    try:
+        snapshot_usage(d)
+    except Exception:
+        pass
     ws = d.get("workspace") or {}
     cwd = ws.get("current_dir") or d.get("cwd") or os.getcwd()
     model = (d.get("model") or {}).get("display_name") or "?"

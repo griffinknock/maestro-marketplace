@@ -2,7 +2,9 @@
   "hooks": {
     "SessionStart": [
       { "hooks": [ { "type": "command", "timeout": 10,
-        "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/ledger.py\"" } ] }
+        "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/ledger.py\"" } ] },
+      { "matcher": "compact|resume", "hooks": [ { "type": "command", "timeout": 10,
+        "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/sweep_state.py\" anchor" } ] }
     ],
     "PreToolUse": [
       { "matcher": "*", "hooks": [ { "type": "command", "timeout": 10,
