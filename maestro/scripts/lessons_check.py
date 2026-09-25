@@ -538,12 +538,44 @@ def _budget_contexts(entries, repo_name):
     return [None] + sorted(names)
 
 
-def _check_budget(pool, repo_name, fail):
+def published_copies(trusted, records, repo_name):
+    """Personal L- ids that have a trusted, published R- copy in this repo's
+    file (ledger `publish` record with that R- id, sha and `source`). In that
+    repo the R- copy is injected and counted instead of the L- original."""
+    if not repo_name:
+        return frozenset()
+    tier = f"repo:{repo_name}"
+    covered = set()
+    for e in trusted:
+        for r in records:
+            src = r.get("source")
+            if (r.get("how") == "publish" and r["tier"] == tier and r["id"] == e["id"]
+                    and r["sha256"] == e["sha256"] and isinstance(src, str)
+                    and ID_RE_PERSONAL.fullmatch(src)):
+                covered.add(src)
+    return frozenset(covered)
+
+
+def injectable(pool, repo_name, covered=frozenset()):
+    """What actually gets injected for `repo_name`: the active set, minus
+    personal originals whose published copy is in the pool. Superseding is
+    folded over the FULL pool first, so dropping a covered original never
+    resurrects something it retired."""
+    return [e for e in active_for(pool, repo_name) if e.get("id") not in covered]
+
+
+def active_set(ev, repo_name):
+    """The injected set for an evaluate() result."""
+    return injectable(ev["personal"] + ev["trusted"], repo_name, ev["covered"])
+
+
+def _check_budget(pool, repo_name, fail, covered=frozenset()):
     """Budget for the global-only context AND for every repo scope present
-    in either file (plus the current repo) — never just the current one."""
+    in either file (plus the current repo) — never just the current one.
+    Counts exactly the de-duplicated set that inject would render."""
     for rn in _budget_contexts(pool, repo_name):
         label = "global-only" if rn is None else f"global+repo:{rn}"
-        active = active_for(pool, rn)
+        active = injectable(pool, rn, covered)
         n, chars = len(active), len(render_injection(active))
         if n > MAX_BUDGET_ENTRIES:
             fail(f"{label} context has {n} active entries, cap is {MAX_BUDGET_ENTRIES}")
@@ -744,21 +776,31 @@ def _check_append_only(path, fail):
 
 
 def evaluate(personal, repo, repo_name, approvals=None, extra_approvals=()):
-    """Full validation. Returns a dict:
-      reasons   failure reasons (empty = PASS)
-      warnings  non-fatal findings (untrusted repo entries)
-      personal  parsed personal entries
-      repo      parsed repo-file entries
-      trusted   repo entries with a matching approval (the only repo entries
-                that may ever be injected)
+    """Full validation, reported per tier. Returns a dict:
+      personal_reasons  failures of the personal file, the approvals ledger,
+                        or the personal-only budget — these turn EVERYTHING
+                        off (the ledger anchors both tiers)
+      repo_reasons      failures of the repo file (read, format, ids,
+                        Supersedes, append-only history), or of the budget
+                        once its trusted entries join — these turn off only
+                        repo-file injection
+      repo_budget_reasons  the budget subset of repo_reasons
+      reasons           personal_reasons + repo_reasons (empty = PASS)
+      warnings          non-fatal findings (untrusted repo entries)
+      personal, repo    parsed entries of each file
+      trusted           repo entries with a matching approval — empty when
+                        the repo tier failed; the only repo entries that may
+                        ever be injected
+      covered           personal ids whose trusted published copy replaces
+                        them in this repo (see published_copies)
     `extra_approvals` are records validated as if already appended — used by
     accept/publish/trust to check the post-state before writing the ledger.
     """
-    reasons, warnings = [], []
-    fail, warn = reasons.append, warnings.append
+    preasons, rreasons, rbudget, warnings = [], [], [], []
+    pfail, rfail, warn = preasons.append, rreasons.append, warnings.append
 
-    ptext = _read_lesson_file(personal, "personal", fail)
-    rtext = _read_lesson_file(repo, "repo", fail)
+    ptext = _read_lesson_file(personal, "personal", pfail)
+    rtext = _read_lesson_file(repo, "repo", rfail)
     personal_entries = parse(ptext) if ptext else []
     repo_entries = parse(rtext) if rtext else []
     for e in personal_entries:
@@ -767,24 +809,28 @@ def evaluate(personal, repo, repo_name, approvals=None, extra_approvals=()):
         e["file"] = str(repo)
 
     _validate_source(personal_entries, ID_RE_PERSONAL, expect_repo_scope=False,
-                     repo_name=None, fail=fail, label="personal")
+                     repo_name=None, fail=pfail, label="personal")
     _validate_source(repo_entries, ID_RE_REPO, expect_repo_scope=True,
-                     repo_name=repo_name, fail=fail, label="repo")
+                     repo_name=repo_name, fail=rfail, label="repo")
 
-    _check_duplicate_ids(personal_entries + repo_entries, fail)
-    _check_supersedes(personal_entries, ID_RE_PERSONAL, "personal", fail)
-    _check_supersedes(repo_entries, ID_RE_REPO, "repo", fail)
+    # Valid ids cannot collide across files (L- vs R-); malformed ones
+    # already failed their own tier above.
+    _check_duplicate_ids(personal_entries, pfail)
+    _check_duplicate_ids(repo_entries, rfail)
+    pids = {e["id"] for e in personal_entries if e.get("id")}
+    for id_ in sorted({e["id"] for e in repo_entries if e.get("id")} & pids):
+        rfail(f"duplicate ID across files: {_safe_id(id_)}")
+    _check_supersedes(personal_entries, ID_RE_PERSONAL, "personal", pfail)
+    _check_supersedes(repo_entries, ID_RE_REPO, "repo", rfail)
 
     ap = Path(approvals) if approvals else approvals_path()
     records, ledger_reasons = read_approvals(ap)
-    reasons.extend(ledger_reasons)
+    preasons.extend(ledger_reasons)
     records = records + list(extra_approvals)
     trusted = _check_approvals(personal_entries, personal is not None,
-                               repo_entries, repo_name, records, fail, warn)
+                               repo_entries, repo_name, records, pfail, warn)
 
-    _check_budget(personal_entries + trusted, repo_name, fail)
-
-    for p in (personal, repo):
+    for p, fail in ((personal, pfail), (repo, rfail)):
         if p is None:
             continue
         p = Path(p)
@@ -794,9 +840,24 @@ def evaluate(personal, repo, repo_name, approvals=None, extra_approvals=()):
             continue
         _check_append_only(p, fail)
 
-    return {"reasons": reasons, "warnings": warnings,
+    pbudget = []
+    _check_budget(personal_entries, repo_name, pbudget.append)
+    preasons.extend(pbudget)
+
+    if rreasons:
+        trusted = []          # a broken repo file contributes nothing
+    covered = published_copies(trusted, records, repo_name)
+    if trusted and not pbudget:
+        _check_budget(personal_entries + trusted, repo_name, rbudget.append, covered)
+        rreasons.extend(rbudget)
+        if rbudget:
+            trusted, covered = [], frozenset()
+
+    return {"reasons": preasons + rreasons,
+            "personal_reasons": preasons, "repo_reasons": rreasons,
+            "repo_budget_reasons": rbudget, "warnings": warnings,
             "personal": personal_entries, "repo": repo_entries,
-            "trusted": trusted}
+            "trusted": trusted, "covered": covered}
 
 
 def check(personal, repo, repo_name, approvals=None):
@@ -842,18 +903,24 @@ def main(argv):
     res = evaluate(personal, repo, repo_name, approvals)
     if res["reasons"]:
         print("LESSONS FAIL")
-        for r in res["reasons"]:
-            print(f"- {r}")
+        for r in res["personal_reasons"]:
+            print(f"- [personal] {r}")
+        for r in res["repo_reasons"]:
+            print(f"- [repo] {r}")
+        if not res["personal_reasons"]:
+            print("(personal lessons still inject; only the repo file is off)")
         for w in res["warnings"]:
             print(f"WARN - {w}")
         return 1
 
     pool = res["personal"] + res["trusted"]
-    primary = active_for(pool, repo_name)
+    covered = res["covered"]
+    primary = injectable(pool, repo_name, covered)
     primary_text = render_injection(primary)
     near = any(
-        len(active_for(pool, rn)) >= NEAR_BUDGET_RATIO * MAX_BUDGET_ENTRIES
-        or len(render_injection(active_for(pool, rn))) >= NEAR_BUDGET_RATIO * MAX_BUDGET_CHARS
+        len(injectable(pool, rn, covered)) >= NEAR_BUDGET_RATIO * MAX_BUDGET_ENTRIES
+        or len(render_injection(injectable(pool, rn, covered)))
+        >= NEAR_BUDGET_RATIO * MAX_BUDGET_CHARS
         for rn in _budget_contexts(pool, repo_name)
     )
 

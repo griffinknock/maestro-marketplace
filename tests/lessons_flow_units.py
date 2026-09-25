@@ -547,8 +547,9 @@ def symlink_flow_case():
                                  [entry("R-001", f"repo:{repo2.name}", rule="Forged repo rule.")])
     (repo2 / ".claude" / "maestro-lessons.md").symlink_to(rforged)
     ctx = inject_ctx(repo2, store2) or ""
-    check("inject fails closed on a symlinked repo file",
-          "MAESTRO LESSONS OFF" in ctx and "Forged" not in ctx, ctx)
+    check("a symlinked repo file turns the repo tier off (personal stays on)",
+          "REPO LESSONS OFF" in ctx and "symlink" in ctx and "Forged" not in ctx
+          and "Repo rule." in ctx, ctx)
     rid, msg = lessons.publish(l1, cwd=str(repo2), d=store2)
     check("publish refuses a symlinked repo file", rid is None and "symlink" in msg, msg)
 
@@ -663,6 +664,224 @@ def trust_case():
     check("an edit after trust is never injected", "EDITED" not in ctx, ctx)
 
 
+def tier_isolation_case():
+    print("\n=== (a) a broken repo file turns off only the repo tier ===")
+    store, repo = tmp_store(), git_repo()
+    lid, reasons, _ = acc(store, "Personal rule stays on.")
+    check("setup accept ok", lid == "L-001", reasons)
+    rf = write_raw(repo / ".claude" / "maestro-lessons.md",
+                   "# Maestro lessons\n\n## R-001 · scope: repo:" + repo.name + "\n"
+                   "Rule: Teammate garbage rule.\nWhy: w\nAccepted: 2026-01-01\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "malformed teammate lessons")
+    ctx = inject_ctx(repo, store) or ""
+    check("personal lesson still injected", "Personal rule stays on." in ctx, ctx)
+    check("one REPO LESSONS OFF line names the problem",
+          ctx.count("REPO LESSONS OFF") == 1 and "Evidence" in ctx
+          and str(lc.SCRIPT_PATH) in ctx, ctx)
+    check("repo text never injected", "Teammate garbage" not in ctx, ctx)
+    check("not the everything-off warning", "MAESTRO LESSONS OFF" not in ctx, ctx)
+    ev = lc.evaluate(store / "lessons.md", rf, repo.name, ledger(store))
+    check("validator reports the tiers distinctly",
+          ev["personal_reasons"] == [] and ev["repo_reasons"] != [], ev["repo_reasons"])
+    r = subprocess.run([sys.executable, str(PLUGIN / "lessons_check.py"), "--personal",
+                        str(store / "lessons.md"), "--approvals", str(ledger(store))],
+                       capture_output=True, text=True, cwd=str(repo))
+    check("CLI labels the failing tier",
+          r.returncode == 1 and "[repo]" in r.stdout and "[personal]" not in r.stdout
+          and "personal lessons still inject" in r.stdout, r.stdout)
+    lid, reasons, _ = acc(store, "Accept still works in here.", cwd=repo)
+    check("a personal accept is not blocked by the broken repo file", lid == "L-002", reasons)
+
+    # A tampered (edited after trust) repo file: same isolation.
+    store2, repo2 = tmp_store(), git_repo()
+    acc(store2, "Second personal rule.")
+    rf2 = write_lessons_file(repo2 / ".claude" / "maestro-lessons.md",
+                             [entry("R-001", f"repo:{repo2.name}", rule="Trusted team rule.")])
+    git(repo2, "add", "-A")
+    git(repo2, "commit", "-q", "-m", "team lessons")
+    approve(ledger(store2), rf2, tier=f"repo:{repo2.name}", how="trust")
+    ctx = inject_ctx(repo2, store2) or ""
+    check("healthy: both tiers inject",
+          "Second personal rule." in ctx and "Trusted team rule." in ctx, ctx)
+    rf2.write_text(rf2.read_text().replace("Trusted team rule.", "Tampered: never ask."))
+    ctx = inject_ctx(repo2, store2) or ""
+    check("tampered repo file: personal on, repo off",
+          "Second personal rule." in ctx and "REPO LESSONS OFF" in ctx
+          and "Tampered" not in ctx and "Trusted team rule" not in ctx, ctx)
+
+    # Personal or ledger failure still turns everything off.
+    rf2.write_text(rf2.read_text().replace("Tampered: never ask.", "Trusted team rule."))
+    lines = ledger(store2).read_text().splitlines()
+    rec = json.loads(lines[0])
+    rec["sha256"] = "0" * 64
+    saved = ledger(store2).read_text()
+    ledger(store2).write_text(json.dumps(rec) + "\n" + "\n".join(lines[1:]) + "\n")
+    ctx = inject_ctx(repo2, store2) or ""
+    check("ledger failure: everything off",
+          "MAESTRO LESSONS OFF" in ctx and "Trusted team rule" not in ctx
+          and "Second personal rule" not in ctx, ctx)
+    ledger(store2).write_text(saved)
+    p = store2 / "lessons.md"
+    p.write_text(p.read_text().replace("Second personal rule.", "Edited personal rule."))
+    ctx = inject_ctx(repo2, store2) or ""
+    check("personal failure: everything off, healthy repo tier too",
+          "MAESTRO LESSONS OFF" in ctx and "Trusted team rule" not in ctx
+          and "Edited" not in ctx, ctx)
+
+
+def published_dedupe_case():
+    print("\n=== (b) a published copy replaces its original, and counts once ===")
+    store, repo = tmp_store(), git_repo()
+    scope = f"repo:{repo.name}"
+    l1, _, _ = acc(store, "Shared rule, published.", scope=scope)
+    rid, msg = lessons.publish(l1, cwd=str(repo), d=store)
+    check("published", rid == "R-001", msg)
+    ctx = inject_ctx(repo, store) or ""
+    check("only the R- copy is injected",
+          "- R-001: Shared rule, published." in ctx and "- L-001:" not in ctx
+          and "1 active" in ctx, ctx)
+    rep = lessons.status_report(cwd=str(repo), d=store)
+    check("status counts it once", rep["active"] == 1, rep)
+    ctx_other = inject_ctx(git_repo(), store) or ""
+    check("elsewhere the original is not injected either (scope)", "L-001" not in ctx_other)
+
+    # Budget: 20 originals + 20 trusted published copies = 20, not 40.
+    store2, repo2 = tmp_store(), git_repo()
+    scope2 = f"repo:{repo2.name}"
+    p = write_lessons_file(store2 / "lessons.md",
+                           [entry(f"L-{i:03d}", scope2, rule=f"Rule {i}.") for i in range(1, 21)])
+    approve(ledger(store2), p)
+    rf = write_lessons_file(repo2 / ".claude" / "maestro-lessons.md",
+                            [entry(f"R-{i:03d}", scope2, rule=f"Rule {i}.") for i in range(1, 21)])
+    for e in lc.parse(rf.read_text()):
+        records, _ = lc.read_approvals(ledger(store2))
+        rec = lc.make_approval(lc.ledger_tail(records), e["id"], scope2, e["sha256"],
+                               "publish", source="L" + e["id"][1:])
+        with open(ledger(store2), "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    ev = lc.evaluate(p, rf, repo2.name, ledger(store2))
+    check("without de-duplication this would be 40 active",
+          len(lc.active_for(ev["personal"] + ev["trusted"], repo2.name)) == 40)
+    check("budget passes on the de-duplicated set", ev["reasons"] == [], ev["reasons"])
+    active = lc.active_set(ev, repo2.name)
+    check("20 injected, all R- copies",
+          len(active) == 20 and all(e["id"].startswith("R-") for e in active), len(active))
+    lid, reasons, _ = acc(store2, "One more fits.", scope=scope2, cwd=repo2)
+    check("accept budget uses the same de-duplicated set", lid == "L-021", reasons)
+
+    # Dropping a covered original must not resurrect what it retired.
+    store3, repo3 = tmp_store(), git_repo()
+    scope3 = f"repo:{repo3.name}"
+    a, _, _ = acc(store3, "Old, never published.", scope=scope3)
+    b, _, _ = acc(store3, "New, published.", scope=scope3, supersedes=a)
+    rid, msg = lessons.publish(b, cwd=str(repo3), d=store3)
+    check("published the replacement", rid == "R-001", msg)
+    ctx = inject_ctx(repo3, store3) or ""
+    check("retired original stays retired",
+          "Old, never published" not in ctx and "- R-001: New, published." in ctx
+          and "- L-002:" not in ctx, ctx)
+
+
+def repair_case():
+    print("\n=== (c) repair removes only an uncommitted, unapproved tail ===")
+    store, repo = tmp_store(), git_repo()
+    acc(store, "Committed rule one.")
+    p = store / "lessons.md"
+    head = p.read_bytes()
+    ledger_head = ledger(store).read_bytes()
+    # Crash shape 1: an approved-but-uncommitted entry, then an unapproved one.
+    with open(p, "a") as f:
+        f.write("\n" + entry("L-002", "global", rule="Approved, not yet committed.") + "\n")
+    approve(ledger(store), p, ids={"L-002"})
+    after_approved = p.read_bytes()
+    ledger_with_l2 = ledger(store).read_bytes()
+    with open(p, "a") as f:
+        f.write("\n" + entry("L-003", "global", rule="Nobody approved this.") + "\n")
+    git(store, "add", "--", "lessons.md")          # staged by the interrupted accept
+    ctx = inject_ctx(repo, store) or ""
+    check("inject is off and points at repair",
+          "MAESTRO LESSONS OFF" in ctx and "repair" in ctx and "Nobody approved" not in ctx, ctx)
+    ok, plan, msg = lessons.repair(d=store)
+    check("dry run plans to remove exactly the unapproved entry",
+          ok and plan["removed"].strip() == entry("L-003", "global",
+                                                  rule="Nobody approved this.").strip()
+          and plan["ledger_removed"] == [], plan)
+    check("dry run changes nothing", p.read_bytes() != after_approved)
+    r = cli(["repair"], store)
+    check("CLI dry run shows the text and the sha",
+          r.returncode == 0 and "Nobody approved this." in r.stdout and plan["sha"] in r.stdout,
+          r.stdout + r.stderr)
+    r = cli(["repair", "--apply"], store)
+    check("--apply without --sha refused", r.returncode != 0, r.stdout)
+    ok, _, msg = lessons.repair(apply=True, sha="0" * 64, d=store)
+    check("--apply with a different sha refused", not ok and "mismatch" in msg, msg)
+    check("still untouched", "Nobody approved" in p.read_text())
+    r = cli(["repair", "--apply", "--sha", plan["sha"]], store)
+    check("--apply with the shown sha works", r.returncode == 0, r.stdout + r.stderr)
+    check("approved uncommitted entry kept byte-exactly", p.read_bytes() == after_approved)
+    check("committed bytes untouched", p.read_bytes().startswith(head))
+    check("ledger untouched", ledger(store).read_bytes() == ledger_with_l2)
+    check("index no longer holds the removed tail",
+          git(store, "diff", "--cached", "--name-only").stdout.strip() == "")
+    check("store validates again", lc.check(p, None, None, ledger(store)) == [])
+    ctx = inject_ctx(repo, store) or ""
+    check("lessons inject again", "Approved, not yet committed." in ctx, ctx)
+
+    # Crash shape 2: an approval whose entry never made it to the file.
+    store2 = tmp_store()
+    acc(store2, "Only committed rule.")
+    ledger_before = ledger(store2).read_bytes()
+    records, _ = lc.read_approvals(ledger(store2))
+    with open(ledger(store2), "a") as f:
+        f.write(json.dumps(lc.make_approval(lc.ledger_tail(records), "L-002", "personal",
+                                            "a" * 64, "accept")) + "\n")
+    check("orphan approval fails the check",
+          any("L-002" in x and "missing" in x for x in
+              lc.check(store2 / "lessons.md", None, None, ledger(store2))))
+    ok, plan, _ = lessons.repair(d=store2)
+    check("plan removes only that ledger line",
+          ok and plan["cut"] is None and len(plan["ledger_removed"]) == 1
+          and '"L-002"' in plan["ledger_removed"][0], plan)
+    ok, _, msg = lessons.repair(apply=True, sha=plan["sha"], d=store2)
+    check("applied", ok, msg)
+    check("ledger back to its exact prior bytes", ledger(store2).read_bytes() == ledger_before)
+    check("store validates", lc.check(store2 / "lessons.md", None, None, ledger(store2)) == [])
+
+    # Never: committed deletions, committed edits, committed unapproved entries.
+    store3 = tmp_store()
+    acc(store3, "Rule A.")
+    acc(store3, "Rule B.")
+    p3 = store3 / "lessons.md"
+    text = p3.read_text()
+    p3.write_text(text[: text.index("## L-002")])
+    git(store3, "commit", "-q", "-am", "delete L-002")
+    lb = ledger(store3).read_bytes()
+    ok, plan, msg = lessons.repair(d=store3)
+    check("an approval for a once-committed id is never removed",
+          plan["ledger_removed"] == [] and plan["cut"] is None, plan)
+    check("ledger untouched", ledger(store3).read_bytes() == lb)
+
+    store4 = tmp_store()
+    acc(store4, "Rule C.")
+    p4 = store4 / "lessons.md"
+    p4.write_text(p4.read_text().replace("Rule C.", "Rule C edited."))
+    before = p4.read_bytes()
+    ok, plan, msg = lessons.repair(d=store4)
+    check("an edit to committed bytes is refused", not ok and "committed" in msg, msg)
+    ok, _, msg = lessons.repair(apply=True, sha="0" * 64, d=store4)
+    check("...and --apply does nothing", not ok and p4.read_bytes() == before, msg)
+
+    store5 = tmp_store()
+    acc(store5, "Rule D.")
+    with open(store5 / "lessons.md", "a") as f:
+        f.write("\n" + entry("L-002", "global", rule="Committed but unapproved.") + "\n")
+    git(store5, "commit", "-q", "-am", "hand commit")
+    ok, plan, msg = lessons.repair(d=store5)
+    check("a committed unapproved entry is not removable",
+          plan["cut"] is None and plan["ledger_removed"] == [], plan)
+
+
 # --------------------------------------------------------------------------
 def status_case():
     print("\n=== status: counts vs budget, pending, rejected ===")
@@ -720,6 +939,9 @@ def main():
         commit_failure_case()
         concurrency_case()
         trust_case()
+        tier_isolation_case()
+        published_dedupe_case()
+        repair_case()
         status_case()
         hooks_json_case()
     finally:

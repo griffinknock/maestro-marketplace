@@ -20,6 +20,8 @@ approvals-ledger helpers, and `repo_identity`):
     `.claude/maestro-lessons.md` (`R-NNN`), uncommitted — Griffin commits it.
   - TRUST: records Griffin's approval of an `R-NNN` entry a teammate wrote,
     bound to the exact bytes he was shown (its sha256).
+  - REPAIR: shows (and on --apply with the shown sha, removes) an
+    uncommitted, unapproved tail left by an interrupted accept.
   - STATUS: budget and queue counters for `/maestro:lessons`.
 
 accept, publish, trust and reject hold an exclusive lock on the store for
@@ -67,6 +69,7 @@ CLI:
   lessons.py publish ID
   lessons.py untrusted [--json]
   lessons.py trust R-NNN --sha SHA256
+  lessons.py repair [--apply --sha SHA256]
   lessons.py status [--json]
 
 Env:
@@ -557,28 +560,49 @@ def build_injection(cwd):
     """The exact `additionalContext` string for a SessionStart in `cwd`, or
     None when there is nothing worth saying (silence is the common case).
 
-    Fail closed: if the check fails, the ONLY thing injected is a one-line
-    warning naming the validator and the first reason — never a lesson.
+    Fails closed per tier:
+      - personal file, approvals ledger, or personal budget fails -> the ONLY
+        thing injected is one warning line naming the validator and the
+        first reason (plus a pointer to `repair` when the cause is an
+        unapproved uncommitted tail) — never a lesson;
+      - only the repo file fails -> personal lessons still inject, the repo
+        file contributes nothing, and one line names the problem.
     Always hard-capped at MAX_BUDGET_CHARS.
     """
-    personal_path = store_dir() / LESSONS_FILE
+    d = store_dir()
+    personal_path = d / LESSONS_FILE
     repo_path, repo_name_ = lc.repo_lessons_path(cwd)
     ev = lc.evaluate(personal_path, repo_path, repo_name_, approvals_path())
 
-    if ev["reasons"]:
-        first = lc.clean_one_line(ev["reasons"][0], 300)
+    if ev["personal_reasons"]:
+        first = lc.clean_one_line(ev["personal_reasons"][0], 300)
+        hint = ""
+        try:
+            plan = repair_plan(d)
+            if plan["problem"] is None and (plan["removed"] or plan["ledger_removed"]):
+                hint = (" — this looks like an unapproved uncommitted tail left by an "
+                        "interrupted accept: review it with "
+                        f"python3 \"{Path(__file__).resolve()}\" repair")
+        except Exception:
+            hint = ""
         return lc.cap_text(
             "MAESTRO LESSONS OFF — the lessons check failed, so NO lessons were "
-            f"injected. Run: python3 \"{lc.SCRIPT_PATH}\" — first reason: {first}")
+            f"injected. Run: python3 \"{lc.SCRIPT_PATH}\" — first reason: {first}{hint}")
 
-    active = lc.active_for(ev["personal"] + ev["trusted"], repo_name_)
     lines = []
+    active = lc.active_set(ev, repo_name_)
     if active:
         lines.append(lc.render_injection(active))
-    untrusted = len(ev["repo"]) - len(ev["trusted"])
-    if untrusted > 0:
-        lines.append(f"{untrusted} untrusted repo lesson(s) in {repo_path} were "
-                     "NOT injected — review with /maestro:lessons")
+    if ev["repo_reasons"]:
+        first = lc.clean_one_line(ev["repo_reasons"][0], 300)
+        lines.append(f"REPO LESSONS OFF — {repo_path} failed the lessons check, so none "
+                     "of its lessons were injected (personal lessons were). Run: "
+                     f"python3 \"{lc.SCRIPT_PATH}\" — first reason: {first}")
+    else:
+        untrusted = len(ev["repo"]) - len(ev["trusted"])
+        if untrusted > 0:
+            lines.append(f"{untrusted} untrusted repo lesson(s) in {repo_path} were "
+                         "NOT injected — review with /maestro:lessons")
     pending = [c for c in load_candidates() if c.get("status") == "pending"]
     if pending:
         lines.append(f"{len(pending)} lesson candidate(s) pending — "
@@ -700,8 +724,10 @@ def _accept_locked(d, fields, scope, sup_ids, cwd):
 
     repo_path, repo_name_ = lc.repo_lessons_path(cwd)
     path.write_bytes(new_text.encode("utf-8"))
-    reasons = lc.evaluate(path, repo_path, repo_name_, ap,
-                          extra_approvals=[record])["reasons"]
+    ev = lc.evaluate(path, repo_path, repo_name_, ap, extra_approvals=[record])
+    # A broken repo file does not block a personal accept (it is off on its
+    # own); the budget of this repo's context still counts when it is healthy.
+    reasons = ev["personal_reasons"] + ev["repo_budget_reasons"]
     if reasons:
         _restore(path, prev_bytes)
         return None, reasons
@@ -907,6 +933,154 @@ def trust(rid, sha, cwd=None, d=None):
     return rid, f"Trusted {rid} in {repo_path} — it will be injected from now on."
 
 
+# --- repair ----------------------------------------------------------------
+
+def _head_bytes(d):
+    """lessons.md as committed at HEAD in the store repo (b"" if none)."""
+    try:
+        if _git(d, "rev-parse", "--verify", "-q", "HEAD").returncode != 0:
+            return b""
+        r = subprocess.run(["git", "-C", str(d), "show", f"HEAD:{LESSONS_FILE}"],
+                           capture_output=True)
+        return r.stdout if r.returncode == 0 else b""
+    except (OSError, subprocess.SubprocessError):
+        return b""
+
+
+def _ever_committed_ids(d):
+    """Every entry id that appears in any committed version of lessons.md."""
+    ids = set()
+    log = _git(d, "log", "--format=%H", "--", LESSONS_FILE)
+    for h in [x for x in log.stdout.split("\n") if x]:
+        r = subprocess.run(["git", "-C", str(d), "show", f"{h}:{LESSONS_FILE}"],
+                           capture_output=True)
+        if r.returncode == 0:
+            ids.update(e["id"] for e in lc.parse(r.stdout.decode("utf-8", "replace"))
+                       if e.get("id"))
+    return ids
+
+
+def repair_plan(d=None):
+    """What `repair --apply` would remove, computed read-only. Returns
+    {"problem": str|None, "cut": int|None, "removed": str, "ledger_cut":
+    int|None, "ledger_removed": [str], "sha": str}.
+
+    Removable, and ONLY this:
+      - in lessons.md: the uncommitted bytes beyond HEAD, starting at the
+        first uncommitted entry nobody approved — provided every entry after
+        it is also unapproved (committed bytes and approved entries are
+        never touched; a mixed tail is left for a human);
+      - in the ledger: trailing `accept` lines for ids that are in neither
+        the kept lessons.md nor ANY committed version of it (an approval
+        whose entry was never committed). Trailing only, so the chain of
+        the lines kept still verifies.
+    """
+    d = Path(d) if d else store_dir()
+    plan = {"problem": None, "cut": None, "removed": "", "ledger_cut": None,
+            "ledger_removed": [], "sha": ""}
+    path = d / LESSONS_FILE
+    ap = approvals_path(d)
+    err = _refuse_nonregular(path) or _refuse_nonregular(ap)
+    if err:
+        plan["problem"] = err
+        return plan
+    working = path.read_bytes() if path.exists() else b""
+    head = _head_bytes(d)
+    if not working.startswith(head):
+        plan["problem"] = ("committed content of lessons.md was edited or removed — "
+                           "that is not an uncommitted tail; repair will not touch it")
+        return plan
+    try:
+        text = working.decode("utf-8")
+    except UnicodeDecodeError:
+        plan["problem"] = "lessons.md is not valid UTF-8 — fix by hand"
+        return plan
+    records, ledger_reasons = lc.read_approvals(ap)
+    if ledger_reasons:
+        plan["problem"] = "approvals ledger does not verify — " + ledger_reasons[0]
+        return plan
+
+    offsets, pos = [], 0
+    for ln in text.split("\n"):
+        offsets.append(pos)
+        pos += len(ln.encode("utf-8")) + 1
+    approved = {(r["id"], r["sha256"]) for r in records if r["tier"] == "personal"}
+    entries = lc.parse(text)
+    for e in entries:
+        e["_start"] = offsets[e["line"] - 1]
+        e["_end"] = e["_start"] + len(e["raw"].encode("utf-8"))
+    if any(e["_start"] < len(head) < e["_end"] for e in entries):
+        plan["problem"] = ("an uncommitted edit extends a committed entry — "
+                           "that is not a clean tail; fix by hand")
+        return plan
+    tail = [e for e in entries if e["_start"] >= len(head)]
+    k = next((i for i, e in enumerate(tail) if (e.get("id"), e["sha256"]) not in approved), None)
+    cut = None
+    if k is not None:
+        if any((e.get("id"), e["sha256"]) in approved for e in tail[k + 1:]):
+            plan["problem"] = ("an approved entry follows an unapproved one in the "
+                               "uncommitted tail — fix by hand")
+            return plan
+        cut = tail[k]["_start"]
+        while cut > len(head) and working[cut - 2:cut] == b"\n\n":
+            cut -= 1
+        plan["cut"] = cut
+        plan["removed"] = working[cut:].decode("utf-8")
+
+    kept_ids = {e.get("id") for e in entries if cut is None or e["_start"] < cut}
+    committed = _ever_committed_ids(d) if records else set()
+    n = len(records)
+    while n > 0:
+        r = records[n - 1]
+        if (r["tier"] == "personal" and r["how"] == "accept"
+                and r["id"] not in kept_ids and r["id"] not in committed):
+            n -= 1
+        else:
+            break
+    if n < len(records):
+        lines = ap.read_bytes().decode("utf-8").split("\n")
+        plan["ledger_removed"] = lines[n:len(records)]
+        plan["ledger_cut"] = sum(len(x.encode("utf-8")) + 1 for x in lines[:n])
+
+    blob = (plan["removed"] + "\0" + "\n".join(plan["ledger_removed"])).encode("utf-8")
+    plan["sha"] = hashlib.sha256(blob).hexdigest()
+    return plan
+
+
+def repair(apply=False, sha=None, d=None):
+    """Dry run by default. With apply=True (only after Griffin's explicit yes
+    to the plan it was shown) removes exactly the planned bytes, and only if
+    the plan's sha still matches `sha`. Returns (ok, plan, message)."""
+    d = Path(d) if d else store_dir()
+    if not apply:
+        plan = repair_plan(d)
+        return plan["problem"] is None, plan, plan["problem"] or ""
+    if not isinstance(sha, str) or not lc.SHA_RE.fullmatch(sha):
+        return False, None, "--apply needs --sha: the sha256 printed by the dry run Griffin approved"
+    with _flock(d / STORE_LOCK, REVIEW_LOCK_TRIES, REVIEW_LOCK_DELAY) as ok:
+        if not ok:
+            return False, None, LOCK_BUSY
+        plan = repair_plan(d)
+        if plan["problem"]:
+            return False, plan, plan["problem"]
+        if plan["cut"] is None and plan["ledger_cut"] is None:
+            return True, plan, "nothing to repair"
+        if plan["sha"] != sha:
+            return False, plan, ("refusing: what would be removed changed since it was "
+                                 "shown (sha256 mismatch) — show the dry run again")
+        path, ap = d / LESSONS_FILE, approvals_path(d)
+        if plan["cut"] is not None:
+            path.write_bytes(path.read_bytes()[:plan["cut"]])
+            if _git(d, "diff", "--cached", "--quiet", "--", LESSONS_FILE).returncode != 0:
+                _unstage(d)
+        if plan["ledger_cut"] is not None:
+            os.truncate(str(ap), plan["ledger_cut"])
+    reasons = lc.evaluate(d / LESSONS_FILE, None, None, approvals_path(d))["personal_reasons"]
+    msg = "repaired." + ("" if not reasons else
+                         " The store still fails its check:\n" + "\n".join(f"- {r}" for r in reasons))
+    return True, plan, msg
+
+
 # --- status ---------------------------------------------------------------
 
 def status_report(cwd=None, d=None):
@@ -916,7 +1090,7 @@ def status_report(cwd=None, d=None):
     d = Path(d) if d else store_dir()
     repo_path, repo_name_ = lc.repo_lessons_path(cwd)
     ev = lc.evaluate(d / LESSONS_FILE, repo_path, repo_name_, approvals_path(d))
-    active = lc.active_for(ev["personal"] + ev["trusted"], repo_name_)
+    active = lc.active_set(ev, repo_name_)
     text = lc.render_injection(active)
     n_active, n_chars = len(active), len(text)
 
@@ -938,6 +1112,8 @@ def status_report(cwd=None, d=None):
         "rejected": len(rejected),
         "untrusted": len(ev["repo"]) - len(ev["trusted"]),
         "check_failed": bool(ev["reasons"]),
+        "personal_check_failed": bool(ev["personal_reasons"]),
+        "repo_check_failed": bool(ev["repo_reasons"]),
         "repo": repo_name_,
     }
 
@@ -1081,6 +1257,36 @@ def _cmd_trust(args):
     return 0
 
 
+def _print_plan(plan, d):
+    d = Path(d) if d else store_dir()
+    print(f"repair plan (sha256 {plan['sha']}):")
+    if plan["cut"] is not None:
+        print(f"--- remove from {d / LESSONS_FILE} (uncommitted, never approved):")
+        print(plan["removed"], end="" if plan["removed"].endswith("\n") else "\n")
+    if plan["ledger_removed"]:
+        print(f"--- remove from {approvals_path(d)} (approvals whose entry was never committed):")
+        for ln in plan["ledger_removed"]:
+            print(ln)
+
+
+def _cmd_repair(args):
+    ok, plan, msg = repair(apply=args.apply, sha=args.sha)
+    if plan is not None and plan.get("problem") is None and (
+            plan["cut"] is not None or plan["ledger_cut"] is not None):
+        _print_plan(plan, None)
+    if not ok:
+        print(msg, file=sys.stderr)
+        return 1
+    if args.apply:
+        print(msg)
+    elif plan["cut"] is None and plan["ledger_cut"] is None:
+        print("nothing to repair")
+    else:
+        print("Apply only after Griffin's explicit yes to exactly this, with:")
+        print(f"  lessons.py repair --apply --sha {plan['sha']}")
+    return 0
+
+
 def _cmd_status(args):
     rep = status_report()
     if args.json:
@@ -1151,6 +1357,11 @@ def build_parser():
     p.add_argument("id")
     p.add_argument("--sha", required=True)
     p.set_defaults(func=_cmd_trust)
+
+    p = sub.add_parser("repair")
+    p.add_argument("--apply", action="store_true")
+    p.add_argument("--sha")
+    p.set_defaults(func=_cmd_repair)
 
     p = sub.add_parser("status")
     p.add_argument("--json", action="store_true")

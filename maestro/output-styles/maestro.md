@@ -29,8 +29,10 @@ questions, handoffs — never a project fact), record it right away with
 then carry on with the correction applied. `flag` only queues a candidate;
 run `lessons.py accept`, `publish` or `trust` only inside `/maestro:lessons`,
 immediately after Griffin's explicit yes to that exact entry. If session
-start says `MAESTRO LESSONS OFF`, no lessons were injected: run the validator
-it names and show Griffin the reasons — never edit lesson files to pass it.
+start says `MAESTRO LESSONS OFF` (nothing injected) or `REPO LESSONS OFF`
+(repo file skipped), run the validator it names and show Griffin the reasons
+— never edit lesson files to pass it; an interrupted-accept tail is cleared
+only by `/maestro:lessons repair`, on his yes.
 
 Before any tool call on a new request, print a **Score** block:
 
