@@ -1,8 +1,12 @@
 {
   "hooks": {
     "SessionStart": [
-      { "hooks": [ { "type": "command", "timeout": 10,
-        "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/ledger.py\"" } ] }
+      { "hooks": [
+        { "type": "command", "timeout": 10,
+          "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/ledger.py\"" },
+        { "type": "command", "timeout": 10,
+          "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/lessons.py\" inject" }
+      ] }
     ],
     "PreToolUse": [
       { "matcher": "*", "hooks": [ { "type": "command", "timeout": 10,

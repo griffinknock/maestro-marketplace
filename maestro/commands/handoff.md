@@ -17,7 +17,17 @@ and points at the right places. That is what you produce now.
 2. **Settle the record.** Update `.claude/maestro/PLAN.md` — decisions since
    the last update, wave status, anything you would hate to lose.
 
-3. **Write `.claude/maestro/HANDOFF.md`.** Pointers and decisions, never
+3. **Review pending lessons.**
+
+   ```bash
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/lessons.py" candidates --pending
+   ```
+
+   If that lists any candidates, run the `/maestro:lessons` review flow now,
+   before writing the handoff — a candidate carries this session's id, and
+   this session is about to end. Skip only if Griffin says skip.
+
+4. **Write `.claude/maestro/HANDOFF.md`.** Pointers and decisions, never
    payloads — the next session reads files itself. Exactly these sections:
 
    ```markdown
@@ -44,7 +54,7 @@ and points at the right places. That is what you produce now.
    Hard rules: ≤120 lines; no fenced block over 20 lines; every path, branch,
    and worktree you name must exist right now. No transcript quotes, no code.
 
-4. **Validate. Do not skip this.**
+5. **Validate. Do not skip this.**
 
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/handoff_check.py"
@@ -53,7 +63,7 @@ and points at the right places. That is what you produce now.
    Fix every reason it prints and re-run until it says `HANDOFF PASS`. A
    pointer that does not resolve is a bug in the handoff, not a nit.
 
-5. **Hand over.** Print exactly this, then stop:
+6. **Hand over.** Print exactly this, then stop:
 
    Handoff validated. Clear, then seed the next session:
 

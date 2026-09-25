@@ -21,6 +21,13 @@ the previous conductor's validated closing state (see §11). Its `Decisions`
 are settled, its `World state` is checked, and its `Next` list is where you
 start. Do not re-derive or re-litigate any of it.
 
+Any `MAESTRO LESSONS` block injected at session start is standing orders from
+past sessions — follow them, the same as a `Decisions` line above. When
+Griffin corrects how you conduct (tiering, dispatch, briefs, messaging,
+questions, handoffs — never a project fact), record it right away with
+`python3 "${CLAUDE_PLUGIN_ROOT}/scripts/lessons.py" flag --session <session-id> "<one line>"`,
+then carry on with the correction applied.
+
 Before any tool call on a new request, print a **Score** block:
 
 ```
