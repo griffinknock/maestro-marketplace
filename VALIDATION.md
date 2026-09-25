@@ -40,7 +40,7 @@ Neither path has ever run on macOS. Test the Warp one first — it is the defaul
 cd ~/Documents/Development/maestro-marketplace/maestro/scripts && python3 -c "
 import board, pathlib
 board.sys.platform='darwin'
-print(board.spawn_warp('$HOME/Documents/Development/MintSplice/web-application',
+print(board.spawn_warp('$HOME/Documents/Development/example-app',
       'probe prompt', title='probe', color='violet'))"
 ```
 
@@ -74,7 +74,7 @@ def fake(cmd,**kw):
     class R: returncode=0; stderr=''; stdout=''
     return R()
 board.subprocess.run=fake
-board.spawn_ghostty('$HOME/Documents/Development/MintSplice/web-application','test prompt',title='probe')
+board.spawn_ghostty('$HOME/Documents/Development/example-app','test prompt',title='probe')
 print(cap['s'])"
 ```
 
@@ -116,7 +116,7 @@ report what it actually supports.
 Finally, the real path — start the board and spawn from the UI:
 
 ```bash
-cd ~/Documents/Development/maestro-marketplace && MAESTRO_DEBUG=1 python3 maestro/scripts/board.py ~/Documents/Development/MintSplice/web-application
+cd ~/Documents/Development/maestro-marketplace && MAESTRO_DEBUG=1 python3 maestro/scripts/board.py ~/Documents/Development/example-app
 ```
 
 Click **+ New orchestration**, fill it in, hit **Open tab**. Report whether the

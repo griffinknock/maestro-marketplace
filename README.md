@@ -1,8 +1,35 @@
 # Maestro
 
-A Claude Code plugin that runs a session as a conductor: one orchestrator fans
-work out to model-tiered subagents, and the tree it builds is visible in the
-terminal and on a local board.
+Maestro is a Claude Code plugin that runs a session as a conductor. One
+orchestrator hands work to model-tiered subagents, a set of hooks watches what
+they do, and the tree they build shows up in the terminal and on a local board.
+
+I built it because multi-agent Claude Code sessions kept failing in the same
+few ways, and the lead agent usually couldn't tell:
+
+- **It miscounts its own agents.** Launch five at once and, depending on when
+  you count, one is running or none are. The conductor acts on that number.
+- **Reports go missing.** A subagent finishes, but what reaches the conductor
+  is an idle frame or a bare "report stands." It reads that as a clean finish.
+- **Failures repeat.** The same tier fails twice, or two agents work on one
+  file, and nothing flags it.
+- **Claims go unchecked.** A finding gets trusted because an agent stated it
+  confidently.
+- **Context piles up.** Every turn re-reads the whole transcript, so a long
+  session keeps paying for everything it ever read, and `/compact` decides on
+  its own what to keep.
+
+What Maestro does about each:
+
+| Failure | Response |
+|---|---|
+| Miscounted agents | Records each dispatch batch and judges it only after the batch settles |
+| Missing reports | Keeps the best report each agent produced, recovers it from the agent's own transcript when needed, and hands the conductor a digest plus a pointer. If nothing is recoverable it says `REPORT NOT DELIVERED` |
+| Repeated failures | A re-orchestration check flags stalls, the same tier failing twice, two live agents on one file, and depth 5. Each finding lands once, on the conductor's next turn, so it can re-plan |
+| Unchecked claims | An `adversary` agent whose job is to refute a claim before anyone trusts it, and an opus `surgeon` for work a builder has already failed twice |
+| Context pile-up | Per-agent token accounting, and `/handoff`, which writes a validated `HANDOFF.md` at a phase boundary so the next session starts clean |
+
+Everything below is the technical reference.
 
 Requires `python3` and `git`. Terminal spawning, notifications and the sleep
 assertion are macOS-only; everything else is portable. No pip packages.
@@ -494,3 +521,9 @@ is not found. The spawner resolves `claude` to an absolute path; if you changed
 that, resolve it yourself.
 
 **Source edits have no effect.** See *Updating* above.
+
+---
+
+## License
+
+MIT. See [LICENSE](LICENSE).
