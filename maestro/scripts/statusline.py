@@ -20,6 +20,227 @@ FG = {
 PORT = os.environ.get("MAESTRO_PORT", "7717")
 CACHE_TTL = 4
 
+# ── usage snapshot ──────────────────────────────────────────────────────
+# Claude Code's statusLine payload carries `rate_limits` (Pro/Max, after the
+# first API response of a session): five_hour / seven_day / spend_limit, each
+# optional. This is the only place that reading arrives, so it is persisted
+# here for `sweep_state.py` (and `pace.py`) to read pacing from — but this
+# script runs every 3s in a live status line, so the write has to be cheap
+# and, above all, invisible: it must never change what gets printed and must
+# never raise.
+#
+# usage.json shape (C1): {"captured_at", "session_id", "five_hour":
+# {"used_percentage", "resets_at", "captured_at"} | None, "seven_day": {...}
+# | None}. Each window carries its OWN captured_at: the last time its value
+# was seen to rise (or the window to roll over). This is what makes
+# cross-session merging correct: every open session's statusline writes every
+# 3s, so an idle session sitting on an hours-old, lower reading of the SAME
+# window must never overwrite a fresher, higher reading from another session
+# just because it re-sends with a newer wall-clock time. The top-level
+# `captured_at` is the later of the two windows' (kept for older readers);
+# `session_id` is whichever session wrote last and may be null — readers
+# must not rely on it.
+#
+# Freshness (`fresh_at`, per window): the last time a session that had JUST
+# received an API response reported this window. A reading only means
+# "usage now" on the tick where its session's `cost.total_api_duration_ms`
+# advanced; an idle session re-sends the rate_limits of its last response
+# forever. So `sessions` keeps {session_id: {"api_ms", "seen"}} (pruned after
+# a day), and a tick whose session's api_ms advanced refreshes `fresh_at` of
+# every window it carries — even when the value is unchanged (a cheap chunk
+# on a large plan need not move the percentage). Idle ticks never touch
+# `fresh_at`. A payload with no api duration at all (older Claude Code)
+# falls back to the old signal: `fresh_at` follows `captured_at`. Readers
+# use `fresh_at` when the key exists, else `captured_at`.
+USAGE_FILE = Path(os.environ.get("MAESTRO_USAGE_FILE")
+                  or (Path.home() / ".claude" / "maestro" / "usage.json"))
+SESSION_TTL_S = 86400.0
+# Two readings of one window whose resets_at differ by at most this many
+# seconds are the SAME window: resets_at jitters by a second or so between
+# sessions and responses, and a jittered idle reading must never pass for a
+# new window and replace a fresh one.
+RESET_JITTER_S = 60.0
+
+
+def _finite(v):
+    """float(v) when v is a real, finite number (bools excluded), else None."""
+    if isinstance(v, bool):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f in (float("inf"), float("-inf")):
+        return None
+    return f
+
+
+def _window(w):
+    """One rate-limit window -> `{"used_percentage", "resets_at"}` or None.
+    A NaN/inf/non-numeric `used_percentage` makes the window absent (it must
+    never merge in); a NaN/inf/non-numeric `resets_at` is treated as None."""
+    if not isinstance(w, dict) or "used_percentage" not in w:
+        return None
+    pct = _finite(w.get("used_percentage"))
+    if pct is None:
+        return None
+    resets = w.get("resets_at")
+    resets = _finite(resets) if resets is not None else None
+    return {"used_percentage": pct, "resets_at": resets}
+
+
+def _same_window(a, b):
+    if a is None or b is None:
+        return a is None and b is None
+    return abs(a - b) <= RESET_JITTER_S
+
+
+def _merge_window(old, new, now, fresh=None):
+    """Merge one freshly-read rate-limit window (`new`, from `_window` — no
+    `captured_at` yet) into the persisted one (`old`, may be None). Returns
+    the window to persist, always carrying `captured_at` and `fresh_at`.
+
+    `fresh`: True when this tick's session just got an API response (its
+    reading is current), False when it is idle, None when the payload has no
+    activity signal (legacy: fresh_at follows captured_at).
+    """
+    w = _merge_value(old, new, now)
+    if w is old:
+        if fresh is True and old is not None and new is not None \
+                and _same_window(_resets(old), new.get("resets_at")):
+            return {**old, "fresh_at": now}
+        return old
+    rose = w.get("captured_at") == now
+    if fresh is True or (fresh is None and rose):
+        fresh_at = now
+    elif old is not None and _same_window(_resets(old), w.get("resets_at")):
+        fresh_at = old.get("fresh_at")
+    else:
+        fresh_at = None  # a new window nobody active has confirmed yet
+    return {**w, "fresh_at": fresh_at}
+
+
+def _resets(w):
+    r = w.get("resets_at")
+    return _finite(r) if r is not None else None
+
+
+def _merge_value(old, new, now):
+    """The value/resets/captured_at part of the merge (fresh_at is carried
+    through from `old` untouched here).
+
+    Contract (C1):
+      - `new` is None (window absent from this payload) -> keep `old`
+        untouched; a payload missing a window must never remove/null it.
+      - same window (resets_at within RESET_JITTER_S of `old`'s) -> keep
+        max(used_percentage) and the later resets_at; captured_at only
+        updates (to `now`) when the new value is strictly greater than the
+        existing one — an idle session re-sending an hours-old, lower (or
+        equal) reading must not revive its timestamp and look fresh, and a
+        truly-unchanged tick must not force a write.
+      - `new.resets_at` later than that -> replace outright (a new window
+        has begun).
+      - `new.resets_at` earlier than that -> ignore (a stale cross-window
+        race; never regress).
+    """
+    if new is None:
+        return old
+    if old is None:
+        return {**new, "captured_at": now}
+    old_resets = old.get("resets_at")
+    old_resets = _finite(old_resets) if old_resets is not None else None
+    new_resets = new.get("resets_at")
+    if _same_window(old_resets, new_resets):
+        resets = max(old_resets, new_resets) if new_resets is not None else None
+        old_pct = _finite(old.get("used_percentage"))
+        if old_pct is None or new["used_percentage"] > old_pct:
+            return {"used_percentage": new["used_percentage"], "resets_at": resets,
+                    "captured_at": now}
+        if resets != old.get("resets_at"):
+            return {**old, "resets_at": resets}
+        return old
+    if new_resets is not None and (old_resets is None or new_resets > old_resets):
+        return {**new, "captured_at": now}
+    return old
+
+
+def snapshot_usage(payload):
+    """Persist this tick's rate-limit reading, if any. Best-effort, silent.
+
+    Never writes when `rate_limits` is absent — a session between API
+    responses must not clobber a good reading left by another session. Skips
+    the write when the merge changes nothing, so a 3s-interval status line
+    does not thrash the disk once usage is stable.
+    """
+    rl = payload.get("rate_limits")
+    if not isinstance(rl, dict):
+        return
+    five = _window(rl.get("five_hour"))
+    seven = _window(rl.get("seven_day"))
+    if five is None and seven is None:
+        return
+
+    old = {}
+    try:
+        if USAGE_FILE.is_file():
+            old = json.loads(USAGE_FILE.read_text())
+            if not isinstance(old, dict):
+                old = {}
+    except (OSError, ValueError):
+        old = {}
+    old_five = old.get("five_hour") if isinstance(old.get("five_hour"), dict) else None
+    old_seven = old.get("seven_day") if isinstance(old.get("seven_day"), dict) else None
+
+    now = time.time()
+    sessions = old.get("sessions") if isinstance(old.get("sessions"), dict) else {}
+    new_sessions = sessions
+    fresh = None
+    sid = payload.get("session_id")
+    cost = payload.get("cost")
+    api_ms = _finite(cost.get("total_api_duration_ms")) if isinstance(cost, dict) else None
+    if isinstance(sid, str) and sid and api_ms is not None:
+        prev = sessions.get(sid)
+        prev_ms = _finite(prev.get("api_ms")) if isinstance(prev, dict) else None
+        # First sighting is NOT fresh: a session seen for the first time may
+        # be idle on an hours-old response.
+        fresh = prev_ms is not None and api_ms > prev_ms
+        if prev_ms != api_ms:
+            new_sessions = {}
+            for k, v in sessions.items():
+                seen = _finite(v.get("seen")) if isinstance(v, dict) else None
+                if seen is not None and now - seen <= SESSION_TTL_S:
+                    new_sessions[k] = v
+            new_sessions[sid] = {"api_ms": api_ms, "seen": now}
+
+    merged_five = _merge_window(old_five, five, now, fresh)
+    merged_seven = _merge_window(old_seven, seven, now, fresh)
+    if merged_five == old_five and merged_seven == old_seven and new_sessions is sessions:
+        return  # nothing changed — skip the write
+
+    caps = [_finite(w.get("captured_at")) for w in (merged_five, merged_seven)
+            if isinstance(w, dict)]
+    caps = [c for c in caps if c is not None]
+    rec = {"captured_at": max(caps) if caps else None,
+           "session_id": payload.get("session_id"),
+           "five_hour": merged_five, "seven_day": merged_seven,
+           "sessions": new_sessions}
+    tmp = None
+    try:
+        USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = USAGE_FILE.with_name(USAGE_FILE.name + f".tmp{os.getpid()}")
+        tmp.write_text(json.dumps(rec))
+        os.replace(tmp, USAGE_FILE)
+        tmp = None
+    except OSError:
+        pass
+    finally:
+        # A failed os.replace used to leak this tmp file on every tick.
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
 
 def link(text, url):
     return f"\033]8;;{url}\033\\{text}\033]8;;\033\\"
@@ -80,6 +301,10 @@ def census(cwd):
 
 def main():
     d = json.loads(sys.stdin.read() or "{}")
+    try:
+        snapshot_usage(d)
+    except Exception:
+        pass
     ws = d.get("workspace") or {}
     cwd = ws.get("current_dir") or d.get("cwd") or os.getcwd()
     model = (d.get("model") or {}).get("display_name") or "?"
