@@ -69,6 +69,16 @@ Hooks, agents and `subagentStatusLine` run from the installed copy under
 `~/.claude/plugins/cache/`. Only `statusLine` points at the source tree, so
 editing source changes the status line immediately and nothing else.
 
+**Updating to a new release.** After the marketplace source has a new
+version:
+
+```bash
+claude plugin marketplace update maestro-marketplace
+claude plugin update maestro@maestro-marketplace
+```
+
+then restart Claude Code.
+
 Optional: `brew install terminal-notifier` makes notifications clickable
 (they open the board). Without it `osascript` is used, which cannot carry a
 click action.
@@ -82,7 +92,7 @@ click action.
 | Maestro output style | System prompt — wave planning, brainstorm gate, mermaid graphs |
 | 7 tiered agents | `scout` `scribe` (haiku) · `builder` `section-lead` `visual-reviewer` `adversary` (sonnet) · `surgeon` (opus) |
 | Indented agent tree | Agent panel, via `subagentStatusLine` — nesting, tier colour, context meter, elapsed |
-| Two-row status line | Model · project · branch · cost, then context · agent census · `depth N/5` · board link |
+| Two-row status line | Model · project · branch · cost, then context · agent census · `depth N/5` · board link. Also persists each `rate_limits` reading to `usage.json` for sweep pacing |
 | Board | `http://127.0.0.1:7717` — fan-out DAG, lanes, worktrees, screenshots |
 | Ledger | `.claude/maestro/<session>/{events.jsonl,state.json}` |
 | Token accounting | Per-agent and conductor spend from the transcripts, on the board and lanes |
@@ -91,6 +101,8 @@ click action.
 | Mailbox prune | Drops stale teammate idle pings before the conductor is ever woken by them |
 | Sleep assertion | Holds `caffeinate` while agents are in flight |
 | Ghostty config | `ghostty/config` — keybinds, theme pairing, shell integration |
+| Cross-session lessons | Human-approved rules captured in one session, injected at the start of every later one — see *Lessons* |
+| Usage-aware sweep | Checkpointed long runs paced against real rate-limit usage instead of a fixed interval — see *Sweeps* |
 
 `scout` and `scribe` are read-only. `builder`, `section-lead` and `surgeon`
 declare `isolation: worktree` and run in their own checkout.
@@ -107,6 +119,8 @@ declare `isolation: worktree` and run in their own checkout.
 | `/board` | Starts the board, returns the link. `--lan` also binds to the network |
 | `/tree` | Prints the tree, waves, worktrees and a mermaid diagram as text |
 | `/look <url>` | Screenshot pass across viewports, compared against a mock or baseline |
+| `/maestro:lessons [review\|status\|publish <id>\|trust\|repair]` | Reviews pending lesson candidates, checks the lesson budget, publishes a repo-scoped lesson, or trusts/repairs one — see *Lessons* |
+| `/maestro:sweep <new\|run\|resume\|status\|stop\|takeover> <slug>` | Runs or manages a usage-paced sweep — see *Sweeps* |
 
 ---
 
@@ -405,6 +419,166 @@ Asking does not stop the orchestra — unblocked lanes keep running.
 
 ---
 
+## Lessons
+
+A lesson is a small, human-approved rule about how Maestro should
+**orchestrate** — subagent tiering, dispatch/batching, briefs, how reports and
+messages pass back, questions, handoffs — never a project fact. Nothing
+becomes an active rule without Griffin's explicit yes to the exact bytes, and
+a saved lesson is never edited or removed: a stale rule is only ever
+superseded by a newer entry that names it.
+
+**Capture.** Candidates arrive two ways: automatically, when
+`reorchestrate.py`'s findings surface something worth learning, and manually,
+when Griffin corrects the conductor mid-session —
+`lessons.py flag --session <id> "<one line>"`. Capture never decides a
+candidate is a lesson; it only queues it.
+
+**Review.** `/maestro:lessons` (default `review`) groups pending candidates,
+drafts a rule per group, and previews the exact block `accept` would write —
+heading, Rule, Why, Evidence, optional Supersedes, Accepted — before ever
+asking. `/maestro:handoff` runs the same review for anything still pending
+before it writes the handoff, since a candidate carries this session's id and
+the session is about to end.
+
+**Entry format** (markdown):
+
+```
+## L-007 · scope: global
+Rule: <the rule; may wrap to one continuation line indented two spaces>
+Why: <one line>
+Evidence: <session-id prefix> · <finding fingerprint> · "<short quoted line>"
+Supersedes: L-003, L-004
+Accepted: 2026-10-02
+```
+
+Ids are `L-NNN` in the personal store, `R-NNN` in a repo file. Scope is
+`global` or `repo:<name>`.
+
+**Two tiers.**
+
+- **Personal store** — `~/.claude/maestro/lessons/lessons.md` (or
+  `$MAESTRO_LESSONS_DIR`). Git-tracked, append-only. `accept` is the only way
+  in.
+- **Per-repo file** — `<repo>/.claude/maestro-lessons.md`. `publish <id>`
+  copies an accepted, repo-scoped personal lesson into it (uncommitted —
+  Griffin commits it with his work), so a team can share a rule. A repo
+  file's entry a teammate wrote is **untrusted** until Griffin runs `trust
+  <R-NNN> --sha <sha256>`, binding the approval to the exact bytes shown.
+
+**The approvals ledger** (`lessons-approved.jsonl`, next to the store
+directory, or `$MAESTRO_LESSONS_APPROVALS`) is the external anchor for
+"Griffin said yes to exactly these bytes": one JSON line per approval, each
+carrying the sha256 of the entry it covers and a hash chain over every
+record, so editing, reordering, or cutting a line out of the middle is
+detectable. It is **tamper-evident** against accidental or naive edits — a
+hand edit, a script rewriting a file, a git history rewrite — and it is
+**not** a defense against deliberate forgery by code that already has write
+access to `~/.claude`: there is no secret, so such code could append a
+forged entry and a matching chain. The real guard against that is never
+running `accept`/`publish`/`trust` except immediately after Griffin's
+explicit yes to the exact bytes shown.
+
+**Injection.** The `SessionStart` hook (`lessons.py inject`) prints an active,
+approved lesson block, capped at a hard budget (24 entries / 6000 characters
+per scope — global, and each repo scope present). Injection is **fail
+closed**: if the personal store or its ledger fails validation, nothing is
+injected and the session sees `MAESTRO LESSONS OFF` with the reason to fix,
+never a silent partial set. A repo file failing on its own (malformed,
+tampered, symlinked, too large, too long a history to verify, or over budget)
+only turns off that tier — `REPO LESSONS OFF` — personal lessons still
+inject.
+
+**Consolidation.** Near or over budget, `/maestro:lessons review` proposes
+merging several older entries into one, via `--supersedes L-0AA,L-0BB,L-0CC`
+on a fresh `accept` — the active set shrinks; superseded entries stay on disk,
+just out of the active set.
+
+**Repair.** `repair` shows (dry run) and, on `--apply --sha <sha256>`,
+removes an uncommitted, unapproved tail left by an interrupted `accept` — the
+one failure mode that can leave stray bytes behind. It never touches a
+committed entry, an approved entry, or anything in the ledger.
+
+`node`-free: the whole pipeline is `maestro/scripts/lessons.py` (capture,
+inject, accept, publish, trust, repair, status) plus
+`maestro/scripts/lessons_check.py` (parse/validate/trust logic, reused by
+`lessons.py`).
+
+---
+
+## Sweeps
+
+A sweep is a frozen plan plus an item index, worked in small checkpointed
+chunks between pauses that a pacing brain schedules from **real rate-limit
+usage** — not a fixed interval:
+
+```
+/maestro:sweep new <goal>
+/maestro:sweep run <slug>
+/maestro:sweep resume <slug>
+/maestro:sweep status [slug]
+/maestro:sweep stop <slug>
+/maestro:sweep takeover <slug>
+```
+
+`run` and `resume` only run inside `/loop` — self-paced (`/loop
+/maestro:sweep run <slug>`), so the same prompt text re-fires on every wakeup
+and is the whole resume line.
+
+**State.** `sweep_state.py` is the checkpoint store, under
+`<repo>/.claude/maestro/sweeps/<slug>/` (or `$MAESTRO_SWEEPS_DIR`):
+`plan.md` (frozen at `new`; amendments are `plan.v2.md`, …), `index.json`
+(items and their status), `policy.json` (the current policy; every version is
+kept as `policy.vN.json`), `findings.jsonl`, `amendments.jsonl`, and
+`pace.jsonl` (two lines per chunk: start, then end).
+
+**Deviation levels** govern what a finding may do to the plan, default
+`additive`:
+
+| Level | A finding may |
+|---|---|
+| `locked` | log only — `add` refuses |
+| `additive` (default) | add a new item, never edit the plan or drop items |
+| `adaptive` | amend the plan after Griffin approves a non-blocking question |
+| `autonomous` | amend the plan freely, logged |
+
+**Pacing.** `pace.py` reads `usage.json` (written by the statusLine's own
+`rate_limits` reading — see below) and `pace.jsonl`'s chunk history to decide
+`continue` / `sleep` / `stop` / `probe` for each configured ceiling
+(`five_hour` / `seven_day`, default 80 / 90). A reading is a lower bound, and
+is projected forward when stale; when headroom for one more chunk is gone,
+`five_hour` sleeps until its reset (plus a margin), `seven_day` stops (a
+weekly reset is too far off to sleep through — it hands off instead). With no
+fresh usage reading for 3 chunks running, it stops with "no usage signal"
+unless the policy's `allow_blind` is set, in which case it sleeps
+`blind_gap_s` instead.
+
+**Ownership.** `next`, `recover`, `end-chunk`, `done`, `fail` and `lease` act
+for an owner — the Claude Code session id (`$CLAUDE_CODE_SESSION_ID`), never
+a minted token. A `/loop` also holds a lease so a sleeping loop still owns
+the sweep between chunks; `/clear` changes the session id, so a chunk or
+lease left by the pre-`/clear` session needs `takeover`. `set-policy` changes
+a running sweep's policy (a ceiling, `chunk_size`, deviation, `allow_blind`)
+only on Griffin's explicit request.
+
+**Exit codes** (`sweep_state.py`):
+
+| code | meaning |
+|---|---|
+| 0 | ok |
+| 1 | `check` printed `SWEEP FAIL` |
+| 2 | invalid input, refused, or no such sweep |
+| 3 | `next`: nothing pending or running — the sweep is finished |
+| 4 | owned by another live session (open chunk or held lease) |
+| 5 | the sweep lock is busy |
+
+Needs Maestro's statusLine (`./install.sh`) for pacing — `rate_limits` only
+appears in the statusLine payload on a Pro/Max plan, after the first API
+response of a session — and a foreground session, since whether a
+backgrounded session renders the statusLine at all is undocumented.
+
+---
+
 ## Staying awake
 
 The ledger holds a `caffeinate` assertion for exactly as long as agents are in
@@ -445,6 +619,14 @@ so one orphaned by a deleted session dir dies on its own.
 | `MAESTRO_CAFFEINATE_MAX_IDLE` | `900` | Idle seconds before a node stops holding it |
 | `MAESTRO_REAP_SECONDS` | `900` | Idle seconds before a `running` node is orphaned |
 | `MAESTRO_PENDING_TTL` | `600` | Age limit on an unmatched dispatch |
+| `MAESTRO_LESSONS_DIR` | `~/.claude/maestro/lessons/` | Personal lesson store directory |
+| `MAESTRO_LESSONS_APPROVALS` | `lessons-approved.jsonl` next to the store | Approvals ledger path |
+| `MAESTRO_LESSONS` | on | `0` disables capture, `flag`, and injection |
+| `MAESTRO_USAGE_FILE` | `~/.claude/maestro/usage.json` | Statusline usage snapshot read by `pace.py`/`sweep_state.py` |
+| `MAESTRO_SWEEPS_DIR` | `<git toplevel>/.claude/maestro/sweeps` | Sweep state root |
+| `MAESTRO_LOCK_STALE_S` | `10.0` | Seconds before a sweep lock is considered stale under contention |
+| `MAESTRO_LOCK_TIMEOUT_S` | `4.0` | Seconds a sweep command retries a busy lock before giving up |
+| `MAESTRO_LOCK_HARD_STALE_S` | `3600` | Seconds before a lock holder on another host is presumed gone |
 
 ---
 
@@ -469,10 +651,25 @@ so one orphaned by a deleted session dir dies on its own.
   mocks/                   HTML mocks from /brainstorm
   PLAN.md                  the conductor's durable ledger
   HANDOFF.md               the validated phase-boundary handoff (/handoff)
+  sweeps/<slug>/           frozen plan, item index, policy versions, findings,
+                           amendments, and pace history for one sweep
+
+~/.claude/maestro/
+  lessons/                 personal lesson store ($MAESTRO_LESSONS_DIR)
+    lessons.md             the personal lesson file, git-tracked, append-only
+    candidates.jsonl       append-only, gitignored, capture queue
+    rejected.jsonl         append-only, tracked in the store's own git repo
+  lessons-approved.jsonl   the approvals ledger ($MAESTRO_LESSONS_APPROVALS)
+  usage.json               latest statusline rate-limit snapshot, read by
+                           pace.py/sweep_state.py
+
+<repo>/.claude/maestro-lessons.md   published, repo-scoped lessons (R-NNN) —
+                                    uncommitted by `publish`; Griffin commits it
 ```
 
 Add `.claude/maestro/` to `.gitignore`; commit `baselines/` if you want visual
-regression references in the repo.
+regression references in the repo, and commit `.claude/maestro-lessons.md` if
+you want repo-scoped lessons shared with the team.
 
 ---
 
@@ -490,6 +687,27 @@ regression references in the repo.
   (see reaping) keeps `tokens: 0`. Totals are floor values, not billing.
 - The board is read-only apart from spawning and the music transport.
 - Split-pane agent teams need tmux or iTerm2. In-process mode is the default.
+- **Lessons ledger is tamper-evident, not tamper-proof.** It catches
+  accidental or naive edits, not deliberate forgery by code that already has
+  write access to `~/.claude` — there is no secret backing the chain. Nothing
+  mechanically proves a human said yes; the docs bind the conductor.
+- Two repos with the same directory basename share one lesson scope (and so
+  each other's repo-scoped personal lessons and trust records).
+- `lessons.py inject`'s pending-candidate count is read by folding the whole
+  of `candidates.jsonl` at every `SessionStart`.
+- Sweep pacing's freshness signal assumes `cost.total_api_duration_ms`
+  advances in step with a `rate_limits` update — both are documented Claude
+  Code fields, but that they co-update is not independently verified.
+- Whether a backgrounded (agent view) or headless (`-p`) session renders the
+  statusLine at all is undocumented; a sweep loop that goes blind stops with
+  a reason that says so rather than guessing.
+- A sweep's loop lease depends on the sweep skill renewing it before every
+  wakeup; `/clear` changes the session id, so a lease or open chunk from
+  before a `/clear` needs `takeover`.
+- `sweep_state.py add` has no idempotent retry after a mid-write crash
+  between its amendment and index writes — re-run `add`.
+- `rate_limits`, and so all sweep pacing, only exists for a Pro/Max plan
+  after the session's first API response; it is absent on API-key billing.
 
 ---
 

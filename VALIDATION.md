@@ -12,7 +12,7 @@ record the actual output, and only then decide whether it passed.
 | | |
 |---|---|
 | Plugin source | `~/Documents/Development/maestro-marketplace` |
-| Scripts | `<source>/maestro/scripts/{ledger,subagent_tree,statusline,board,notify,reorchestrate}.py` |
+| Scripts | `<source>/maestro/scripts/{ledger,subagent_tree,statusline,board,notify,reorchestrate,lessons,lessons_check,sweep_state,pace}.py` |
 | Installed as | `maestro@maestro-marketplace` (user scope) |
 | Ledger written to | `<repo>/.claude/maestro/<8-char-session-id>/{state.json,events.jsonl}` |
 | Board | `http://127.0.0.1:7717` |
@@ -487,6 +487,101 @@ ghostty +validate-config && ghostty +show-config | grep -iE 'theme|keybind|font-
 Test each Maestro keybind: `Cmd+Shift+B` (board), `Cmd+Shift+A` (`claude agents`),
 `Cmd+Shift+T` (`/tree`), `Cmd+I` (rename tab), `Cmd+Shift+S` (scrollback file).
 Report any that do nothing — the `text:` action syntax is unverified.
+
+### 2.7 Lessons
+
+#### Automated
+
+```bash
+cd ~/Documents/Development/maestro-marketplace \
+  && python3 tests/lessons_units.py \
+  && python3 tests/lessons_capture_units.py \
+  && python3 tests/lessons_flow_units.py
+```
+
+`lessons_units.py` is the pure validator: parsing, the size/id/Supersedes
+caps, the injection budget, the append-only history proof, and the ledger
+chain, all hermetic (`MAESTRO_LESSONS_DIR`/`MAESTRO_LESSONS_APPROVALS` point
+into a temp root, so nothing here can resolve to `~/.claude`).
+`lessons_capture_units.py` drives the capture side (`flag`, `candidates`,
+`mark`, `reject`) plus one integration case through `reorchestrate.py`'s real
+wiring, the way `tests/replay.py` does, to prove capture never changes what
+the conductor sees mid-session. `lessons_flow_units.py` covers the flow
+commands — `inject` (the `SessionStart` hook), `accept`, `publish`, `trust`,
+`status`, and the `hooks.json` wiring — with one case per adversarial finding
+against the flow, each reproducing the original attack and asserting it no
+longer works.
+
+**Pass:** all three exit 0 and print their own `PASS`/failure summary.
+
+#### Live — one real lesson, end to end
+
+In a repo with the plugin installed, correct the conductor on something
+genuinely about its own orchestration mechanics (dispatch batching, tiering,
+a brief), confirm it runs `lessons.py flag --session <id> "<one line>"`, then
+run `/maestro:lessons`:
+
+**Pass:** it lists the candidate, drafts a rule scoped to Maestro mechanics
+(never a project fact), shows the exact `accept --preview` block verbatim in
+a fenced block, and asks with no option pre-marked as the pick. Approve it,
+confirm `~/.claude/maestro/lessons/lessons.md` gained the entry and
+`lessons-approved.jsonl` gained a matching approval line, then start a new
+session and confirm `MAESTRO LESSONS` is injected with that rule present.
+Run `python3 maestro/scripts/lessons_check.py` directly and confirm it prints
+`LESSONS PASS`.
+
+### 2.8 Sweeps
+
+#### Automated
+
+```bash
+cd ~/Documents/Development/maestro-marketplace \
+  && python3 tests/pace_units.py \
+  && python3 tests/pace_integration_units.py \
+  && python3 tests/sweep_units.py \
+  && python3 tests/sweep_skill_units.py
+```
+
+`pace_units.py` checks `decide()` against synthetic fixtures — policy
+validation, burn/gate-burn estimation, staleness projection, the
+sleep/stop/continue/probe verdicts per window, and window combination.
+`pace_integration_units.py` drives `pace.py` against a real sweep built with
+the real `sweep_state.py` CLI rather than synthetic history, specifically to
+catch contract drift between the two scripts (this is the suite that caught
+the `_more_restrictive` `TypeError` a hand-rolled fixture never combined).
+`sweep_units.py` covers `sweep_state.py`'s commands (`new`, `next`, `done`,
+`fail`, `finding`, `add`, `amend-plan`, `set-policy`, `lease`, `recover`,
+`check`, `status`) and the statusline's usage-snapshot writer. `sweep_skill_units.py`
+checks `maestro/skills/sweep/SKILL.md` itself: every `sweep_state.py`/`pace.py`
+subcommand or flag it documents actually exists (grepped from their argparse
+definitions), the resume/wakeup prompt string is consistent everywhere it
+appears and matches the `anchor` hook's own text, the owner always comes from
+the session id and never a minted token, and every exit code
+`sweep_state.py` returns is documented.
+
+**Pass:** all four exit 0 and print their own `PASS`/failure summary.
+
+#### Live — force one sleep and resume
+
+Create a small sweep (a handful of trivial items), then set a ceiling just
+above current usage so pacing is forced to sleep almost immediately:
+
+```bash
+python3 maestro/scripts/sweep_state.py new --slug validation-probe \
+  --plan <plan.md> --items <items.txt> \
+  --policy '{"ceilings":{"five_hour":<current usage + 1>,"seven_day":90},
+             "deviation":"additive","chunk_size":1}'
+```
+
+Start it with `/loop /maestro:sweep run validation-probe`.
+
+**Pass:** the first chunk runs, `pace.py` returns `sleep` (not `continue`),
+the loop renews the lease and calls `ScheduleWakeup` rather than stopping,
+and on the scheduled wakeup `/maestro:sweep resume validation-probe` picks up
+exactly where it left off — `status validation-probe` shows the same
+done/pending counts before and after the sleep, plus one. Confirm
+`pace.jsonl` has matched start/end records for the completed chunk and that
+`policy.json`'s sha still matches `index.policy_sha256`.
 
 ---
 
