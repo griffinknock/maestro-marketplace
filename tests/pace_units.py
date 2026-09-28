@@ -185,13 +185,23 @@ def both_windows_sleep_mismatched_wake_at_case():
     # sweep_state.py fixtures: a near five_hour reset (short sleep, no
     # wake_at) combined with a distant seven_day reset (long sleep,
     # wake_at set) — comparing None <= float used to blow up.
+    # Chunk 1 ran 900..1000 burning 2 points on each window:
+    #   five_hour: spacing = 10800*2/40 = 540 -> due 1440 -> sleep 440
+    #   seven_day: spacing = 345600*2/40 = 17280 -> due 18180 -> sleep 3600
     now = 1000.0
+    five_resets, seven_resets = now + 3 * 3600, now + 4 * 86400
+    history = [
+        pace_rec(1, "start", 900, five_used=38.0, seven_used=48.0,
+                 five_resets=five_resets, seven_resets=seven_resets),
+        pace_rec(1, "end", 1000, five_used=40.0, seven_used=50.0,
+                 five_resets=five_resets, seven_resets=seven_resets),
+    ]
     snapshot = snap(
         now,
-        five_hour=reading(40.0, now + 3 * 3600),
-        seven_day=reading(50.0, now + 4 * 86400),
+        five_hour=reading(40.0, five_resets),
+        seven_day=reading(50.0, seven_resets),
     )
-    d = decide(snapshot, now, DEFAULT_POLICY, [])  # no history -> default burn
+    d = decide(snapshot, now, DEFAULT_POLICY, history)
     check("action is sleep, not a crash", d["action"] == "sleep", d)
     check("window is seven_day (the longer sleep wins)", d["window"] == "seven_day", d)
     check("delay_s clamped to [60, 3600]", 60 <= d["delay_s"] <= 3600, d)
@@ -239,24 +249,27 @@ def zero_delta_coarse_readings_case():
 
 
 def stale_reading_projected_forward_case():
-    print("\n=== stale reading -> projected forward using burn/duration ===")
-    now = 1000.0
+    print("\n=== stale reading -> projected forward by the chunks started since ===")
+    now = 251.0
     resets_at = now + 10000
     history = [
         pace_rec(1, "start", 0, five_used=30.0, five_resets=resets_at, captured_at=0),
         pace_rec(1, "end", 100, five_used=32.0, five_resets=resets_at, captured_at=100),
+        pace_rec(2, "start", 150, five_used=32.0, five_resets=resets_at, captured_at=150),
+        pace_rec(2, "end", 250, five_used=34.0, five_resets=resets_at, captured_at=250),
     ]
-    # snapshot reading is from before the last chunk ended (stale), used=31 at t=50
+    # The snapshot was captured at t=50, before chunk 2 started (stale):
+    # projected = 31 + 2*1 = 33 -> headroom 47, spacing = 10000*2/47 ~= 425.5,
+    # due at 150 + 425.5 -> sleep ~324s (the raw 31 would give ~308s).
     snapshot = {
         "captured_at": 50,
         "five_hour": reading(31.0, resets_at),
         "seven_day": None,
     }
     d = decide(snapshot, now, DEFAULT_POLICY, history)
-    # burn=2/100s duration. elapsed = (100-50) + (1000-100) = 950s -> 9.5 chunks
-    # projected = 31 + 2*9.5 = 50 -> headroom = 30, still > burn(2) -> paced sleep
-    check("action is sleep (projected use is higher than raw reading)", d["action"] == "sleep", d)
-    check("reason notes the reading was stale/projected", "stale" in d["reason"] or "projected" in d["reason"], d["reason"])
+    check("action is sleep", d["action"] == "sleep", d)
+    check("delay reflects the projected use, not the raw reading", abs(d["delay_s"] - 324) <= 2, d)
+    check("reason notes the reading was projected by 1 chunk", "projected forward by 1 chunk" in d["reason"], d["reason"])
 
 
 def resets_at_passed_no_chunks_since_probes_case():
@@ -718,6 +731,106 @@ def no_signal_reason_names_background_case():
           "install.sh" in d["reason"] and "headless" in d["reason"] and "background" in d["reason"], d)
 
 
+def fresh_sweep_first_chunk_runs_case():
+    print("\n=== fresh sweep, low usage on both windows -> first chunk runs ===")
+    # Live 0.5.0 shape: 1% five_hour, 0% seven_day, default ceilings, no
+    # history. There is no earlier chunk start to space from, so pacing has
+    # nothing to wait for; the default-burn headroom gate still applies.
+    # Before the fix this slept 3600s on every wakeup, forever.
+    now = 1000.0
+    snapshot = snap(now, five_hour=reading(1.0, now + 17600),
+                    seven_day=reading(0.0, now + 530000))
+    d = decide(snapshot, now, DEFAULT_POLICY, [])
+    check("action is continue", d["action"] == "continue", d)
+    check("reason still names the conservative default", "default" in d["reason"], d["reason"])
+
+
+def paced_sleep_then_wake_continues_case():
+    print("\n=== paced sleep, woken at the target -> continue, not another sleep ===")
+    # Same numbers as moderate_usage_computed_gap_case: chunk 1 ran 0..100,
+    # spacing 500, so the next chunk is due at t=500. Waking there with the
+    # reading unchanged must run the chunk; the old gap-from-now math slept
+    # another ~390s on every wakeup.
+    resets = 10100.0
+    history = [
+        pace_rec(1, "start", 0, five_used=30.0, five_resets=resets),
+        pace_rec(1, "end", 100, five_used=32.0, five_resets=resets),
+    ]
+    first = decide(snap(100.0, five_hour=reading(40.0, resets)), 100.0, DEFAULT_POLICY, history)
+    check("first decision sleeps ~400s", first["action"] == "sleep" and abs(first["delay_s"] - 400) <= 2, first)
+    woke = 100.0 + first["delay_s"]
+    d = decide(snap(woke, five_hour=reading(40.0, resets)), woke, DEFAULT_POLICY, history)
+    check("decision at the wake time is continue", d["action"] == "continue", d)
+
+
+def chained_long_sleep_converges_case():
+    print("\n=== paced target > 1h -> chained sleeps converge on it ===")
+    # spacing = 100000*2/40 = 5000 from chunk 1's start (t=0). The first
+    # sleep clamps to 3600 with wake_at at the real target; each later wake
+    # must aim at (about) that same target, not push it out again.
+    resets = 100100.0
+    history = [
+        pace_rec(1, "start", 0, five_used=30.0, five_resets=resets),
+        pace_rec(1, "end", 100, five_used=32.0, five_resets=resets),
+    ]
+    now = 100.0
+    first = decide(snap(now, five_hour=reading(40.0, resets)), now, DEFAULT_POLICY, history)
+    check("first sleep clamps to 3600 with wake_at set",
+          first["action"] == "sleep" and first["delay_s"] == 3600 and first["wake_at"] is not None, first)
+    wakes = 0
+    d = first
+    while d["action"] == "sleep" and wakes < 10:
+        now += d["delay_s"]
+        wakes += 1
+        d = decide(snap(now, five_hour=reading(40.0, resets)), now, DEFAULT_POLICY, history)
+    check("reaches continue within 3 wakeups", d["action"] == "continue" and wakes <= 3, (wakes, d))
+    check("never waits past the first target", now <= first["wake_at"] + 60, (now, first["wake_at"]))
+
+
+def future_dated_start_bounded_case():
+    print("\n=== last start in the future (clock step / corrupt at) -> sleep bounded by spacing ===")
+    # A start stamped after `now` must not push the target past now + spacing;
+    # a ms timestamp (1.7e12) used to starve the sweep at 3600s per wake.
+    resets = 10100.0
+    history = [
+        pace_rec(1, "start", 1.7e12, five_used=30.0, five_resets=resets),
+        pace_rec(1, "end", 1.7e12 + 100, five_used=32.0, five_resets=resets),
+    ]
+    now = 100.0
+    d = decide(snap(now, five_hour=reading(40.0, resets)), now, DEFAULT_POLICY, history)
+    # The future end also marks the reading stale (+1 chunk projected):
+    # headroom 38, spacing = 10000*2/38 ~= 526, measured from now at most.
+    check("sleep no longer than the spacing", d["action"] == "sleep" and d["delay_s"] <= 527, d)
+    check("no wake_at far in the future", d["wake_at"] is None, d)
+
+
+def no_history_five_hour_gate_sleeps_case():
+    print("\n=== no history, five_hour headroom under the default gate -> sleep, not continue ===")
+    # The no-chunk-yet continue sits after the headroom gate: 77% used with
+    # an 80 ceiling leaves 3 points, under the default gate of 5.
+    now = 1000.0
+    d = decide(snap(now, five_hour=reading(77.0, now + 1800)), now, DEFAULT_POLICY, [])
+    check("action is sleep", d["action"] == "sleep", d)
+    check("sleeps until reset + margin", abs(d["delay_s"] - (1800 + 120)) <= 1, d)
+
+
+def interrupted_last_chunk_anchors_case():
+    print("\n=== interrupted last chunk still anchors the paced gap ===")
+    # Chunk 2 was closed by recover (interrupted) — excluded from burn, but it
+    # did start, so spacing counts from its start (t=150), not chunk 1's.
+    resets = 10251.0
+    history = [
+        pace_rec(1, "start", 0, five_used=30.0, five_resets=resets),
+        pace_rec(1, "end", 100, five_used=32.0, five_resets=resets),
+        pace_rec(2, "start", 150, five_used=32.0, five_resets=resets),
+        dict(pace_rec(2, "end", 250, five_used=33.0, five_resets=resets), interrupted=True),
+    ]
+    now = 251.0
+    d = decide(snap(now, five_hour=reading(40.0, resets)), now, DEFAULT_POLICY, history)
+    # burn 2 (chunk 1 only), headroom 40, spacing = 10000*2/40 = 500 -> due 650
+    check("sleeps ~399s (anchored at chunk 2's start)", d["action"] == "sleep" and abs(d["delay_s"] - 399) <= 2, d)
+
+
 def main():
     no_history_case()
     low_usage_far_from_reset_case()
@@ -759,6 +872,12 @@ def main():
     fresh_at_drives_staleness_case()
     chunk_size_raised_midsweep_case()
     no_signal_reason_names_background_case()
+    fresh_sweep_first_chunk_runs_case()
+    paced_sleep_then_wake_continues_case()
+    chained_long_sleep_converges_case()
+    future_dated_start_bounded_case()
+    no_history_five_hour_gate_sleeps_case()
+    interrupted_last_chunk_anchors_case()
 
     print()
     if FAILURES:

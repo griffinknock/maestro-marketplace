@@ -77,7 +77,8 @@ For each window ("five_hour", "seven_day") present in `snapshot`:
        to decide whether one more chunk still fits before the ceiling, and
        (as max(burn, gate_burn)) to project stale or post-reset readings.
    Chunk duration = mean of (end.at - start.at) over the same deltas used
-   for `burn`. With zero eligible deltas, fall back to a conservative
+   for `burn` (diagnostic only — step 4 paces from the last chunk's start,
+   which already includes how long it ran). With zero eligible deltas, fall back to a conservative
    default burn/gate (see `_DEFAULT_BURN`) and duration (see
    `_DEFAULT_DURATION`), and the reason says the estimate is a
    conservative default (no history).
@@ -109,11 +110,14 @@ For each window ("five_hour", "seven_day") present in `snapshot`:
 
 4. **Otherwise, pace to land at/under the ceiling by resets_at** (skipped,
    falling through to a plain "continue", when there is no reset horizon to
-   pace against — `resets_at` absent or already passed):
+   pace against — `resets_at` absent or already passed — or when no chunk
+   has started yet, so there is no earlier start to space from):
      chunks_affordable = headroom / burn   # mean burn, not gate_burn
      spacing = (resets_at - now) / chunks_affordable   # target gap between
                                                           # chunk *starts*
-     gap = spacing - mean_chunk_duration                # gap is BETWEEN chunks
+     gap = last_chunk_start + spacing - now   # anchored to the last start,
+                                              # so a wakeup converges on the
+                                              # target instead of re-sleeping
      gap < 60s  -> continue now (delay_s = 0)
      else       -> sleep min(gap, 3600)s
 
@@ -502,6 +506,10 @@ def decide(snapshot, now, policy, history):
     end_ats = [_finite_number(r.get("at")) for r in (history or [])
                if isinstance(r, dict) and r.get("event") == "end"]
     last_chunk_end_at = max((a for a in end_ats if a is not None), default=None)
+    start_ats = _chunk_start_times(history)
+    # Clamped to `now`: a start stamped in the future (clock step, corrupt
+    # `at`) must not push the paced target past now + spacing.
+    last_chunk_start_at = min(start_ats[-1], now) if start_ats else None
 
     verdict = None
     for window in _WINDOWS:
@@ -528,7 +536,7 @@ def decide(snapshot, now, policy, history):
         else:
             fresh_at = captured_at
 
-        burn, gate_burn, duration, used_default = _burn_and_duration(pairs, window, chunk_size)
+        burn, gate_burn, _, used_default = _burn_and_duration(pairs, window, chunk_size)
         # Projections count the items actually claimed since the reading,
         # at max(burn, gate_burn) per current-size chunk.
         proj_item = max(burn, gate_burn) / chunk_size
@@ -603,10 +611,24 @@ def decide(snapshot, now, policy, history):
             verdict = _more_restrictive(verdict, w)
             continue
 
+        if last_chunk_start_at is None:
+            # Spacing is between chunk starts; with none yet there is nothing
+            # to space from, and the gate above already allowed one chunk.
+            w = {
+                "action": "continue", "delay_s": 0, "window": window, "wake_at": None,
+                "reason": "%s headroom (%.1f%%) clears one chunk and no chunk has run yet; "
+                          "continuing now%s%s" % (window, headroom, default_note, stale_note),
+            }
+            verdict = _more_restrictive(verdict, w)
+            continue
+
         chunks_affordable = headroom / burn if burn > 0 else float("inf")
         time_to_reset = resets_at - now
         spacing = time_to_reset / chunks_affordable if chunks_affordable > 0 else 0.0
-        gap = spacing - duration
+        # Anchored to the last chunk's start, not to `now`: a wakeup re-asks
+        # with the same history, and measuring from `now` would push the
+        # target out again on every wake.
+        gap = last_chunk_start_at + spacing - now
 
         if gap < 60:
             w = {
