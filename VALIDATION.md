@@ -530,6 +530,27 @@ session and confirm `MAESTRO LESSONS` is injected with that rule present.
 Run `python3 maestro/scripts/lessons_check.py` directly and confirm it prints
 `LESSONS PASS`.
 
+**Recorded on 2026-09-28, macOS 26.6, Python 3.14, plugin 0.5.0 plus branch
+`validate/0.5.0-live`:**
+
+| check | result |
+|---|---|
+| three automated suites | pass, all exit 0 |
+| session start with candidates queued | pass: `1 lesson candidate(s) pending — review with /maestro:lessons`, no error |
+| `flag` from a correction | partial: `flag --session` queued the two candidates the 0.5.0 handoff carried; no live in-session correction happened, so "the conductor flags on its own when corrected" is still unexercised |
+| review lists, drafts, previews, asks with no pick | pass: 9 pending, 3 drafted (the cap), each asked with its `--preview` block verbatim and no option pre-marked |
+| Griffin approves one real lesson | pass: L-001, L-002 and L-003 approved |
+| `lessons.md` and ledger agree | pass: three entries; `lessons-approved.jsonl` has three `accept` lines with matching shas (`73f5654f…`, `f9dcb005…`, `a32321e9…`); store git has one commit per entry |
+| `lessons_check.py` | pass: `LESSONS PASS — 3 active, 557 chars` |
+| `inject` carries the rules | pass: `MAESTRO LESSONS — 3 active …` lists L-001 to L-003 |
+| new session shows `MAESTRO LESSONS` | not yet run; needs a Claude Code restart |
+
+Found and fixed (`a328865`): capture deduped per session on the
+re-orchestration fingerprint, which is wave-scoped (`serial:3`, `serial:4`,
+`inline:6` …), so every wave queued another copy of the same finding. At
+review time, 7 of 9 pending candidates were repeats of two nudges.
+`_lesson_fingerprint` now collapses non-report fingerprints to their kind.
+
 ### 2.8 Sweeps
 
 #### Automated
@@ -561,27 +582,70 @@ the session id and never a minted token, and every exit code
 
 **Pass:** all four exit 0 and print their own `PASS`/failure summary.
 
-#### Live — force one sleep and resume
+#### Live — a real wakeup and an exact resume
 
-Create a small sweep (a handful of trivial items), then set a ceiling just
-above current usage so pacing is forced to sleep almost immediately:
+The original procedure here set the five-hour ceiling to current usage + 1.
+That cannot make the first chunk run: a sweep with no history gates on the
+conservative default burn (5 points a chunk), so pace sleeps until the
+five-hour reset before running anything, and a gate-tripped sleep lasts
+until that reset, one capped hour per wake. Instead, use a small natural
+run:
 
 ```bash
 python3 maestro/scripts/sweep_state.py new --slug validation-probe \
   --plan <plan.md> --items <items.txt> \
-  --policy '{"ceilings":{"five_hour":<current usage + 1>,"seven_day":90},
+  --policy '{"ceilings":{"five_hour":80,"seven_day":90},
              "deviation":"additive","chunk_size":1}'
 ```
 
-Start it with `/loop /maestro:sweep run validation-probe`.
+Five trivial items (a haiku scout running `wc -l` on one file each), then
+`/loop /maestro:sweep run validation-probe`.
 
-**Pass:** the first chunk runs, `pace.py` returns `sleep` (not `continue`),
-the loop renews the lease and calls `ScheduleWakeup` rather than stopping,
-and on the scheduled wakeup `/maestro:sweep resume validation-probe` picks up
-exactly where it left off — `status validation-probe` shows the same
-done/pending counts before and after the sleep, plus one. Confirm
-`pace.jsonl` has matched start/end records for the completed chunk and that
-`policy.json`'s sha still matches `index.policy_sha256`.
+**Pass:** the first turn runs 3 chunks (the per-turn bound) with pace
+answering `continue`. The loop then renews the lease (`lease --in 60`) and
+calls `ScheduleWakeup(60)` instead of stopping. On the wakeup the same
+prompt re-fires: `recover` returns `[]`, `status` shows the same
+done/pending counts as before the sleep, and the remaining chunks run.
+`next` exits 3, and the END procedure releases the lease and calls
+`ScheduleWakeup(stop: true)`. `pace.jsonl` has a matched start/end pair per
+chunk with fresh end readings, `policy.json`'s sha matches
+`index.policy_sha256`, and `check` prints `SWEEP PASS`. A pace-driven
+`sleep` only happens if a chunk moves the five-hour reading. The sleep
+arithmetic itself, including waking on a paced sleep and converging on a
+target over an hour away, is pinned in `pace_units.py`.
+
+**Recorded on 2026-09-28, macOS 26.6, Python 3.14, plugin 0.5.0 plus branch
+`validate/0.5.0-live`:**
+
+| time | point in the loop | pace | outcome |
+|---|---|---|---|
+| 09:56:47 | turn 1, before chunk 1 | `continue`: five_hour headroom 79.0% clears one chunk, none run yet | i-0001 done 721 |
+| 09:57:05 | after chunk 1 | `continue`: paced gap −15s | i-0002 done 1681 |
+| 09:57:22 | after chunk 2 | `continue`: paced gap −14s | i-0003 done 1449 |
+| 09:57:43 | after chunk 3 | `continue`, 3-chunk bound | `lease --in 60` (until 10:08:43), `ScheduleWakeup(60)`; status 3 done / 2 pending / chunk 3 |
+| 09:59:08 | wakeup | `continue`: paced gap −100s | recover `[]`, `SWEEP PASS`, status unchanged (3 / 2 / chunk 3); i-0004 done 356 |
+| 09:59:27 | after chunk 4 | `continue`: paced gap −14s | i-0005 done 419 |
+| 09:59:45 | after chunk 5 | `continue` | `next` exit 3; 5 done / 0 failed; lease released; `ScheduleWakeup(stop)` cancelled 1 pending wakeup |
+
+Five-hour usage stayed at 1.0% the whole run, so no chunk moved the reading
+and pace never needed to sleep. `pace.jsonl` holds 5 matched pairs, none
+interrupted, every end reading fresh; the policy sha matched.
+
+Found and fixed (`beefd19`): 0.5.0's `pace.py` measured the paced gap from
+`now` rather than from the last chunk's start, so every wakeup pushed the
+target out again. On this exact fresh sweep, 0.5.0 answered
+`sleep 3600 (seven_day pacing … of 29442s target)` and would have repeated
+that on every wake without running a chunk.
+
+Observed, not changed:
+- Items are background agents, so one loop turn spans several invocations
+  (one per result). The harness arms its ~20-minute fallback wakeup when an
+  invocation ends without `ScheduleWakeup`; the END's `stop` cancelled it
+  here. Every path ends in a reschedule or a stop, so this is harmless
+  unless a turn dies mid-chunk.
+- The re-orchestration serial rule fired on every chunk ("Three dispatches
+  in a row of one agent each"), a false positive inside a sweep. It is
+  recorded as lesson L-003; the hook itself still fires.
 
 ---
 
