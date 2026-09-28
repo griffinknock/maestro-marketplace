@@ -323,12 +323,19 @@ def _lesson_fingerprint(fp, is_report):
     The reorch-internal fingerprint is keyed for `said`-dedupe within one
     session; the lessons store dedupes across sessions on (session,
     fingerprint), so a delivery finding gets its own stable shape instead.
+
+    Non-report fingerprints (`serial:{len(sizes)}`, `inline:{wave}`, ...) are
+    wave-scoped for that same in-session `said` dedupe, so every wave mints a
+    "new" candidate with identical text; collapse to the kind — the part
+    before the first ':' — so the lessons store dedupes them as one finding.
     """
     if is_report and fp.startswith("report:"):
         parts = fp.split(":", 2)
         if len(parts) == 3:
             _, aid, kind = parts
             return f"delivery:{kind}:{aid}"
+    if not is_report:
+        return fp.split(":", 1)[0]
     return fp
 
 

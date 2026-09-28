@@ -26,6 +26,7 @@ from replay import Conductor, workspace, PLUGIN, ENV, IDLE_FRAME, report_text
 sys.path.insert(0, str(PLUGIN))
 import lessons
 import lessons_check
+import reorchestrate
 
 FAILURES = []
 
@@ -467,6 +468,54 @@ def correction_key_case():
     shutil.rmtree(d, ignore_errors=True)
 
 
+def fingerprint_kind_case():
+    print("\n=== _lesson_fingerprint keys non-report findings by kind, not wave ===")
+    check("serial:6 -> serial", reorchestrate._lesson_fingerprint("serial:6", False) == "serial")
+    check("inline:12 -> inline", reorchestrate._lesson_fingerprint("inline:12", False) == "inline")
+    check("depth5 stays depth5", reorchestrate._lesson_fingerprint("depth5", False) == "depth5")
+    check("report:abc:missing (is_report) -> delivery:missing:abc",
+          reorchestrate._lesson_fingerprint("report:abc:missing", True) == "delivery:missing:abc")
+
+
+def wave_dedupe_case():
+    print("\n=== capture_lessons dedupes reorch findings by kind across waves ===")
+    d = tmp_store()
+    os.environ["MAESTRO_LESSONS_DIR"] = str(d)
+    try:
+        payload_a = {"session_id": "sess-wave-a", "cwd": "/tmp", "tool_use_id": None}
+        # Same kind of finding fired at two different wave numbers within one
+        # session — the reorch-internal fingerprint is wave-scoped, so this is
+        # exactly what a live session produces on repeated serial drift.
+        reorchestrate.capture_lessons(
+            payload_a, [("serial:3", "three dispatches in a row of one agent each.", False)])
+        reorchestrate.capture_lessons(
+            payload_a, [("serial:4", "three dispatches in a row of one agent each.", False)])
+        reorchestrate.capture_lessons(
+            payload_a, [("serial:5", "three dispatches in a row of one agent each.", False)])
+
+        rows = lessons.load_candidates(d)
+        serial_a = [r for r in rows if (r.get("fingerprint") or "") == "serial"]
+        check("exactly one pending candidate for the kind, across three waves",
+              len(serial_a) == 1, f"got {len(rows)}: {rows}")
+        check("its session is the one that produced it",
+              serial_a and serial_a[0].get("session") == "sess-wave-a", serial_a)
+
+        # A second session hitting the same kind gets its own candidate — the
+        # dedupe is per (session, fingerprint), never global.
+        payload_b = {"session_id": "sess-wave-b", "cwd": "/tmp", "tool_use_id": None}
+        reorchestrate.capture_lessons(
+            payload_b, [("serial:3", "three dispatches in a row of one agent each.", False)])
+        rows = lessons.load_candidates(d)
+        serial_all = [r for r in rows if (r.get("fingerprint") or "") == "serial"]
+        check("a second session produces a second candidate for the same kind",
+              len(serial_all) == 2, f"got {len(rows)}: {rows}")
+        check("the second candidate belongs to the second session",
+              any(r.get("session") == "sess-wave-b" for r in serial_all), serial_all)
+    finally:
+        os.environ["MAESTRO_LESSONS_DIR"] = SAFE_STORE
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     init_case()
     dedupe_case()
@@ -479,6 +528,8 @@ def main():
     flag_disabled_case()
     control_chars_case()
     correction_key_case()
+    fingerprint_kind_case()
+    wave_dedupe_case()
     integration_case()
     shutil.rmtree(SAFE_ROOT, ignore_errors=True)
     print("\n  " + ("PASS" if not FAILURES else f"FAIL ({len(FAILURES)})"))
