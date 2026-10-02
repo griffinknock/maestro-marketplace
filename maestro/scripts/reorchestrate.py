@@ -219,6 +219,10 @@ def delivery_findings(state, now):
     for n in state.get("nodes", {}).values():
         if n.get("id") == ROOT:
             continue
+        # A Workflow's agents return to its script (StructuredOutput), never to
+        # the conductor, which hears from the Workflow's completion notice.
+        if "workflow-subagent" in (n.get("type"), n.get("name")):
+            continue
         st = n.get("report_status")
         if st not in ("recovered", "missing"):
             continue
@@ -270,9 +274,10 @@ def check(state, batch, settled, now):
 
     # Worktree collisions — two live agents editing the same file. Fingerprinted
     # by path, so three agents on one file is one line, not three identical ones.
+    # `writes`, not `files`: agents reading one shared contract is the design.
     seen = {}
     for n in live:
-        for path in (n.get("files") or []):
+        for path in (n.get("writes") or []):
             owner = seen.get(path)
             if owner and owner != n.get("id"):
                 f.append((f"collide:{path}",

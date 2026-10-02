@@ -76,6 +76,32 @@ def looks_like_report(txt):
     return substantive(txt) and bool(RETURN_BLOCK.search(txt))
 
 
+def tail_records(path):
+    """Parsed transcript records from the last REPORT_TAIL_BYTES, newest first."""
+    if not path:
+        return []
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - REPORT_TAIL_BYTES))
+            blob = fh.read()
+    except OSError:
+        return []
+    lines = blob.decode("utf-8", "replace").splitlines()
+    if size > REPORT_TAIL_BYTES and len(lines) > 1:
+        del lines[0]                      # sliced mid-line by the seek
+    out = []
+    for line in reversed(lines):
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict):
+            out.append(rec)
+    return out
+
+
 def transcript_texts(path, limit=12):
     """Assistant prose from a subagent's own transcript, newest first.
 
@@ -86,26 +112,9 @@ def transcript_texts(path, limit=12):
     a lost report is recoverable rather than gone.
     """
     out = []
-    if not path:
-        return out
-    try:
-        with open(path, "rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            size = fh.tell()
-            fh.seek(max(0, size - REPORT_TAIL_BYTES))
-            blob = fh.read()
-    except OSError:
-        return out
-    lines = blob.decode("utf-8", "replace").splitlines()
-    if size > REPORT_TAIL_BYTES and len(lines) > 1:
-        del lines[0]                      # sliced mid-line by the seek
-    for line in reversed(lines):
+    for rec in tail_records(path):
         if len(out) >= limit:
             break
-        try:
-            rec = json.loads(line)
-        except ValueError:
-            continue
         if rec.get("type") != "assistant":
             continue
         msg = rec.get("message")
@@ -122,6 +131,42 @@ def transcript_texts(path, limit=12):
         if text.strip():
             out.append(text.strip())
     return out
+
+
+def transcript_handback(path):
+    """The report a background agent handed back on its final turn, or None.
+
+    Background subagents return through the harness's `SubagentHandback`
+    tool: the report is that call's `message`, and the tool's own result says
+    it was delivered to the caller. The turn ends on that tool call, so
+    SubagentStop carries no `last_assistant_message` and the newest prose in
+    the transcript is mid-work narration. Reading prose alone turned every
+    such delivery into a false REPORT RECOVERED / NOT DELIVERED (81 of 100
+    delivery findings in the ledgers this was fixed against).
+
+    Only a handback that is the agent's newest action counts: a resumed agent
+    that stopped without handing back has not delivered on this run.
+    """
+    for rec in tail_records(path):
+        msg = rec.get("message")
+        body = msg.get("content") if isinstance(msg, dict) else None
+        if rec.get("type") == "user":
+            if isinstance(body, list) and body and all(
+                    isinstance(b, dict) and b.get("type") == "tool_result" for b in body):
+                continue                  # the handback's own result
+            return None                   # a new prompt: a later run began
+        if rec.get("type") != "assistant" or not isinstance(body, list):
+            continue
+        for b in body:
+            if (isinstance(b, dict) and b.get("type") == "tool_use"
+                    and b.get("name") == "SubagentHandback"):
+                text = (b.get("input") or {}).get("message")
+                return text.strip() if isinstance(text, str) and text.strip() else None
+        if any(isinstance(b, dict) and (b.get("type") == "tool_use"
+               or (b.get("type") == "text" and (b.get("text") or "").strip()))
+               for b in body):
+            return None                   # the agent acted after any handback
+    return None
 
 
 def transcript_usage(path, skip_sidechain=False):
@@ -232,6 +277,27 @@ def record_stop(n, payload, d, now):
            or payload.get("result") or payload.get("response") or "")
     msg = msg.strip() if isinstance(msg, str) else ""
     delivered = substantive(msg)
+    tpath = payload.get("agent_transcript_path")
+
+    # A handback is a delivery the harness already made. Check it once per
+    # transcript size, like the prose scan below: stops re-fire.
+    if not delivered and tpath:
+        try:
+            size = os.path.getsize(tpath)
+        except OSError:
+            size = -1
+        if size != n.get("handback_size"):
+            n["handback_size"] = size
+            handed = transcript_handback(tpath)
+            if handed:
+                n["result"] = handed[-1200:]
+                n["report_path"] = write_report(d, n, handed)
+                n["reported_at"] = n.get("reported_at") or now
+                n["report_status"] = "delivered"
+                record_usage(n, tpath)
+                return
+        elif n.get("report_status") == "delivered":
+            return
 
     prior = n.get("result") or ""
     best = msg if delivered and (looks_like_report(msg)
@@ -240,7 +306,6 @@ def record_stop(n, payload, d, now):
     # once per size of it. Stops re-fire up to 18 times, and an agent that
     # never uses a RETURN block (a plain `general-purpose` one) would otherwise
     # re-read half a megabyte inside the ledger lock on every one of them.
-    tpath = payload.get("agent_transcript_path")
     if not looks_like_report(best) and tpath:
         try:
             size = os.path.getsize(tpath)
@@ -679,12 +744,22 @@ def whoami(state, payload):
     return aid
 
 
-def touch_file(n, path):
+# Tools that change a file. Only two of these on one path can conflict at
+# merge; reads of a shared contract are the design, not a collision.
+WRITE_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+
+
+def touch_file(n, path, wrote=False):
     if not path:
         return
     if path not in n["files"]:
         n["files"].append(path)
         del n["files"][:-40]
+    if wrote:
+        writes = n.setdefault("writes", [])
+        if path not in writes:
+            writes.append(path)
+            del writes[:-40]
     n["last_file"] = path
 
 
@@ -731,7 +806,8 @@ def apply(state, payload, d=None):
         n["tools"][tool] = n["tools"].get(tool, 0) + 1
         n["last_tool"] = tool
         ti = payload.get("tool_input") or {}
-        touch_file(n, ti.get("file_path") or ti.get("notebook_path"))
+        touch_file(n, ti.get("file_path") or ti.get("notebook_path"),
+                   wrote=tool in WRITE_TOOLS and ev == "PostToolUse")
         if ev == "PostToolUseFailure":
             n["tools"]["!failed"] = n["tools"].get("!failed", 0) + 1
 
