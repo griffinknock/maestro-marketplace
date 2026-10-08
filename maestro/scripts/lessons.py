@@ -495,8 +495,17 @@ def tweak(note, cids=(), session_id=None, d=None):
                 f.write("# Maestro tweak requests\n\nChanges to Maestro itself, found "
                         "while using it. Fix in maestro-marketplace, then tick the box.\n\n")
             f.write(line + "\n")
+    unmarked = []
     for cid in cids:
-        mark(cid, "tweak", d=d)
+        try:
+            mark(cid, "tweak", d=d)
+        except RuntimeError:
+            unmarked.append(cid)
+    if unmarked:
+        # The line is written; re-running `tweak` would duplicate it.
+        raise RuntimeError(f"tweak recorded, but these candidates were not marked: "
+                           f"{', '.join(unmarked)} — run `lessons.py mark <id> --status "
+                           f"tweak` for each")
     return line
 
 

@@ -91,7 +91,7 @@ click action.
 | Indented agent tree | Agent panel, via `subagentStatusLine` — nesting, tier colour, context meter, elapsed |
 | Two-row status line | Model · project · branch · cost, then context · agent census · `depth N/5` · board link. Also persists each `rate_limits` reading to `usage.json` for sweep pacing |
 | Board | `http://127.0.0.1:7717` — fan-out DAG, lanes, worktrees, screenshots |
-| Ledger | `.claude/maestro/<session>/{events.jsonl,state.json}` at the project root, one per session |
+| Ledger | `.claude/maestro/<session>/{events.jsonl,state.json}`, one per session, pinned where the conductor starts (its project root, or its own worktree if it runs in one); every subagent's hooks, worktree builders included, land there via `~/.claude/maestro/sessions/<session>` |
 | Token accounting | Per-agent and conductor spend from the transcripts, on the board and lanes |
 | Phase-boundary handoffs | `/handoff` writes a validated `HANDOFF.md`, then the session is cleared |
 | Re-check | Speaks only with news — an undelivered report, a silent agent, a repeated failure, a file collision, depth 5. Re-delivers swallowed reports as digest + pointer |
@@ -236,7 +236,8 @@ context, so the budget is **silence, unless there is a finding**.
 - **A stalled agent.** An agent with no sign of life for `MAESTRO_STALL_SECONDS`
   (default `600`, ten minutes): no tool call and no write to its own
   transcript. A write to the transcript counts as life, so a long-running
-  step that is still writing is not a stall. It fires once per agent. Idle
+  step that is still writing is not a stall; inside one tool call (a long
+  Bash, a Codex run) the limit doubles. It fires once per agent. Idle
   teammates are skipped.
 - **The same agent type failing twice.**
 - **Two live agents writing the same file.**
@@ -649,7 +650,7 @@ so one orphaned by a deleted session dir dies on its own.
                            (`tokens`, `usage`)
     reports/<agent-id>.md  the full report, kept whether or not the harness
                            managed to deliver it
-    recheck.json           dispatch-batch bookkeeping and findings already said
+    recheck.json           findings already said, so none repeats
     caffeinate.pid         sleep assertion held while agents run
     question.json          pending blocking question
   shots/                   visual-reviewer screenshots
@@ -667,6 +668,8 @@ so one orphaned by a deleted session dir dies on its own.
     rejected.jsonl         append-only, tracked in the store's own git repo
   lessons-approved.jsonl   the approvals ledger ($MAESTRO_LESSONS_APPROVALS)
   tweaks.md                Maestro changes requested via `lessons.py tweak`
+  sessions/<session>       where that session's ledger is pinned
+                           ($MAESTRO_SESSIONS_DIR; pruned after 30 days)
   usage.json               latest statusline rate-limit snapshot, read by
                            pace.py/sweep_state.py
 

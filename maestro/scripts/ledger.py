@@ -545,45 +545,78 @@ def tier_of(agent_type, model=None):
     return _TIER.get(canon_type(agent_type), "sonnet")
 
 
-def session_ledger(cwd, sid):
-    """The outermost existing `.claude/maestro/<sid>` above `cwd`, or None.
+def sessions_dir():
+    o = os.environ.get("MAESTRO_SESSIONS_DIR")
+    return Path(o) if o else Path.home() / ".claude" / "maestro" / "sessions"
 
-    One session, one ledger. A builder's hooks fire with its worktree as cwd,
-    and a worktree root has its own `.git`, so resolving from cwd alone gave
-    every builder a private ledger the conductor never read: no stall,
-    collision or delivery check could see it, and its start and stop landed
-    in different files — the source of the phantom "running" agents.
-    """
+
+def project_root(cwd):
+    """The nearest directory above `cwd` holding `.git` or `.claude` — where
+    the board, notify, the statusline and /tree look for a ledger."""
     p = Path(cwd or os.getcwd()).resolve()
-    found = None
     for parent in [p, *p.parents]:
-        d = parent / ".claude" / "maestro" / sid
-        if d.is_dir():
-            found = d
-    return found
+        if (parent / ".git").exists() or (parent / ".claude").is_dir():
+            return parent
+    return p
+
+
+def outside_worktrees(cwd):
+    """`R/.claude/worktrees/<name>/...` -> `R`; anything else unchanged."""
+    parts = Path(cwd or os.getcwd()).resolve().parts
+    for i in range(len(parts) - 2, 0, -1):
+        if parts[i] == ".claude" and parts[i + 1] == "worktrees":
+            return Path(*parts[:i])
+    return Path(*parts)
+
+
+def session_ledger(sid):
+    """The ledger dir this session's conductor pinned, or None.
+
+    One session, one ledger. Resolving it from each hook's cwd gave every
+    builder a private ledger inside its worktree (a worktree root has its own
+    `.git`): the conductor never saw those agents, and a start and stop
+    landing in different ledgers left phantom "running" agents. So the
+    conductor's first event pins the location in a registry, and every later
+    event — any agent, any cwd, a `cd ..` included — reads it back.
+    """
+    try:
+        d = Path((sessions_dir() / sid).read_text().strip())
+    except OSError:
+        return None
+    return d if d.is_dir() else None
+
+
+def _register(sid, d, ev):
+    reg = sessions_dir()
+    try:
+        reg.mkdir(parents=True, exist_ok=True)
+        tmp = reg / f".{sid}.tmp"
+        tmp.write_text(str(d))
+        tmp.replace(reg / sid)
+        if ev == "SessionStart":          # keep the registry small
+            cutoff = time.time() - 30 * 86400
+            for f in reg.iterdir():
+                if f.stat().st_mtime < cutoff:
+                    f.unlink()
+    except OSError:
+        pass
 
 
 def home(payload):
     """Per-session state directory, inside the project so worktrees can find it."""
     sid = (payload.get("session_id") or "nosession")[:8]
-    base = payload.get("cwd") or os.getcwd()
-    existing = session_ledger(base, sid)
-    if existing is not None:
-        base = str(existing.parent.parent.parent)
-    else:
-        # First event of the session: the project root, climbing out of a
-        # `.claude/worktrees/<name>` checkout rather than stopping at its .git.
-        p = Path(base).resolve()
-        parts = p.parts
-        if ".claude" in parts:
-            i = len(parts) - 1 - parts[::-1].index(".claude")
-            if i + 1 < len(parts) and parts[i + 1] == "worktrees":
-                p = Path(*parts[:i])
-        for parent in [p, *p.parents]:
-            if (parent / ".git").exists() or (parent / ".claude").is_dir():
-                base = str(parent)
-                break
-    d = Path(base) / ".claude" / "maestro" / sid
+    cwd = payload.get("cwd") or os.getcwd()
+    d = session_ledger(sid)
+    if d is None:
+        if payload.get("agent_id"):
+            # Nothing pinned (a session from before the registry). A subagent
+            # in a worktree belongs to the project, not to its checkout.
+            d = project_root(outside_worktrees(cwd)) / ".claude" / "maestro" / sid
+        else:
+            d = project_root(cwd) / ".claude" / "maestro" / sid
+            d.mkdir(parents=True, exist_ok=True)
+            _register(sid, d, payload.get("hook_event_name"))
+    base = d.parent.parent.parent
     d.mkdir(parents=True, exist_ok=True)
     # Pointer so `/board` and the tree renderer find the newest session fast.
     try:
@@ -852,6 +885,7 @@ def apply(state, payload, d=None):
         else:
             n = state["nodes"][me]
             n["last_tool"] = tool
+            n["in_tool_since"] = now     # a long Bash call is not a stall
             if tool == "Bash":
                 n["description"] = (ti.get("description") or ti.get("command") or "")[:120]
 
@@ -859,6 +893,7 @@ def apply(state, payload, d=None):
         me = whoami(state, payload)
         n = state["nodes"][me]
         tool = payload.get("tool_name") or "?"
+        n.pop("in_tool_since", None)
         n["tools"][tool] = n["tools"].get(tool, 0) + 1
         n["last_tool"] = tool
         ti = payload.get("tool_input") or {}

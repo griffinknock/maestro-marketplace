@@ -413,6 +413,62 @@ def quiet_case():
     check("nothing said", not c.msgs, c.msgs)
 
 
+def conductor_in_worktree_case():
+    """A conductor running inside a worktree keeps its ledger there, where the
+    board, notify and /tree look — and its builders' hooks still reach it."""
+    print("\n=== conductor inside a worktree ===")
+    ws = workspace()
+    (ws / ".git").mkdir()
+    feat = ws / ".claude" / "worktrees" / "feat"
+    feat.mkdir(parents=True)
+    (feat / ".git").write_text("gitdir: elsewhere\n")
+    c = Conductor(PLUGIN, feat, "aaaa9998-0000-0000-0000-00000000000a")
+    c.fire(hook_event_name="SessionStart", source="startup")
+    ids = c.dispatch(1, kind="builder", names=["builder-y"])
+    wt = ws / ".claude" / "worktrees" / "agent-y"
+    wt.mkdir(parents=True)
+    (wt / ".git").write_text("gitdir: elsewhere\n")
+    c.fire(hook_event_name="SubagentStop", agent_id=ids["builder-y"], agent_type="builder-y",
+           cwd=str(wt), last_assistant_message=report_text("builder-y"))
+    check("ledger and pointer sit in the conductor's worktree",
+          (feat / ".claude" / "maestro" / "current").is_file() and c.dir.is_dir())
+    check("the sibling worktree's stop reached it",
+          c.state()["nodes"].get(ids["builder-y"], {}).get("status") == "done")
+    check("no ledger at the main root or in the builder's worktree",
+          not (ws / ".claude" / "maestro").exists() and not (wt / ".claude" / "maestro").exists())
+
+
+def cd_up_case():
+    """A conductor command run one directory up does not move the ledger."""
+    print("\n=== a cd .. does not move the ledger ===")
+    ws = workspace()
+    repo = ws / "repo"
+    (repo / ".git").mkdir(parents=True)
+    c = Conductor(PLUGIN, repo, "aaaa9999-0000-0000-0000-00000000000a")
+    c.fire(hook_event_name="SessionStart", source="startup")
+    ids = c.dispatch(1, names=["scout-up"])
+    c.fire(hook_event_name="PostToolUse", tool_name="Bash", cwd=str(ws),
+           tool_input={"command": "ls"}, tool_response={"stdout": ""})
+    c.finish(ids["scout-up"], "scout-up")
+    check("no second ledger above the repo", not (ws / ".claude" / "maestro").exists())
+    check("the stop still landed", c.state()["nodes"][ids["scout-up"]].get("status") == "done")
+
+
+def long_tool_case():
+    """An agent inside one long tool call gets the tool's timeout on top."""
+    print("\n=== stall: a long tool call is not a stall ===")
+    ws = workspace()
+    c = Conductor(PLUGIN, ws, "aaaa999a-0000-0000-0000-00000000000a")
+    c.fire(hook_event_name="SessionStart", source="startup")
+    ids = c.dispatch(1, kind="codex", names=["codex-run"])
+    aid = ids["codex-run"]
+    c.fire(hook_event_name="PreToolUse", tool_name="Bash", agent_id=aid,
+           agent_type="codex-run", tool_input={"command": "codex exec -"})
+    age_node(c, aid, 700)
+    c.tool_call()
+    check("no stall while its Bash call runs", not c.msgs, c.msgs)
+
+
 def main():
     tokens_case()
     digest_case()
@@ -424,6 +480,9 @@ def main():
     phantom_case()
     stall_case()
     quiet_case()
+    conductor_in_worktree_case()
+    cd_up_case()
+    long_tool_case()
     print("\n  " + ("PASS" if not FAILURES else f"FAIL ({len(FAILURES)})"))
     return 1 if FAILURES else 0
 

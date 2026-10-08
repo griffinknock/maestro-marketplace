@@ -33,7 +33,9 @@ ENV = {**os.environ, "MAESTRO_CAFFEINATE": "0", "MAESTRO_QUIET": "1",
        # Off by default so a replay never writes a candidate into the real
        # ~/.claude/maestro/lessons store; lessons_capture_units.py turns it
        # back on explicitly, scoped to its own temp store dir.
-       "MAESTRO_LESSONS": "0"}
+       "MAESTRO_LESSONS": "0",
+       # The session registry (ledger.py) stays out of ~/.claude too.
+       "MAESTRO_SESSIONS_DIR": tempfile.mkdtemp(prefix="maestro-sessions-")}
 
 # Which events each script is actually wired to in maestro/hooks/hooks.json.
 # Replaying a wiring that does not ship would prove nothing.
@@ -56,6 +58,8 @@ class Conductor:
     def __init__(self, scripts, repo, sid, legacy=False):
         self.scripts, self.repo, self.sid = Path(scripts), Path(repo), sid
         self.legacy, self.msgs, self.clock = legacy, [], 0.0
+        # A fresh session: forget any ledger a replay with this id pinned.
+        (Path(ENV["MAESTRO_SESSIONS_DIR"]) / sid[:8]).unlink(missing_ok=True)
 
     @property
     def dir(self):

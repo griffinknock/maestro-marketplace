@@ -58,10 +58,13 @@ try:
 except Exception:
     _lessons = None
 try:
-    from ledger import last_alive
+    from ledger import last_alive, session_ledger
 except Exception:
     def last_alive(state, n):
         return float(n.get("last_activity") or n.get("started") or 0)
+
+    def session_ledger(sid):
+        return None
 
 DEBUG = os.environ.get("MAESTRO_DEBUG") == "1"
 OFF = os.environ.get("MAESTRO_REORCH") == "0"
@@ -77,17 +80,24 @@ CAPTURE_KINDS = ("collide", "fail", "depth5")
 
 
 def state_dir(payload):
-    """This session's ledger dir — the outermost one, as ledger.home() picks."""
+    """This session's ledger dir — the one its conductor pinned (ledger.py).
+
+    Never the workspace-global `.claude/maestro/current` pointer: the newest
+    session owns that, and reading it made a conductor inherit a concurrent
+    session's agents.
+    """
     sid = (payload.get("session_id") or "")[:8]
     if not sid:
         return None
+    d = session_ledger(sid)
+    if d is not None and (d / "state.json").is_file():
+        return d
     p = Path(payload.get("cwd") or ".").resolve()
-    found = None
     for parent in [p, *p.parents]:
         d = parent / ".claude" / "maestro" / sid
         if (d / "state.json").is_file():
-            found = d
-    return found
+            return d
+    return None
 
 
 def load_said(d):
@@ -196,7 +206,10 @@ def check(state, now):
         if float(n.get("idle_at") or 0) >= last:
             continue
         since = now - last
-        if since > STALL_SECONDS:
+        # Inside one tool call (a 10-minute Bash, a Codex run) there is
+        # nothing to write; give it the tool's own timeout on top.
+        limit = STALL_SECONDS * 2 if n.get("in_tool_since") else STALL_SECONDS
+        if since > limit:
             f.append((f"stall:{n.get('id')}",
                       f"{who(n)}{where(state, n)} has shown no activity for "
                       f"{int(since / 60)}m (no tool call, no transcript write) — "

@@ -17,10 +17,12 @@ job by hand.
    installed` and stop.
 
 2. **Write the brief to a file**, outside the worktree so it is never
-   committed:
+   committed. Shell variables do not survive between Bash calls, so every
+   block below starts by recomputing the same `out` path from the worktree
+   name:
 
    ```bash
-   out=$(mktemp -d "${TMPDIR:-/tmp}/maestro-codex.XXXXXX")
+   out="${TMPDIR:-/tmp}/maestro-codex-$(basename "$PWD")"; mkdir -p "$out"
    cat > "$out/brief.md" <<'BRIEF'
    <your caller's brief, verbatim, then:>
    Work only inside this directory. Do not commit, push, or switch branches.
@@ -31,14 +33,17 @@ job by hand.
 3. **Run Codex** — one foreground Bash call with `timeout: 600000`:
 
    ```bash
+   out="${TMPDIR:-/tmp}/maestro-codex-$(basename "$PWD")"
    codex exec -C "$PWD" -s workspace-write -o "$out/last.md" - < "$out/brief.md" > "$out/log.txt" 2>&1; echo "exit=$?"
    ```
 
    - **Review mode** (the brief asks for a review, not a change): use
      `-s read-only` instead, and skip step 5.
    - Add `-m <model>` only when the brief names a Codex model.
-   - Never read `log.txt` whole. Read `$out/last.md`; on a non-zero exit or
-     an empty `last.md`, read only `tail -40 "$out/log.txt"`.
+   - Never read `log.txt` whole. Read `last.md` in that directory; on a
+     non-zero exit or an empty `last.md`, read only `tail -40` of `log.txt`.
+   - The Bash call caps at 10 minutes. Size a brief to fit; if Codex is cut
+     off, report it as `blocked` with the log tail rather than re-running.
    - Codex's sandbox has no network by default. If the brief's check needs
      the network, run that check yourself in step 4, not inside Codex.
 
