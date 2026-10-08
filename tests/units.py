@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from replay import Conductor, workspace, PLUGIN, ENV, IDLE_FRAME
+from replay import Conductor, workspace, PLUGIN, ENV, IDLE_FRAME, report_text
 
 FAILURES = []
 
@@ -160,6 +160,35 @@ def handoff_case():
     check("oversize fence named", "fenced block" in out)
     shutil.rmtree(ws, ignore_errors=True)
 
+    # Multi-repo workspace: the root is not a repo, its children are.
+    root = Path(tempfile.mkdtemp(prefix="maestro-handoff-multi-"))
+    for name in ("alpha", "beta"):
+        repo = root / name
+        repo.mkdir()
+        subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"], check=True)
+        (repo / "f.txt").write_text(name)
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@example.com",
+                        "-c", "user.name=t", "commit", "-qm", "init"], check=True)
+    subprocess.run(["git", "-C", str(root / "beta"), "branch", "feat/only-beta"], check=True)
+
+    def multi(branch):
+        h = write_lines(root / ".claude" / "maestro" / "HANDOFF.md", [
+            "# Handoff — multi", "## Goal", "x", "## Decisions", "- y",
+            "## World state", f"- branch: {branch}", "## Next", "1. go",
+        ])
+        return subprocess.run([sys.executable, str(script), str(h)],
+                              capture_output=True, text=True, cwd=root)
+
+    r = multi("feat/only-beta")
+    check("non-repo root: branch in second child repo passes",
+          r.returncode == 0 and "HANDOFF PASS" in r.stdout, r.stdout.strip())
+    r = multi("feat/nowhere")
+    check("non-repo root: branch nowhere fails naming checked repos",
+          r.returncode == 1 and "feat/nowhere" in r.stdout
+          and "alpha" in r.stdout and "beta" in r.stdout, r.stdout.strip())
+    shutil.rmtree(root, ignore_errors=True)
+
 
 def handback_rec(tid, message):
     return json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
@@ -285,6 +314,166 @@ def workflow_case():
           flagged[0][:120] if flagged else "")
 
 
+def live_nodes(state):
+    return [n for n in state["nodes"].values()
+            if n["id"] != "root" and n.get("status") in ("running", "spawning")]
+
+
+def worktree_ledger_case():
+    """A builder's hooks land in the conductor's ledger, not its worktree's."""
+    print("\n=== one ledger per session, worktrees included ===")
+    ws = workspace()
+    (ws / ".git").mkdir()
+    c = Conductor(PLUGIN, ws, "aaaa9994-0000-0000-0000-00000000000a")
+    c.fire(hook_event_name="SessionStart", source="startup")
+    ids = c.dispatch(1, kind="builder", names=["builder-wt"])
+    wt = ws / ".claude" / "worktrees" / "agent-x1"
+    wt.mkdir(parents=True)
+    (wt / ".git").write_text("gitdir: elsewhere\n")      # a worktree's .git is a file
+    c.fire(hook_event_name="PostToolUse", tool_name="Edit", agent_id=ids["builder-wt"],
+           agent_type="builder-wt", cwd=str(wt), tool_input={"file_path": str(wt / "a.py")},
+           tool_response={"ok": True})
+    c.fire(hook_event_name="SubagentStop", agent_id=ids["builder-wt"], agent_type="builder-wt",
+           cwd=str(wt), last_assistant_message=report_text("builder-wt"))
+    check("no private ledger inside the worktree",
+          not (wt / ".claude" / "maestro").exists())
+    n = c.state()["nodes"].get(ids["builder-wt"], {})
+    check("the builder's edit and stop reached the conductor's ledger",
+          n.get("status") == "done" and n.get("tools", {}).get("Edit") == 1, n)
+
+
+def phantom_case():
+    """A stop for an agent this ledger never saw start is not adopted as running."""
+    print("\n=== no phantom agents from unmatched stops ===")
+    ws = workspace()
+    c = Conductor(PLUGIN, ws, "aaaa9995-0000-0000-0000-00000000000a")
+    c.fire(hook_event_name="SessionStart", source="startup")
+    wt = ws / ".claude" / "worktrees" / "big-pulls"
+    wt.mkdir(parents=True)
+    for i in range(3):
+        c.fire(hook_event_name="SubagentStop", agent_id=f"a1e4b5d634b7{i:05d}",
+               cwd=str(wt), last_assistant_message="done")
+    c.tool_call()
+    check("nothing counted as running", live_nodes(c.state()) == [], live_nodes(c.state()))
+    check("no message about them", not c.msgs, c.msgs)
+
+
+def age_node(c, aid, seconds):
+    sf = c.dir / "state.json"
+    st = json.loads(sf.read_text())
+    now = time.time()
+    st["nodes"][aid]["last_activity"] = now - seconds
+    st["nodes"][aid]["started"] = now - seconds - 10
+    sf.write_text(json.dumps(st))
+    return st
+
+
+def stall_case():
+    """Liveness counts transcript writes, not just tool calls."""
+    print("\n=== stall: transcript writes are signs of life ===")
+    ws = workspace()
+    c = Conductor(PLUGIN, ws, "aaaa9996-0000-0000-0000-00000000000a")
+    session_tr = ws / "projects" / f"{c.sid}.jsonl"
+    session_tr.parent.mkdir(parents=True)
+    session_tr.write_text("")
+    c.fire(hook_event_name="SessionStart", source="startup",
+           transcript_path=str(session_tr))
+    ids = c.dispatch(1, kind="surgeon", names=["surgeon-big"])
+    aid = ids["surgeon-big"]
+    agent_tr = session_tr.with_suffix("") / "subagents" / f"agent-{aid}.jsonl"
+    agent_tr.parent.mkdir(parents=True)
+    agent_tr.write_text("{}\n")                      # written just now
+    age_node(c, aid, 700)                            # past stall (600), before reap (900)
+    c.tool_call()
+    check("a growing transcript is not a stall",
+          not any("no activity" in m for m in c.msgs), c.msgs)
+
+    old = time.time() - 700
+    os.utime(agent_tr, (old, old))
+    age_node(c, aid, 700)
+    c.tool_call()
+    c.tool_call()
+    stalls = [m for m in c.msgs if "no activity" in m]
+    check("a silent agent is reported, once", len(stalls) == 1, c.msgs)
+
+
+def quiet_case():
+    """The retired coaching nudges stay silent."""
+    print("\n=== no serial or inline coaching ===")
+    ws = workspace()
+    c = Conductor(PLUGIN, ws, "aaaa9997-0000-0000-0000-00000000000a")
+    c.fire(hook_event_name="SessionStart", source="startup")
+    for i in range(3):                                # three solo dispatches
+        ids = c.dispatch(1, names=[f"scout-q{i}"])
+        time.sleep(2.2)
+        c.tool_call()
+        c.finish(ids[f"scout-q{i}"], f"scout-q{i}")
+    for _ in range(10):                               # then work by hand
+        c.tool_call()
+    check("nothing said", not c.msgs, c.msgs)
+
+
+def conductor_in_worktree_case():
+    """A conductor running inside a worktree keeps its ledger there, where the
+    board, notify and /tree look — and its builders' hooks still reach it."""
+    print("\n=== conductor inside a worktree ===")
+    ws = workspace()
+    (ws / ".git").mkdir()
+    feat = ws / ".claude" / "worktrees" / "feat"
+    feat.mkdir(parents=True)
+    (feat / ".git").write_text("gitdir: elsewhere\n")
+    c = Conductor(PLUGIN, feat, "aaaa9998-0000-0000-0000-00000000000a")
+    c.fire(hook_event_name="SessionStart", source="startup")
+    ids = c.dispatch(1, kind="builder", names=["builder-y"])
+    wt = ws / ".claude" / "worktrees" / "agent-y"
+    wt.mkdir(parents=True)
+    (wt / ".git").write_text("gitdir: elsewhere\n")
+    c.fire(hook_event_name="SubagentStop", agent_id=ids["builder-y"], agent_type="builder-y",
+           cwd=str(wt), last_assistant_message=report_text("builder-y"))
+    check("ledger and pointer sit in the conductor's worktree",
+          (feat / ".claude" / "maestro" / "current").is_file() and c.dir.is_dir())
+    check("the sibling worktree's stop reached it",
+          c.state()["nodes"].get(ids["builder-y"], {}).get("status") == "done")
+    check("no ledger at the main root or in the builder's worktree",
+          not (ws / ".claude" / "maestro").exists() and not (wt / ".claude" / "maestro").exists())
+
+
+def cd_up_case():
+    """A conductor command run one directory up does not move the ledger."""
+    print("\n=== a cd .. does not move the ledger ===")
+    ws = workspace()
+    repo = ws / "repo"
+    (repo / ".git").mkdir(parents=True)
+    c = Conductor(PLUGIN, repo, "aaaa9999-0000-0000-0000-00000000000a")
+    c.fire(hook_event_name="SessionStart", source="startup")
+    ids = c.dispatch(1, names=["scout-up"])
+    c.fire(hook_event_name="PostToolUse", tool_name="Bash", cwd=str(ws),
+           tool_input={"command": "ls"}, tool_response={"stdout": ""})
+    c.finish(ids["scout-up"], "scout-up")
+    check("no second ledger above the repo", not (ws / ".claude" / "maestro").exists())
+    check("the stop still landed", c.state()["nodes"][ids["scout-up"]].get("status") == "done")
+    other = ws / "other"
+    (other / ".git").mkdir(parents=True)
+    c.fire(hook_event_name="SessionStart", source="resume", cwd=str(other))
+    check("a resume from another directory re-pins there",
+          (other / ".claude" / "maestro" / c.sid[:8] / "state.json").is_file())
+
+
+def long_tool_case():
+    """An agent inside one long tool call gets the tool's timeout on top."""
+    print("\n=== stall: a long tool call is not a stall ===")
+    ws = workspace()
+    c = Conductor(PLUGIN, ws, "aaaa999a-0000-0000-0000-00000000000a")
+    c.fire(hook_event_name="SessionStart", source="startup")
+    ids = c.dispatch(1, kind="codex", names=["codex-run"])
+    aid = ids["codex-run"]
+    c.fire(hook_event_name="PreToolUse", tool_name="Bash", agent_id=aid,
+           agent_type="codex-run", tool_input={"command": "codex exec -"})
+    age_node(c, aid, 700)
+    c.tool_call()
+    check("no stall while its Bash call runs", not c.msgs, c.msgs)
+
+
 def main():
     tokens_case()
     digest_case()
@@ -292,6 +481,13 @@ def main():
     handback_case()
     collide_case()
     workflow_case()
+    worktree_ledger_case()
+    phantom_case()
+    stall_case()
+    quiet_case()
+    conductor_in_worktree_case()
+    cd_up_case()
+    long_tool_case()
     print("\n  " + ("PASS" if not FAILURES else f"FAIL ({len(FAILURES)})"))
     return 1 if FAILURES else 0
 

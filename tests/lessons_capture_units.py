@@ -85,8 +85,11 @@ def dedupe_case():
         check("first capture returns an id", bool(cid1))
         check("duplicate (same session+fingerprint) is skipped", cid2 is None)
         check("distinct fingerprint creates a new candidate", bool(cid3))
-        check("distinct session creates a new candidate", bool(cid4))
-        check("exactly 3 candidates landed", len(rows) == 3, f"got {len(rows)}")
+        check("another session's capture is skipped while one is pending", cid4 is None)
+        check("exactly 2 candidates landed", len(rows) == 2, f"got {len(rows)}")
+        lessons.mark(cid1, "reviewed", d)
+        cid5 = lessons.capture_finding("sess-b", "/tmp", "stall:x1:1", "after review")
+        check("once reviewed, the fingerprint can be captured again", bool(cid5))
         check("all candidates source=finding",
               all(r["source"] == "finding" for r in rows))
         check("truncated to <=300 chars",
@@ -248,14 +251,15 @@ def _final_payload(c):
 
 
 def integration_case():
-    """A swallowed report -> REPORT RECOVERED, and a lesson candidate lands.
+    """A swallowed report plus a collision -> both shown; only the collision
+    becomes a lesson candidate (a lost report is the harness's failure).
 
     Also proves capture never perturbs what the conductor is shown: the exact
     same triggering event, replayed against three lessons configurations
     (a real store, MAESTRO_LESSONS=0, and an unwritable store), must print the
     byte-identical thing on stdout every time.
     """
-    print("\n=== integration: swallowed report feeds the lessons queue ===")
+    print("\n=== integration: a collision feeds the lessons queue, a lost report does not ===")
     sid = "eeee5555-0000-0000-0000-00000000000e"
     with _EnvOverride({}):
         ws = workspace()
@@ -270,6 +274,10 @@ def integration_case():
         time.sleep(2.5)
         c.tool_call()
         c.finish(ids["scout-long"], "scout-long", last=IDLE_FRAME, transcript=tr)
+        for n, aid in c.dispatch(2, kind="builder", names=["builder-a", "builder-b"]).items():
+            c.fire(hook_event_name="PostToolUse", tool_name="Edit", agent_id=aid,
+                   agent_type=n, tool_input={"file_path": "/w/shared.py"},
+                   tool_response={"ok": True})
         time.sleep(5.5)
 
     pre = c.dir / "recheck.json"
@@ -320,6 +328,7 @@ def integration_case():
     check("the triggering call produced output",
           all(bool(s.strip()) for s in stdouts.values()))
     check("REPORT RECOVERED shows up", "REPORT RECOVERED" in stdouts["capture-on"])
+    check("the collision shows up", "both live on shared.py" in stdouts["capture-on"])
     check("stdout is byte-identical: on vs disabled",
           stdouts["capture-on"] == stdouts["capture-disabled"])
     check("stdout is byte-identical: on vs unwritable",
@@ -335,9 +344,8 @@ def integration_case():
     finding_rows = [r for r in rows if r["source"] == "finding"]
     check("a candidate landed in the real store", len(finding_rows) >= 1,
           f"rows={rows}")
-    check("its fingerprint is the delivery-shaped one",
-          any((r.get("fingerprint") or "").startswith("delivery:recovered:")
-              for r in finding_rows),
+    check("it is the collision, and no delivery candidate was queued",
+          [r.get("fingerprint") for r in finding_rows] == ["collide"],
           f"rows={finding_rows}")
     check("its session matches the conductor's",
           all(r.get("session") == sid for r in finding_rows))
@@ -468,52 +476,99 @@ def correction_key_case():
     shutil.rmtree(d, ignore_errors=True)
 
 
-def fingerprint_kind_case():
-    print("\n=== _lesson_fingerprint keys non-report findings by kind, not wave ===")
-    check("serial:6 -> serial", reorchestrate._lesson_fingerprint("serial:6", False) == "serial")
-    check("inline:12 -> inline", reorchestrate._lesson_fingerprint("inline:12", False) == "inline")
-    check("depth5 stays depth5", reorchestrate._lesson_fingerprint("depth5", False) == "depth5")
-    check("report:abc:missing (is_report) -> delivery:missing:abc",
-          reorchestrate._lesson_fingerprint("report:abc:missing", True) == "delivery:missing:abc")
-
-
-def wave_dedupe_case():
-    print("\n=== capture_lessons dedupes reorch findings by kind across waves ===")
+def capture_kinds_case():
+    print("\n=== capture_lessons queues only conductor-behaviour kinds ===")
     d = tmp_store()
     os.environ["MAESTRO_LESSONS_DIR"] = str(d)
     try:
-        payload_a = {"session_id": "sess-wave-a", "cwd": "/tmp", "tool_use_id": None}
-        # Same kind of finding fired at two different wave numbers within one
-        # session — the reorch-internal fingerprint is wave-scoped, so this is
-        # exactly what a live session produces on repeated serial drift.
-        reorchestrate.capture_lessons(
-            payload_a, [("serial:3", "three dispatches in a row of one agent each.", False)])
-        reorchestrate.capture_lessons(
-            payload_a, [("serial:4", "three dispatches in a row of one agent each.", False)])
-        reorchestrate.capture_lessons(
-            payload_a, [("serial:5", "three dispatches in a row of one agent each.", False)])
-
-        rows = lessons.load_candidates(d)
-        serial_a = [r for r in rows if (r.get("fingerprint") or "") == "serial"]
-        check("exactly one pending candidate for the kind, across three waves",
-              len(serial_a) == 1, f"got {len(rows)}: {rows}")
-        check("its session is the one that produced it",
-              serial_a and serial_a[0].get("session") == "sess-wave-a", serial_a)
-
-        # A second session hitting the same kind gets its own candidate — the
-        # dedupe is per (session, fingerprint), never global.
-        payload_b = {"session_id": "sess-wave-b", "cwd": "/tmp", "tool_use_id": None}
-        reorchestrate.capture_lessons(
-            payload_b, [("serial:3", "three dispatches in a row of one agent each.", False)])
-        rows = lessons.load_candidates(d)
-        serial_all = [r for r in rows if (r.get("fingerprint") or "") == "serial"]
-        check("a second session produces a second candidate for the same kind",
-              len(serial_all) == 2, f"got {len(rows)}: {rows}")
-        check("the second candidate belongs to the second session",
-              any(r.get("session") == "sess-wave-b" for r in serial_all), serial_all)
+        payload = {"session_id": "sess-kinds", "cwd": "/tmp", "tool_use_id": None}
+        reorchestrate.capture_lessons(payload, [
+            ("stall:a1", "a1 has shown no activity for 11m"),
+            ("report:a2:missing", "REPORT NOT DELIVERED — a2"),
+            ("collide:/w/a.py", "x and y are both live on a.py"),
+            ("collide:/w/b.py", "x and y are both live on b.py"),
+            ("fail:builder:2", "builder has failed 2 times"),
+        ])
+        fps = sorted(r.get("fingerprint") for r in lessons.load_candidates(d))
+        check("stall and delivery are never queued; collide collapses to its kind",
+              fps == ["collide", "fail"], fps)
     finally:
         os.environ["MAESTRO_LESSONS_DIR"] = SAFE_STORE
         shutil.rmtree(d, ignore_errors=True)
+
+
+def cross_session_case():
+    print("\n=== one pending candidate per kind, across sessions ===")
+    d = tmp_store()
+    os.environ["MAESTRO_LESSONS_DIR"] = str(d)
+    try:
+        for i in range(3):
+            reorchestrate.capture_lessons(
+                {"session_id": f"sess-x{i}", "cwd": "/tmp", "tool_use_id": None},
+                [(f"collide:/w/{i}.py", "two live agents on one file")])
+        rows = lessons.load_candidates(d)
+        check("three sessions, one pending candidate", len(rows) == 1, rows)
+        lessons.mark(rows[0]["id"], "not-a-lesson", d)
+        reorchestrate.capture_lessons(
+            {"session_id": "sess-x9", "cwd": "/tmp", "tool_use_id": None},
+            [("collide:/w/9.py", "two live agents on one file")])
+        check("after review the kind queues again",
+              len(lessons.load_candidates(d)) == 2)
+    finally:
+        os.environ["MAESTRO_LESSONS_DIR"] = SAFE_STORE
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def rejected_kind_case():
+    print("\n=== a rejected kind is never queued again ===")
+    d = tmp_store()
+    os.environ["MAESTRO_LESSONS_DIR"] = str(d)
+    try:
+        lessons.reject("collide", "Always serialize same-file builders.", d)
+        cid = lessons.capture_finding("sess-r", "/tmp", "collide", "two live on a.py")
+        check("capture of a rejected kind is skipped", cid is None)
+        cid = lessons.capture_finding("sess-r", "/tmp", "fail", "builder failed twice")
+        check("other kinds still land", bool(cid))
+    finally:
+        os.environ["MAESTRO_LESSONS_DIR"] = SAFE_STORE
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def tweak_case():
+    print("\n=== tweak records a Maestro change and dequeues its candidates ===")
+    d = tmp_store()
+    tf = d.parent / f"{d.name}-tweaks.md"
+    os.environ["MAESTRO_LESSONS_DIR"] = str(d)
+    os.environ["MAESTRO_TWEAKS_FILE"] = str(tf)
+    try:
+        a = lessons.capture_finding("sess-t", "/tmp", "collide", "two live on a.py")
+        b = lessons.flag("sess-t", "the inline nudge fired while I ran the gate")
+        line = lessons.tweak("retire the inline nudge", [a, b], "sess-tweak-1234", d)
+        check("line is an unchecked item naming the candidates",
+              line.startswith("- [ ] retire the inline nudge") and a in line and b in line, line)
+        check("file has a header and the item",
+              tf.read_text().startswith("# Maestro tweak requests") and line in tf.read_text())
+        st = {r["id"]: r["status"] for r in lessons.load_candidates(d)}
+        check("both candidates marked tweak", st.get(a) == "tweak" and st.get(b) == "tweak", st)
+        check("open_tweaks counts it", len(lessons.open_tweaks(d)) == 1)
+        tf.write_text(tf.read_text().replace("- [ ] ", "- [x] "))
+        check("a ticked item is no longer open", lessons.open_tweaks(d) == [])
+        cid = lessons.capture_finding("sess-t2", "/tmp", "collide", "again")
+        check("the kind can queue again once its candidate left the queue", bool(cid))
+        r = subprocess.run([sys.executable, str(PLUGIN / "lessons.py"), "tweak",
+                            "--note", "x", "--candidates", "c-nope"],
+                           capture_output=True, text=True, env=os.environ.copy())
+        check("CLI refuses an unknown candidate id", r.returncode == 1, r.stderr)
+        try:
+            lessons.tweak("   ", [], None, d)
+            check("an empty note is refused", False)
+        except ValueError:
+            check("an empty note is refused", True)
+    finally:
+        os.environ.pop("MAESTRO_TWEAKS_FILE", None)
+        os.environ["MAESTRO_LESSONS_DIR"] = SAFE_STORE
+        shutil.rmtree(d, ignore_errors=True)
+        tf.unlink(missing_ok=True)
 
 
 def main():
@@ -528,8 +583,10 @@ def main():
     flag_disabled_case()
     control_chars_case()
     correction_key_case()
-    fingerprint_kind_case()
-    wave_dedupe_case()
+    capture_kinds_case()
+    cross_session_case()
+    rejected_kind_case()
+    tweak_case()
     integration_case()
     shutil.rmtree(SAFE_ROOT, ignore_errors=True)
     print("\n  " + ("PASS" if not FAILURES else f"FAIL ({len(FAILURES)})"))

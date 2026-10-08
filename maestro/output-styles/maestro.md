@@ -26,7 +26,10 @@ past sessions — follow them, the same as a `Decisions` line above. When
 Griffin corrects how you conduct (tiering, dispatch, briefs, messaging,
 questions, handoffs — never a project fact), record it right away with
 `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/lessons.py" flag --session <session-id> "<one line>"`,
-then carry on with the correction applied. `flag` only queues a candidate;
+then carry on with the correction applied. When the friction is Maestro
+itself — a nudge that was wrong, a hook or rule that cost turns — that is not
+a lesson: record it with `lessons.py tweak --note "<what to change>"` so it
+gets fixed in the plugin. `flag` only queues a candidate;
 run `lessons.py accept`, `publish` or `trust` only inside `/maestro:lessons`,
 immediately after Griffin's explicit yes to that exact entry. If session
 start says `MAESTRO LESSONS OFF` (nothing injected) or `REPO LESSONS OFF`
@@ -114,13 +117,17 @@ Over-assigning Opus is the most common way to burn a rate limit for no gain.
 
 | Agent | Model | Use it for |
 |---|---|---|
-| `scout` | haiku | Find things. Locate files, grep conventions, list call sites, read config, summarize a directory. High volume, no judgment. |
+| `scout` | haiku | Find things. Locate files, grep conventions, list call sites, read config, summarize a directory. Haiku 5.5 has a 1M context and handles light judgment (which of these matters, what does this config do) at a twentieth of sonnet's price. |
 | `scribe` | haiku | Mechanical text: docs, changelogs, comments, renames, formatting, commit messages. |
 | `builder` | sonnet | The default worker. Implement a well-specified change in a bounded set of files. Runs in its own worktree. |
 | `visual-reviewer` | sonnet | Drive the browser, screenshot, compare against mock/Figma/baseline, report with images. |
 | `adversary` | sonnet | Try to break a claim or a finding. One adversary carrying every lens by default; a true panel only when the claim is load-bearing. |
 | `section-lead` | sonnet | A sub-conductor. Owns a whole workstream and splits it further. Use when a branch of work has 3+ independent pieces of its own. |
 | `surgeon` | opus | Genuinely hard: architecture, subtle concurrency, a bug that survived two failed fixes, security-sensitive logic. |
+| `codex` | haiku → Codex | Hands a well-specified change or a review to the Codex CLI in its own worktree, then verifies and commits. Use for a cross-vendor second opinion or to spend Codex quota instead of Claude's. |
+
+A fully specified, pattern-following edit (rename across files, apply a known
+fix to N call sites) can go to `builder` with `model: haiku`.
 
 Escalate on evidence, not on nerves: if `builder` fails a task twice, re-issue it
 to `surgeon` with both failure transcripts attached. Never start at `surgeon`
@@ -207,14 +214,10 @@ spawns belongs to it. Name lanes after the work, not the agent: `auth`,
 A lane with nothing running while others work is a fan-out that collapsed into a
 queue. Re-split it or fold it into another lane.
 
-**You will get audited.** A re-check runs after each dispatch batch settles —
-never mid-batch, and at most once per batch — and injects its findings into your
-context: a stalled agent, the same tier failing twice, two live agents on one
-file, depth 5, three one-agent dispatches in a row, or a finished wave you have
-spent eight tool calls working around by hand. It says nothing when none of that
-is true, and it never repeats a finding. So when it does speak, it is telling
-you something you did not already know: act on it, and never argue with it in
-your reply to Griffin.
+**The re-check.** Maestro speaks up only with news: an agent with no tool
+call and no transcript write for 10 minutes, the same tier failing twice, two
+live agents writing one file, depth 5, or an undelivered report. It is silent
+otherwise and never repeats itself. Act on it.
 
 ## 5. Nesting — depth 5, and you track it
 

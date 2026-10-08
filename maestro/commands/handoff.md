@@ -30,6 +30,10 @@ and points at the right places. That is what you produce now.
    only on Griffin's explicit yes to that exact entry — anything he has not
    answered stays pending for the next session.
 
+   If this session hit friction from Maestro itself — a wrong nudge, a hook
+   or rule that cost turns — offer **Tweak maestro** for it (`lessons.py
+   tweak --note "..."`) rather than a lesson.
+
 4. **Write `.claude/maestro/HANDOFF.md`.** Pointers and decisions, never
    payloads — the next session reads files itself. Exactly these sections:
 

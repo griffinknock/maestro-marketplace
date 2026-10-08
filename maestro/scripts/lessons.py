@@ -35,6 +35,8 @@ Store layout ($MAESTRO_LESSONS_DIR, else ~/.claude/maestro/lessons/):
                      takes the latest status ("pending" by default).
   .dedupe/<hash>     per-session capture dedupe index (one fingerprint per
                      line), so capture never scans candidates.jsonl.
+  .dedupe/pending/<hash>  one marker per fingerprint with a pending
+                     candidate (holds its id); `mark` clears it.
   rejected.jsonl     append-only, tracked in the store's own git repo.
   .gitignore         written by `init`.
 Approvals ledger: `lessons-approved.jsonl` NEXT TO the store directory
@@ -47,7 +49,17 @@ Candidate record (creation):
    or null>", "tool_use_id": "<id or null>", "text": "<one line, <=300 chars>"}
 
 Candidate record (status change, appended later, same "id"):
-  {"id": "c-...", "status": "reviewed"|"not-a-lesson"|"accepted", "at": ...}
+  {"id": "c-...", "status": "reviewed"|"not-a-lesson"|"accepted"|"tweak", "at": ...}
+
+Capture skips a finding whose kind is rejected or already has a pending
+candidate from any session: one queued candidate per mechanic is enough to
+review it.
+
+Tweaks: when the real fix for a candidate is a change to Maestro itself (a
+nudge that was wrong, a hook or rule that cost turns), `tweak` appends an
+unchecked item to $MAESTRO_TWEAKS_FILE (else ~/.claude/maestro/tweaks.md) and
+marks the candidates `tweak`, so they leave the queue and never become a
+lesson. A maestro-marketplace session works the list and ticks items off.
 
 Rejected record:
   {"key": "<key>", "rule": "<drafted rule text>", "at": <epoch float>}
@@ -60,7 +72,9 @@ CLI:
   lessons.py init
   lessons.py flag --session SID "<one line>"
   lessons.py candidates [--pending] [--json]
-  lessons.py mark ID --status reviewed|not-a-lesson|accepted
+  lessons.py mark ID --status reviewed|not-a-lesson|accepted|tweak
+  lessons.py tweak --note "<what to change in Maestro>" [--candidates c-..,c-..]
+                   [--session SID]
   lessons.py reject --key KEY --rule "<drafted rule text>"
   lessons.py rejected [--json]
   lessons.py inject                     (SessionStart hook; reads stdin)
@@ -76,6 +90,7 @@ CLI:
 Env:
   MAESTRO_LESSONS_DIR        overrides the store directory
   MAESTRO_LESSONS_APPROVALS  overrides the approvals ledger path
+  MAESTRO_TWEAKS_FILE        overrides the tweak-request file
   MAESTRO_LESSONS=0          disable capture, flag and injection (tests/
                              replay.py sets this so a replay never touches
                              the real store). The explicit review commands
@@ -98,7 +113,7 @@ import lessons_check
 
 lc = lessons_check
 
-STATUSES = ("reviewed", "not-a-lesson", "accepted")
+STATUSES = ("reviewed", "not-a-lesson", "accepted", "tweak")
 CANDIDATES_FILE = "candidates.jsonl"
 REJECTED_FILE = "rejected.jsonl"
 LESSONS_FILE = lc.LESSONS_FILE
@@ -243,13 +258,49 @@ def _dedupe_path(d, session_id):
     return Path(d) / DEDUPE_DIR / h
 
 
+def _pending_marker(d, fp):
+    h = hashlib.sha256(fp.encode("utf-8")).hexdigest()[:24]
+    return Path(d) / DEDUPE_DIR / "pending" / h
+
+
+def _clear_pending(d, cid):
+    """Drop the pending marker that names `cid`, once it has a status."""
+    pdir = Path(d) / DEDUPE_DIR / "pending"
+    try:
+        for m in pdir.iterdir():
+            try:
+                if m.read_text(encoding="utf-8").strip() == cid:
+                    m.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _suppressed(d, fp):
+    """True when this finding kind is rejected or already awaiting review.
+
+    Before this check, every nudge minted a candidate: 245 in 31 sessions,
+    152 later marked not-a-lesson, and all 19 left pending at 0.5.2 were
+    repeats of three kinds filed after a lesson covering each existed.
+    """
+    if _pending_marker(d, fp).is_file():
+        return True
+    for r in load_rejected(d):
+        k = r.get("key") or ""
+        if k and (fp == k or fp.startswith(k + ":")):
+            return True
+    return False
+
+
 def capture_finding(session_id, cwd, fingerprint, text, tool_use_id=None):
     """Append a re-orchestration finding as a candidate lesson.
 
-    Skips silently if this session already captured this fingerprint (a
-    small per-session index — never a scan of candidates.jsonl). Never
-    blocks for more than ~0.1 s on a busy lock and never raises: a failure
-    here must never change what the caller prints or does.
+    Skips silently if this session already captured this fingerprint, if the
+    kind is rejected, or if a candidate with this fingerprint is already
+    pending from any session. Never blocks for more than ~0.1 s on a busy
+    lock and never raises: a failure here must never change what the caller
+    prints or does.
     """
     try:
         if not lessons_on():
@@ -266,12 +317,17 @@ def capture_finding(session_id, cwd, fingerprint, text, tool_use_id=None):
                 with open(idx, encoding="utf-8") as f:
                     if fp in {ln.rstrip("\n") for ln in f}:
                         return None
+            if fp is not None and _suppressed(d, fp):
+                return None
             with open(d / CANDIDATES_FILE, "a") as f:
                 f.write(json.dumps(rec) + "\n")
             if idx is not None:
                 idx.parent.mkdir(exist_ok=True)
                 with open(idx, "a", encoding="utf-8") as f:
                     f.write(fp + "\n")
+                pm = _pending_marker(d, fp)
+                pm.parent.mkdir(parents=True, exist_ok=True)
+                pm.write_text(rec["id"], encoding="utf-8")
         return rec["id"]
     except Exception:
         return None
@@ -354,6 +410,7 @@ def mark(cid, status, d=None):
     if not _append_line(d, CANDIDATES_FILE,
                         {"id": cid, "status": status, "at": time.time()}):
         raise RuntimeError("lessons store is busy — status not recorded; try again")
+    _clear_pending(d, cid)
 
 
 def reject(key, rule, d=None):
@@ -397,6 +454,59 @@ def load_rejected(d=None):
     except OSError:
         return []
     return out
+
+
+def tweaks_path(d=None):
+    override = os.environ.get("MAESTRO_TWEAKS_FILE")
+    if override:
+        return Path(override)
+    return (Path(d) if d else store_dir()).parent / "tweaks.md"
+
+
+def open_tweaks(d=None):
+    """Unchecked items in the tweak-request file."""
+    try:
+        lines = tweaks_path(d).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    return [ln for ln in lines if ln.startswith("- [ ] ")]
+
+
+def tweak(note, cids=(), session_id=None, d=None):
+    """Record a requested change to Maestro and take its candidates out of
+    the lesson queue. Returns the line written."""
+    note = lc.clean_one_line(note, 400)
+    if not note:
+        raise ValueError("a tweak needs a note saying what to change")
+    path = tweaks_path(d)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    meta = [time.strftime("%Y-%m-%d")]
+    if session_id:
+        meta.append(f"session {str(session_id)[:8]}")
+    if cids:
+        meta.append("candidates " + ",".join(cids))
+    line = f"- [ ] {note} ({'; '.join(meta)})"
+    with _flock(path.parent / ".tweaks.lock", REVIEW_LOCK_TRIES, REVIEW_LOCK_DELAY) as ok:
+        if not ok:
+            raise RuntimeError("tweak file is busy — nothing written; try again")
+        new = not path.is_file()
+        with open(path, "a", encoding="utf-8") as f:
+            if new:
+                f.write("# Maestro tweak requests\n\nChanges to Maestro itself, found "
+                        "while using it. Fix in maestro-marketplace, then tick the box.\n\n")
+            f.write(line + "\n")
+    unmarked = []
+    for cid in cids:
+        try:
+            mark(cid, "tweak", d=d)
+        except RuntimeError:
+            unmarked.append(cid)
+    if unmarked:
+        # The line is written; re-running `tweak` would duplicate it.
+        raise RuntimeError(f"tweak recorded, but these candidates were not marked: "
+                           f"{', '.join(unmarked)} — run `lessons.py mark <id> --status "
+                           f"tweak` for each")
+    return line
 
 
 # --- shared file helpers -----------------------------------------------
@@ -1157,6 +1267,8 @@ def status_report(cwd=None, d=None):
         "near_budget": pct >= lc.NEAR_BUDGET_RATIO,
         "pending": len(pending),
         "rejected": len(rejected),
+        "tweaks": len(open_tweaks(d)),
+        "tweaks_file": str(tweaks_path(d)),
         "untrusted": len(ev["repo"]) - len(ev["trusted"]),
         "check_failed": bool(ev["reasons"]),
         "personal_check_failed": bool(ev["personal_reasons"]),
@@ -1366,6 +1478,24 @@ def _cmd_status(args):
         print(f"pending candidates: {rep['pending']}")
         print(f"untrusted repo lessons: {rep['untrusted']}")
         print(f"rejected rules: {rep['rejected']}")
+        print(f"open maestro tweaks: {rep['tweaks']} ({rep['tweaks_file']})")
+    return 0
+
+
+def _cmd_tweak(args):
+    cids = [c.strip() for c in (args.candidates or "").split(",") if c.strip()]
+    known = {r["id"] for r in load_candidates()}
+    unknown = [c for c in cids if c not in known]
+    if unknown:
+        print(f"unknown candidate(s): {', '.join(unknown)}", file=sys.stderr)
+        return 1
+    try:
+        line = tweak(" ".join(args.note), cids, args.session)
+    except (ValueError, RuntimeError) as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    print(line)
+    print(f"-> {tweaks_path()}")
     return 0
 
 
@@ -1436,6 +1566,12 @@ def build_parser():
     p = sub.add_parser("status")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=_cmd_status)
+
+    p = sub.add_parser("tweak")
+    p.add_argument("--note", required=True, nargs="+")
+    p.add_argument("--candidates", help="comma-separated candidate ids")
+    p.add_argument("--session")
+    p.set_defaults(func=_cmd_tweak)
 
     return ap
 

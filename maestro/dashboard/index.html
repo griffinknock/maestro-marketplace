@@ -518,7 +518,7 @@ function ago(t){if(!t)return'';const s=Math.max(0,Math.round(Date.now()/1000-t))
     :`${Math.floor(s/3600)}h${String(Math.floor(s%3600/60)).padStart(2,'0')}m`;}
 function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 const bare=s=>String(s??'').split(':').pop();
-const TIERMAP={scout:'haiku',scribe:'haiku',surgeon:'opus'};
+const TIERMAP={scout:'haiku',scribe:'haiku',codex:'haiku',surgeon:'opus'};
 function tierOf(n){const m=(n.model||'').toLowerCase();
   return TIERS.find(t=>m.includes(t))||TIERMAP[bare(n.type)]||'sonnet';}
 /* tokens: n.tokens is the headline spend (uncached in + cache writes + output);

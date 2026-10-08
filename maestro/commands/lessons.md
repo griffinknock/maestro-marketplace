@@ -151,6 +151,12 @@ refuses — run the dry run again and re-ask.
    active lesson (same mechanic, already covered) or a rejected rule (same
    key). Drop or fold that candidate instead of drafting it again.
 
+   **Lesson or tweak?** If the group's real cause is Maestro itself — a
+   nudge that fired on correct work, a hook, rule or doctrine line that cost
+   turns — the fix is a change to the plugin, not a rule telling the
+   conductor to ignore it. Offer **Tweak maestro** for it (below) and draft
+   no lesson.
+
 3. **Preview, then present one entry at a time.** Render the exact block
    `accept` would append — heading with its `L-NNN` id and scope, Rule, Why,
    Evidence, any Supersedes, Accepted:
@@ -169,7 +175,8 @@ refuses — run the dry run again and re-ask.
    {"question": "Accept this lesson exactly as it will be written?\n<the printed block, verbatim>",
     "why": "standing rule for every future session",
     "options": [{"label": "Approve"}, {"label": "Edit then approve"},
-                {"label": "Reject"}, {"label": "Not a lesson"}],
+                {"label": "Reject"}, {"label": "Not a lesson"},
+                {"label": "Tweak maestro"}],
     "blocking": true}
    ```
 
@@ -202,6 +209,15 @@ refuses — run the dry run again and re-ask.
      ```bash
      python3 "${CLAUDE_PLUGIN_ROOT}/scripts/lessons.py" mark <id> --status not-a-lesson
      ```
+   - **Tweak maestro** → one line on what to change in Maestro and the
+     evidence, then:
+     ```bash
+     python3 "${CLAUDE_PLUGIN_ROOT}/scripts/lessons.py" tweak \
+       --note "<what to change, and why>" --candidates <comma-separated ids> --session <session-id>
+     ```
+     It appends an unchecked item to the tweak file `status` names and takes
+     the candidates out of the queue. A session in `maestro-marketplace`
+     works that list. A tweak writes no rule, so it needs no approval ritual.
 
    Delete `question.json` the moment each one is answered.
 

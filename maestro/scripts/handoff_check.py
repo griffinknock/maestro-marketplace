@@ -77,11 +77,59 @@ def check_paths(prose, base, fail):
             fail(f"path does not exist: {t}")
 
 
-def check_fields(lines, base, fail):
-    for ln in lines:
-        m = FIELD.match(ln)
-        if not m:
+def git_out(path, *args):
+    r = subprocess.run(["git", "-C", str(path), *args],
+                       capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def is_repo(path):
+    return git_out(path, "rev-parse", "--git-dir") is not None
+
+
+def candidate_repos(base, worktrees):
+    """Repos to search for a branch when the workspace root is not a repo:
+    owners of the named worktrees, then git-repo children one level down."""
+    repos = []
+
+    def add(path):
+        path = Path(path).resolve()
+        if path not in repos:
+            repos.append(path)
+
+    for wt in worktrees:
+        p = Path(os.path.expanduser(wt))
+        p = p if p.is_absolute() else base / wt
+        if not p.is_dir():
             continue
+        top = git_out(p, "rev-parse", "--show-toplevel")
+        if not top:
+            continue
+        add(top)
+        common = git_out(p, "rev-parse", "--path-format=absolute",
+                         "--git-common-dir")
+        if common and Path(common).name == ".git":
+            add(Path(common).parent)    # a linked worktree's main repo
+    try:
+        children = sorted(c for c in base.iterdir() if c.is_dir())
+    except OSError:
+        children = []
+    for c in children:
+        if (c / ".git").exists() and is_repo(c):
+            add(c)
+    return repos
+
+
+def branch_resolves(repo, name):
+    return git_out(repo, "rev-parse", "--verify", "--quiet",
+                   f"{name}^{{commit}}") is not None
+
+
+def check_fields(lines, base, fail):
+    matches = [m for m in map(FIELD.match, lines) if m]
+    worktrees = [m.group(2) for m in matches if m.group(1).lower() == "worktree"]
+    repos = None                        # resolved lazily, only if root isn't a repo
+    for m in matches:
         kind, val = m.group(1).lower(), m.group(2)
         if "<" in val:
             fail(f"{kind} is a placeholder, not a value: {val}")
@@ -89,13 +137,16 @@ def check_fields(lines, base, fail):
             p = Path(os.path.expanduser(val))
             if not (p.is_absolute() and p.is_dir()) and not (base / val).is_dir():
                 fail(f"worktree does not exist: {val}")
-        else:
-            r = subprocess.run(
-                ["git", "-C", str(base), "rev-parse", "--verify", "--quiet",
-                 f"{val}^{{commit}}"],
-                capture_output=True, text=True)
-            if r.returncode != 0:
+        elif is_repo(base):
+            if not branch_resolves(base, val):
                 fail(f"branch does not resolve in git: {val}")
+        else:
+            if repos is None:
+                repos = candidate_repos(base, worktrees)
+            if not any(branch_resolves(r, val) for r in repos):
+                checked = ", ".join(r.name for r in repos) or "none found"
+                fail(f"branch does not resolve in git: {val} "
+                     f"(workspace root is not a repo; checked: {checked})")
 
 
 def main(argv):
