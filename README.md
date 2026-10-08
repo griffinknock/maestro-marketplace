@@ -7,8 +7,6 @@ they do, and the tree they build shows up in the terminal and on a local board.
 I built it because multi-agent Claude Code sessions kept failing in the same
 few ways, and the lead agent usually couldn't tell:
 
-- **It miscounts its own agents.** Launch five at once and, depending on when
-  you count, one is running or none are. The conductor acts on that number.
 - **Reports go missing.** A subagent finishes, but what reaches the conductor
   is an idle frame or a bare "report stands." It reads that as a clean finish.
 - **Failures repeat.** The same tier fails twice, or two agents work on one
@@ -23,9 +21,8 @@ What Maestro does about each:
 
 | Failure | Response |
 |---|---|
-| Miscounted agents | Records each dispatch batch and judges it only after the batch settles |
 | Missing reports | Keeps the best report each agent produced, recovers it from the agent's own transcript when needed, and hands the conductor a digest plus a pointer. If nothing is recoverable it says `REPORT NOT DELIVERED` |
-| Repeated failures | A re-orchestration check flags stalls, the same tier failing twice, two live agents on one file, and depth 5. Each finding lands once, on the conductor's next turn, so it can re-plan |
+| Repeated failures | A re-check speaks only with news: a stalled agent, the same agent type failing twice, two live agents on one file, and depth 5. Each finding lands once, on the conductor's next turn, so it can re-plan |
 | Unchecked claims | An `adversary` agent whose job is to refute a claim before anyone trusts it, and an opus `surgeon` for work a builder has already failed twice |
 | Context pile-up | Per-agent token accounting, and `/handoff`, which writes a validated `HANDOFF.md` at a phase boundary so the next session starts clean |
 
@@ -90,22 +87,49 @@ click action.
 | Piece | Where |
 |---|---|
 | Maestro output style | System prompt — wave planning, brainstorm gate, mermaid graphs |
-| 7 tiered agents | `scout` `scribe` (haiku) · `builder` `section-lead` `visual-reviewer` `adversary` (sonnet) · `surgeon` (opus) |
+| 8 tiered agents | `scout` `scribe` `codex` (haiku) · `builder` `section-lead` `visual-reviewer` `adversary` (sonnet) · `surgeon` (opus) |
 | Indented agent tree | Agent panel, via `subagentStatusLine` — nesting, tier colour, context meter, elapsed |
 | Two-row status line | Model · project · branch · cost, then context · agent census · `depth N/5` · board link. Also persists each `rate_limits` reading to `usage.json` for sweep pacing |
 | Board | `http://127.0.0.1:7717` — fan-out DAG, lanes, worktrees, screenshots |
-| Ledger | `.claude/maestro/<session>/{events.jsonl,state.json}` |
+| Ledger | `.claude/maestro/<session>/{events.jsonl,state.json}` at the project root, one per session |
 | Token accounting | Per-agent and conductor spend from the transcripts, on the board and lanes |
 | Phase-boundary handoffs | `/handoff` writes a validated `HANDOFF.md`, then the session is cleared |
-| Re-orchestration check | One message per dispatch batch, or silence; re-delivers swallowed reports as digest + pointer |
+| Re-check | Speaks only with news — an undelivered report, a silent agent, a repeated failure, a file collision, depth 5. Re-delivers swallowed reports as digest + pointer |
 | Mailbox prune | Drops stale teammate idle pings before the conductor is ever woken by them |
 | Sleep assertion | Holds `caffeinate` while agents are in flight |
 | Ghostty config | `ghostty/config` — keybinds, theme pairing, shell integration |
 | Cross-session lessons | Human-approved rules captured in one session, injected at the start of every later one — see *Lessons* |
 | Usage-aware sweep | Checkpointed long runs paced against real rate-limit usage instead of a fixed interval — see *Sweeps* |
 
-`scout` and `scribe` are read-only. `builder`, `section-lead` and `surgeon`
-declare `isolation: worktree` and run in their own checkout.
+`scout` and `scribe` are read-only. `builder`, `section-lead`, `surgeon` and
+`codex` declare `isolation: worktree` and run in their own checkout.
+
+`scout` and `scribe` run on Haiku 5.5 through the `haiku` alias: a 1M context
+window, at roughly a twentieth of Sonnet 5.5's price.
+
+### Codex lane
+
+`codex` hands a well-specified change, or a review, to OpenAI's Codex CLI in
+its own worktree, then verifies and commits what Codex did. Use it for a
+cross-vendor second implementation or an independent review, or to spend
+Codex quota instead of Claude's. It is a haiku wrapper: it writes the brief,
+runs Codex, checks the result and reports. It does not write the change
+itself.
+
+It needs `codex` installed and logged in. Without `codex` on `PATH` it
+returns `blocked: codex CLI not installed`.
+
+The invocation it runs, with the brief read from stdin:
+
+```bash
+codex exec -C <worktree> -s workspace-write -o <file> -
+```
+
+Review mode uses `-s read-only` instead and makes no commit. Codex's sandbox
+has no network by default.
+
+Codex tokens bill to the Codex account, not the ledger, so they do not appear
+in the token accounting.
 
 ---
 
@@ -198,39 +222,29 @@ deepest live level.
 
 ## Re-orchestration check
 
-`reorchestrate.py` audits the shape of the orchestra and pushes findings into
-the conductor's context. Every message it sends costs a full main-loop turn on
-a large context, so the budget it works to is **one message per dispatch batch,
-or silence**.
-
-### It never speaks mid-batch
-
-One assistant message dispatching five agents fires `PostToolUse(Agent)` five
-times, each before the other four subagents have emitted `SubagentStart`. A
-count taken there is not slightly off, it is meaningless — that is how "only 1
-agent in flight, launch more" arrived *during* a five-agent launch, and "0
-agents in flight, the wave is done" one beat after a two-agent one.
-
-So an `Agent` call only **records** the batch. The verdict is computed on the
-first ordinary tool call after the batch has settled, and the census counts
-dispatches seen at `PreToolUse` that have not yet matched a `SubagentStart`
-(`state["pending"]`, within `MAESTRO_DISPATCH_GRACE`) as in flight. If the
-count changed inside one assistant message, that is one event, not N.
+`reorchestrate.py` (the re-check) watches the shape of the orchestra and pushes
+a finding into the conductor's context, but only when the finding is news: a
+thing the conductor does not already know, that would change its next
+decision. Every message it sends costs a full main-loop turn on a large
+context, so the budget is **silence, unless there is a finding**.
 
 ### It only reports what would change the next decision
 
-A stalled agent, the same tier failing twice, two live agents on one file,
-depth 5, three consecutive one-agent dispatches, and a finished wave the
-conductor has spent eight tool calls working around by hand. Every finding is
-fingerprinted and delivered at most once.
+- **An undelivered report.** A subagent's report the harness swallowed —
+  recovered from its transcript, or lost. See *It re-delivers reports the
+  harness swallowed* below.
+- **A stalled agent.** An agent with no sign of life for `MAESTRO_STALL_SECONDS`
+  (default `600`, ten minutes): no tool call and no write to its own
+  transcript. A write to the transcript counts as life, so a long-running
+  step that is still writing is not a stall. It fires once per agent. Idle
+  teammates are skipped.
+- **The same agent type failing twice.**
+- **Two live agents writing the same file.**
+- **Depth 5.**
 
-Two rules were deleted rather than fixed. *Lane balance* ("N of M lanes are
-idle while one keeps working") counted a lane whose agents had all **finished**
-as idle, so it fired on ordinary sequential progress; excluding complete lanes
-leaves a rule that can almost never fire honestly, and serial drift already
-carries that doctrine. *Cheap-work-on-an-expensive-model* judged a live agent
-from its tool counts, which is the same mistake the second opinion made below,
-and a running agent cannot be re-tiered anyway.
+Every finding is fingerprinted and delivered at most once. It never speaks on
+a dispatch call, since a batch still landing is not a moment to judge, and it
+never speaks inside a subagent.
 
 ### It re-delivers reports the harness swallowed
 
@@ -280,23 +294,6 @@ answering the re-check instead of returning its report. The conductor gets
 `main()`, independent of `hooks.json`. As a second layer, every agent's
 definition ends with a resend rule: any message arriving after it has reported
 gets the same `RETURN:` block again, verbatim.
-
-### The second opinion is off by default
-
-When the rules smell something they cannot judge, a detached Haiku call can
-give a second opinion that lands on a later turn. It used to be handed a tool
-signature and a model name and nothing else, and its answer was printed against
-whichever dispatch finished next. It called a 14,000-line attribution trace
-"trivial lookups, should use Haiku" and an opus builder writing fail-closed
-pagination tests "a read operation".
-
-It now receives the **dispatch prompt** it is judging, must answer
-`CONFIDENCE: high` with an explicit `FINDING:`, and the agent ids it judged are
-written beside the verdict — if any of them has finished by the time the
-verdict is read, it is discarded rather than attributed to a different
-dispatch. It is still `MAESTRO_REORCH_LLM=1` to enable: a confidently wrong
-tier recommendation costs the conductor more reasoning than silence does, and
-it has to earn its way back on.
 
 ### Stale idle pings never reach the conductor
 
@@ -428,11 +425,13 @@ becomes an active rule without Griffin's explicit yes to the exact bytes, and
 a saved lesson is never edited or removed: a stale rule is only ever
 superseded by a newer entry that names it.
 
-**Capture.** Candidates arrive two ways: automatically, when
-`reorchestrate.py`'s findings surface something worth learning, and manually,
-when Griffin corrects the conductor mid-session —
-`lessons.py flag --session <id> "<one line>"`. Capture never decides a
-candidate is a lesson; it only queues it.
+**Capture.** Candidates arrive two ways. Automatically, when the re-check's
+findings point at the conductor's own behaviour: a file collision, a repeated
+failure, or depth 5. Only those three kinds are queued. Manually, when Griffin
+corrects the conductor mid-session: `lessons.py flag --session <id> "<one line>"`.
+Capture never decides a candidate is a lesson; it only queues it. It skips a
+kind whose candidate was rejected, and keeps one pending candidate per kind
+across sessions.
 
 **Review.** `/maestro:lessons` (default `review`) groups pending candidates,
 drafts a rule per group, and previews the exact block `accept` would write —
@@ -440,6 +439,15 @@ heading, Rule, Why, Evidence, optional Supersedes, Accepted — before ever
 asking. `/maestro:handoff` runs the same review for anything still pending
 before it writes the handoff, since a candidate carries this session's id and
 the session is about to end.
+
+**Tweak or lesson?** Some candidates are about Maestro itself — a hook or
+rule that cost turns — and no rule the conductor should follow would fix them.
+`lessons.py tweak --note "..." [--candidates ids] [--session sid]` records
+that as a change to Maestro. It appends an unchecked item to
+`~/.claude/maestro/tweaks.md` (override with `MAESTRO_TWEAKS_FILE`) and marks
+the named candidates `tweak`, so they leave the queue. A tweak writes no rule
+and needs no approval. `/maestro:lessons` and `/handoff` both offer
+**Tweak maestro** for these.
 
 **Entry format** (markdown):
 
@@ -500,7 +508,7 @@ one failure mode that can leave stray bytes behind. It never touches a
 committed entry, an approved entry, or anything in the ledger.
 
 `node`-free: the whole pipeline is `maestro/scripts/lessons.py` (capture,
-inject, accept, publish, trust, repair, status) plus
+inject, accept, publish, trust, repair, tweak, status) plus
 `maestro/scripts/lessons_check.py` (parse/validate/trust logic, reused by
 `lessons.py`).
 
@@ -605,10 +613,7 @@ so one orphaned by a deleted session dir dies on its own.
 | `MAESTRO_NTFY_TOPIC` | unset | ntfy.sh topic for phone push |
 | `MAESTRO_NTFY_SERVER` | `https://ntfy.sh` | Self-hosted ntfy |
 | `MAESTRO_REORCH` | on | `0` disables the re-check entirely |
-| `MAESTRO_REORCH_LLM` | `0` | `1` enables the detached second opinion |
-| `MAESTRO_REORCH_COOLDOWN` | `90` | Seconds between second opinions |
-| `MAESTRO_REORCH_SETTLE` | `2` | Seconds a dispatch batch must be quiet before it is judged |
-| `MAESTRO_DISPATCH_GRACE` | `60` | Seconds an unstarted dispatch still counts as in flight |
+| `MAESTRO_STALL_SECONDS` | `600` | Silence (no tool call, no transcript write) before an agent counts as stalled |
 | `MAESTRO_REPORT_GRACE` | `5` | Seconds to let a resend land before reporting loss |
 | `MAESTRO_REPORT_MAX` | `40000` | Characters of a report kept on disk |
 | `MAESTRO_INBOX_PRUNE` | on | `0` stops maestro removing stale idle pings from the mailbox |
@@ -622,6 +627,7 @@ so one orphaned by a deleted session dir dies on its own.
 | `MAESTRO_LESSONS_DIR` | `~/.claude/maestro/lessons/` | Personal lesson store directory |
 | `MAESTRO_LESSONS_APPROVALS` | `lessons-approved.jsonl` next to the store | Approvals ledger path |
 | `MAESTRO_LESSONS` | on | `0` disables capture, `flag`, and injection |
+| `MAESTRO_TWEAKS_FILE` | `~/.claude/maestro/tweaks.md` | Tweak-request file that `lessons.py tweak` appends to |
 | `MAESTRO_USAGE_FILE` | `~/.claude/maestro/usage.json` | Statusline usage snapshot read by `pace.py`/`sweep_state.py` |
 | `MAESTRO_SWEEPS_DIR` | `<git toplevel>/.claude/maestro/sweeps` | Sweep state root |
 | `MAESTRO_LOCK_STALE_S` | `10.0` | Seconds before a sweep lock is considered stale under contention |
@@ -660,6 +666,7 @@ so one orphaned by a deleted session dir dies on its own.
     candidates.jsonl       append-only, gitignored, capture queue
     rejected.jsonl         append-only, tracked in the store's own git repo
   lessons-approved.jsonl   the approvals ledger ($MAESTRO_LESSONS_APPROVALS)
+  tweaks.md                Maestro changes requested via `lessons.py tweak`
   usage.json               latest statusline rate-limit snapshot, read by
                            pace.py/sweep_state.py
 
