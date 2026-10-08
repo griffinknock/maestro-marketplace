@@ -160,6 +160,35 @@ def handoff_case():
     check("oversize fence named", "fenced block" in out)
     shutil.rmtree(ws, ignore_errors=True)
 
+    # Multi-repo workspace: the root is not a repo, its children are.
+    root = Path(tempfile.mkdtemp(prefix="maestro-handoff-multi-"))
+    for name in ("alpha", "beta"):
+        repo = root / name
+        repo.mkdir()
+        subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"], check=True)
+        (repo / "f.txt").write_text(name)
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@example.com",
+                        "-c", "user.name=t", "commit", "-qm", "init"], check=True)
+    subprocess.run(["git", "-C", str(root / "beta"), "branch", "feat/only-beta"], check=True)
+
+    def multi(branch):
+        h = write_lines(root / ".claude" / "maestro" / "HANDOFF.md", [
+            "# Handoff — multi", "## Goal", "x", "## Decisions", "- y",
+            "## World state", f"- branch: {branch}", "## Next", "1. go",
+        ])
+        return subprocess.run([sys.executable, str(script), str(h)],
+                              capture_output=True, text=True, cwd=root)
+
+    r = multi("feat/only-beta")
+    check("non-repo root: branch in second child repo passes",
+          r.returncode == 0 and "HANDOFF PASS" in r.stdout, r.stdout.strip())
+    r = multi("feat/nowhere")
+    check("non-repo root: branch nowhere fails naming checked repos",
+          r.returncode == 1 and "feat/nowhere" in r.stdout
+          and "alpha" in r.stdout and "beta" in r.stdout, r.stdout.strip())
+    shutil.rmtree(root, ignore_errors=True)
+
 
 def handback_rec(tid, message):
     return json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
