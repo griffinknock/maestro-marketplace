@@ -26,12 +26,13 @@ _TIER = {
     "builder": "sonnet", "section-lead": "sonnet",
     "visual-reviewer": "sonnet", "adversary": "sonnet",
     "surgeon": "opus",
+    "codex": "haiku",       # the Claude-side wrapper; Codex bills separately
 }
 
 
-# Only these three declare `isolation: worktree`, so only these can ever own a
+# Only these declare `isolation: worktree`, so only these can ever own a
 # worktree — which is what makes a worktree name a usable parent signal.
-ISOLATED = ("section-lead", "builder", "surgeon")
+ISOLATED = ("section-lead", "builder", "surgeon", "codex")
 # `.claude/worktrees/agent-<agent-id>` — the owning agent's id, and the only
 # place a delegating agent's id ever appears (it is on no hook payload).
 WT_OWNER = re.compile(r"^agent-([0-9a-z]{6,})$", re.I)
@@ -544,16 +545,44 @@ def tier_of(agent_type, model=None):
     return _TIER.get(canon_type(agent_type), "sonnet")
 
 
+def session_ledger(cwd, sid):
+    """The outermost existing `.claude/maestro/<sid>` above `cwd`, or None.
+
+    One session, one ledger. A builder's hooks fire with its worktree as cwd,
+    and a worktree root has its own `.git`, so resolving from cwd alone gave
+    every builder a private ledger the conductor never read: no stall,
+    collision or delivery check could see it, and its start and stop landed
+    in different files — the source of the phantom "running" agents.
+    """
+    p = Path(cwd or os.getcwd()).resolve()
+    found = None
+    for parent in [p, *p.parents]:
+        d = parent / ".claude" / "maestro" / sid
+        if d.is_dir():
+            found = d
+    return found
+
+
 def home(payload):
     """Per-session state directory, inside the project so worktrees can find it."""
-    base = payload.get("cwd") or os.getcwd()
-    # Climb out of a worktree back to the real project root when possible.
-    p = Path(base).resolve()
-    for parent in [p, *p.parents]:
-        if (parent / ".git").exists() or (parent / ".claude").is_dir():
-            base = str(parent)
-            break
     sid = (payload.get("session_id") or "nosession")[:8]
+    base = payload.get("cwd") or os.getcwd()
+    existing = session_ledger(base, sid)
+    if existing is not None:
+        base = str(existing.parent.parent.parent)
+    else:
+        # First event of the session: the project root, climbing out of a
+        # `.claude/worktrees/<name>` checkout rather than stopping at its .git.
+        p = Path(base).resolve()
+        parts = p.parts
+        if ".claude" in parts:
+            i = len(parts) - 1 - parts[::-1].index(".claude")
+            if i + 1 < len(parts) and parts[i + 1] == "worktrees":
+                p = Path(*parts[:i])
+        for parent in [p, *p.parents]:
+            if (parent / ".git").exists() or (parent / ".claude").is_dir():
+                base = str(parent)
+                break
     d = Path(base) / ".claude" / "maestro" / sid
     d.mkdir(parents=True, exist_ok=True)
     # Pointer so `/board` and the tree renderer find the newest session fast.
@@ -696,6 +725,36 @@ def link_by_worktree(state, now):
             p["ended"] = p.get("ended") or p["last_activity"]
 
 
+def agent_transcript(state, aid):
+    """`<dir>/<session>.jsonl` -> `<dir>/<session>/subagents/agent-<aid>.jsonl`.
+
+    No hook payload names a running subagent's own transcript (SubagentStart
+    carries only the session's), so it is derived from the session transcript
+    the conductor's own hooks report.
+    """
+    t = state.get("transcript")
+    if not t or not aid or aid == ROOT:
+        return None
+    return Path(t).with_suffix("") / "subagents" / f"agent-{aid}.jsonl"
+
+
+def last_alive(state, n):
+    """Latest sign of life: a tool call, or a write to the agent's transcript.
+
+    An agent reasoning, or writing one large file, makes no tool call for
+    minutes while its transcript keeps growing. Judging it by tool calls
+    alone called live opus agents stalled.
+    """
+    last = float(n.get("last_activity") or n.get("started") or 0)
+    p = agent_transcript(state, n.get("id"))
+    if p:
+        try:
+            last = max(last, p.stat().st_mtime)
+        except OSError:
+            pass
+    return last
+
+
 def reap_stale(state, now):
     """Retire nodes whose SubagentStop never landed.
 
@@ -707,7 +766,7 @@ def reap_stale(state, now):
     for n in state["nodes"].values():
         if n["id"] == ROOT or n.get("status") not in ("running", "spawning"):
             continue
-        last = float(n.get("last_activity") or n.get("started") or now)
+        last = last_alive(state, n) or now
         if now - last > REAP_SECONDS:
             n["status"] = "orphaned"
             n["ended"] = n.get("ended") or last
@@ -783,10 +842,7 @@ def apply(state, payload, d=None):
                 "parent": me,
                 "type": atype,
                 "description": (ti.get("description") or ti.get("prompt") or "")[:160],
-                # The full brief, not just the label. A second opinion that
-                # judges a dispatch from its tool signature calls an
-                # attribution trace across a 14k-line service a "trivial
-                # lookup"; the prompt is the only thing that shows the stakes.
+                # The full brief, not just the label — the board shows it.
                 "prompt": (ti.get("prompt") or "")[:800],
                 "model": tier_of(atype, ti.get("model")),
                 "background": bool(ti.get("run_in_background")),
@@ -904,9 +960,18 @@ def apply(state, payload, d=None):
     if ev in ("PreToolUse", "PostToolUse", "PostToolUseFailure", "SubagentStart"):
         node(state, whoami(state, payload), last_activity=now)
 
-    # Infer worktree membership from the cwd the hook fired in.
+    # The session transcript, from the conductor's own hooks. Subagent
+    # transcripts sit beside it (see agent_transcript).
+    if payload.get("transcript_path") and not payload.get("agent_id"):
+        state["transcript"] = payload["transcript_path"]
+
+    # Infer worktree membership from the cwd the hook fired in. Never on a
+    # stop: whoami() adopts an unknown id as *running*, so a SubagentStop for
+    # an agent whose start this ledger never saw minted a phantom that sat in
+    # the census — and drew stall nudges — until the reaper caught it 15
+    # minutes later. One field session showed 24 of them "in flight".
     cw = payload.get("cwd") or ""
-    if ".claude/worktrees/" in cw.replace("\\", "/"):
+    if ev != "SubagentStop" and ".claude/worktrees/" in cw.replace("\\", "/"):
         wt = cw.replace("\\", "/").split(".claude/worktrees/")[1].split("/")[0]
         me = whoami(state, payload)
         node(state, me, worktree=wt)

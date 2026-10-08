@@ -224,7 +224,7 @@ def audit(c, swallowed):
     for m in c.msgs:
         head = m.splitlines()[0]
         accurate, foreign = True, False
-        if head.startswith("MAESTRO"):
+        if head.startswith("MAESTRO") and "in flight" in head:   # pre-0.6 header
             tok = head.split()[2] if len(head.split()) > 2 else ""
             claimed = int(tok) if tok.isdigit() else -1
             live = sum(1 for x in state["nodes"].values()

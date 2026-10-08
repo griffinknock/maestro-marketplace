@@ -45,7 +45,7 @@ def tier(model, name):
     for k in ("haiku", "sonnet", "opus"):
         if k in m:
             return k
-    return {"scout": "haiku", "scribe": "haiku", "surgeon": "opus"}.get(bare(name), "sonnet")
+    return {"scout": "haiku", "scribe": "haiku", "codex": "haiku", "surgeon": "opus"}.get(bare(name), "sonnet")
 
 
 def link(text, url):

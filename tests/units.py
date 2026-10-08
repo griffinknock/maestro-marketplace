@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from replay import Conductor, workspace, PLUGIN, ENV, IDLE_FRAME
+from replay import Conductor, workspace, PLUGIN, ENV, IDLE_FRAME, report_text
 
 FAILURES = []
 
@@ -314,6 +314,105 @@ def workflow_case():
           flagged[0][:120] if flagged else "")
 
 
+def live_nodes(state):
+    return [n for n in state["nodes"].values()
+            if n["id"] != "root" and n.get("status") in ("running", "spawning")]
+
+
+def worktree_ledger_case():
+    """A builder's hooks land in the conductor's ledger, not its worktree's."""
+    print("\n=== one ledger per session, worktrees included ===")
+    ws = workspace()
+    (ws / ".git").mkdir()
+    c = Conductor(PLUGIN, ws, "aaaa9994-0000-0000-0000-00000000000a")
+    c.fire(hook_event_name="SessionStart", source="startup")
+    ids = c.dispatch(1, kind="builder", names=["builder-wt"])
+    wt = ws / ".claude" / "worktrees" / "agent-x1"
+    wt.mkdir(parents=True)
+    (wt / ".git").write_text("gitdir: elsewhere\n")      # a worktree's .git is a file
+    c.fire(hook_event_name="PostToolUse", tool_name="Edit", agent_id=ids["builder-wt"],
+           agent_type="builder-wt", cwd=str(wt), tool_input={"file_path": str(wt / "a.py")},
+           tool_response={"ok": True})
+    c.fire(hook_event_name="SubagentStop", agent_id=ids["builder-wt"], agent_type="builder-wt",
+           cwd=str(wt), last_assistant_message=report_text("builder-wt"))
+    check("no private ledger inside the worktree",
+          not (wt / ".claude" / "maestro").exists())
+    n = c.state()["nodes"].get(ids["builder-wt"], {})
+    check("the builder's edit and stop reached the conductor's ledger",
+          n.get("status") == "done" and n.get("tools", {}).get("Edit") == 1, n)
+
+
+def phantom_case():
+    """A stop for an agent this ledger never saw start is not adopted as running."""
+    print("\n=== no phantom agents from unmatched stops ===")
+    ws = workspace()
+    c = Conductor(PLUGIN, ws, "aaaa9995-0000-0000-0000-00000000000a")
+    c.fire(hook_event_name="SessionStart", source="startup")
+    wt = ws / ".claude" / "worktrees" / "big-pulls"
+    wt.mkdir(parents=True)
+    for i in range(3):
+        c.fire(hook_event_name="SubagentStop", agent_id=f"a1e4b5d634b7{i:05d}",
+               cwd=str(wt), last_assistant_message="done")
+    c.tool_call()
+    check("nothing counted as running", live_nodes(c.state()) == [], live_nodes(c.state()))
+    check("no message about them", not c.msgs, c.msgs)
+
+
+def age_node(c, aid, seconds):
+    sf = c.dir / "state.json"
+    st = json.loads(sf.read_text())
+    now = time.time()
+    st["nodes"][aid]["last_activity"] = now - seconds
+    st["nodes"][aid]["started"] = now - seconds - 10
+    sf.write_text(json.dumps(st))
+    return st
+
+
+def stall_case():
+    """Liveness counts transcript writes, not just tool calls."""
+    print("\n=== stall: transcript writes are signs of life ===")
+    ws = workspace()
+    c = Conductor(PLUGIN, ws, "aaaa9996-0000-0000-0000-00000000000a")
+    session_tr = ws / "projects" / f"{c.sid}.jsonl"
+    session_tr.parent.mkdir(parents=True)
+    session_tr.write_text("")
+    c.fire(hook_event_name="SessionStart", source="startup",
+           transcript_path=str(session_tr))
+    ids = c.dispatch(1, kind="surgeon", names=["surgeon-big"])
+    aid = ids["surgeon-big"]
+    agent_tr = session_tr.with_suffix("") / "subagents" / f"agent-{aid}.jsonl"
+    agent_tr.parent.mkdir(parents=True)
+    agent_tr.write_text("{}\n")                      # written just now
+    age_node(c, aid, 700)                            # past stall (600), before reap (900)
+    c.tool_call()
+    check("a growing transcript is not a stall",
+          not any("no activity" in m for m in c.msgs), c.msgs)
+
+    old = time.time() - 700
+    os.utime(agent_tr, (old, old))
+    age_node(c, aid, 700)
+    c.tool_call()
+    c.tool_call()
+    stalls = [m for m in c.msgs if "no activity" in m]
+    check("a silent agent is reported, once", len(stalls) == 1, c.msgs)
+
+
+def quiet_case():
+    """The retired coaching nudges stay silent."""
+    print("\n=== no serial or inline coaching ===")
+    ws = workspace()
+    c = Conductor(PLUGIN, ws, "aaaa9997-0000-0000-0000-00000000000a")
+    c.fire(hook_event_name="SessionStart", source="startup")
+    for i in range(3):                                # three solo dispatches
+        ids = c.dispatch(1, names=[f"scout-q{i}"])
+        time.sleep(2.2)
+        c.tool_call()
+        c.finish(ids[f"scout-q{i}"], f"scout-q{i}")
+    for _ in range(10):                               # then work by hand
+        c.tool_call()
+    check("nothing said", not c.msgs, c.msgs)
+
+
 def main():
     tokens_case()
     digest_case()
@@ -321,6 +420,10 @@ def main():
     handback_case()
     collide_case()
     workflow_case()
+    worktree_ledger_case()
+    phantom_case()
+    stall_case()
+    quiet_case()
     print("\n  " + ("PASS" if not FAILURES else f"FAIL ({len(FAILURES)})"))
     return 1 if FAILURES else 0
 
