@@ -607,6 +607,11 @@ def home(payload):
     sid = (payload.get("session_id") or "nosession")[:8]
     cwd = payload.get("cwd") or os.getcwd()
     d = session_ledger(sid)
+    # A fresh process re-pins: `claude --resume` from another directory gets
+    # its ledger where it now runs, as it did before the registry existed.
+    if (payload.get("hook_event_name") == "SessionStart" and not payload.get("agent_id")
+            and payload.get("source") in ("startup", "resume")):
+        d = None
     if d is None:
         if payload.get("agent_id"):
             # Nothing pinned (a session from before the registry). A subagent

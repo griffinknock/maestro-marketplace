@@ -452,6 +452,11 @@ def cd_up_case():
     c.finish(ids["scout-up"], "scout-up")
     check("no second ledger above the repo", not (ws / ".claude" / "maestro").exists())
     check("the stop still landed", c.state()["nodes"][ids["scout-up"]].get("status") == "done")
+    other = ws / "other"
+    (other / ".git").mkdir(parents=True)
+    c.fire(hook_event_name="SessionStart", source="resume", cwd=str(other))
+    check("a resume from another directory re-pins there",
+          (other / ".claude" / "maestro" / c.sid[:8] / "state.json").is_file())
 
 
 def long_tool_case():
