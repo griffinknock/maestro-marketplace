@@ -474,6 +474,21 @@ def long_tool_case():
     check("no stall while its Bash call runs", not c.msgs, c.msgs)
 
 
+def untyped_failure_case():
+    """A failed node with no type must not silence the whole re-check."""
+    print("\n=== repeated failures tolerate an untyped node ===")
+    sys.path.insert(0, str(PLUGIN))
+    import reorchestrate
+    st = {"nodes": {"a": {"id": "a", "status": "failed", "type": None},
+                    "b": {"id": "b", "status": "failed", "type": "builder"},
+                    "c": {"id": "c", "status": "failed", "type": "builder"}}}
+    try:
+        found = [fp for fp, _ in reorchestrate.check(st, time.time())]
+    except TypeError as e:
+        found = [f"raised {e}"]
+    check("builder's two failures still reported", "fail:builder:2" in found, found)
+
+
 def main():
     tokens_case()
     digest_case()
@@ -488,6 +503,7 @@ def main():
     conductor_in_worktree_case()
     cd_up_case()
     long_tool_case()
+    untyped_failure_case()
     print("\n  " + ("PASS" if not FAILURES else f"FAIL ({len(FAILURES)})"))
     return 1 if FAILURES else 0
 
