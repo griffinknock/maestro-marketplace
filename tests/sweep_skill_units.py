@@ -118,7 +118,7 @@ def resume_prompt_case(text):
     check("skill uses '/loop /maestro:sweep resume <slug>' to resume one",
           resume_count >= 2, f"found {resume_count}")
 
-    # Every /loop line Griffin is told to type is exactly the slug form —
+    # Every /loop line the user is told to type is exactly the slug form —
     # no owner token riding along (the owner is the session id now).
     loop_lines = re.findall(r"^/loop .*$", text, re.M)
     check("every fenced /loop line is exactly '/loop /maestro:sweep run|resume <slug>'",
@@ -202,8 +202,8 @@ def exit_codes_case(text):
           re.search(r"^\| 5 \|.*minimum delay", text, re.M) is not None)
     check("step 1 never proceeds past a recover that didn't exit 0",
           "where `recover` did not\n   exit 0" in text or "recover` did not exit 0" in norm(text))
-    check("set-policy only on Griffin's explicit request",
-          "Only on Griffin's explicit request" in text)
+    check("set-policy only on the user's explicit request",
+          "Only on the user's explicit request" in text)
     check("invalid-policy remedy points to set-policy, not a hand edit",
           re.search(r"\*\*invalid policy\*\*.*?set-policy", text, re.DOTALL) is not None
           and "fix\n     `policy.json`" not in text and "re-run `new`" not in text)
@@ -258,7 +258,7 @@ def terminal_paths_case(text):
     check("the END procedure releases the lease, then calls the stop",
           re.search(r"\*\*END the loop\*\*.*?lease <slug> --release.*?ScheduleWakeup\(stop: true\)",
                     text, re.DOTALL) is not None)
-    forbidden = ["no `ScheduleWakeup`", "do not `ScheduleWakeup`", "don't reschedule, tell Griffin, end",
+    forbidden = ["no `ScheduleWakeup`", "do not `ScheduleWakeup`", "don't reschedule, tell the user, end",
                  "no\n     `ScheduleWakeup`"]
     found = [f for f in forbidden if f in text]
     check("no path tells you to end WITHOUT the stop call", not found, found)

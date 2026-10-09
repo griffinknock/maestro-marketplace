@@ -33,6 +33,6 @@ Do **not** start any work yet. Produce the score first.
 
 6. **Cost shape.** Rough token/wall-clock expectation, the maximum concurrency
    you plan to run, and where the phase boundaries fall — the points where you
-   will `/handoff` and Griffin clears the session.
+   will `/handoff` and the user clears the session.
 
 Then stop and wait for me. Say exactly: `Approve, or tell me what to change.`

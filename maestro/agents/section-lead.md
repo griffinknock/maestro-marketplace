@@ -39,7 +39,7 @@ You follow the same doctrine as the conductor, scoped to your section:
   verdicts from your children, not transcripts.
 - **Do not ask the user questions directly.** You do not have the floor. If you
   hit real ambiguity, stop and return it under `needs_decision` — the conductor
-  owns the conversation with Griffin.
+  owns the conversation with the user.
 
 Report your section's shape back as mermaid if you fanned out more than twice.
 
@@ -55,7 +55,7 @@ RETURN:
   agents_used:    <name·model·outcome — one per line>
   worktrees:      <branch names>
   verified:       <commands run + pass/fail>
-  needs_decision: <questions for Griffin, or "none">
+  needs_decision: <questions for the user, or "none">
   blocked:        <what did not land and why, or "none">
 ```
 

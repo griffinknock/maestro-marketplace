@@ -104,7 +104,7 @@ def flag_case():
     d = tmp_store()
     os.environ["MAESTRO_LESSONS_DIR"] = str(d)
     try:
-        cid = lessons.flag("sess-c", "Griffin: always dispatch scouts in one message")
+        cid = lessons.flag("sess-c", "User: always dispatch scouts in one message")
         check("flag returns an id", bool(cid))
         rows = lessons.load_candidates(d)
         check("exactly one candidate", len(rows) == 1, f"got {len(rows)}")
