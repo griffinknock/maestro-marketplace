@@ -219,7 +219,8 @@ def check(state, now):
     repeat = {}
     for n in nodes:
         if n.get("status") == "failed":
-            repeat[n.get("type")] = repeat.get(n.get("type"), 0) + 1
+            t = n.get("type") or "agent"     # a None key breaks sorted() below
+            repeat[t] = repeat.get(t, 0) + 1
     for t, c in sorted(repeat.items()):
         if c >= 2:
             f.append((f"fail:{t}:{c}",
