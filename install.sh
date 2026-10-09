@@ -62,33 +62,11 @@ json.dump(d, open(p, "w"), indent=2)
 print("  statusLine, outputStyle, agent teams, worktree perms")
 PY
 
-# The CLI is not on PATH for a .app-only install, so check the bundle too.
-GHOSTTY_MAC_CONFIG="$HOME/Library/Application Support/com.mitchellh.ghostty/config"
-if [ -d "$HOME/.config/ghostty" ] || command -v ghostty >/dev/null \
-   || [ -d "/Applications/Ghostty.app" ] || [ -f "$GHOSTTY_MAC_CONFIG" ]; then
-  if [ -f "$HOME/.config/ghostty/config" ]; then
-    warn "Ghostty config already exists — left alone. Compare with ghostty/config"
-  else
-    mkdir -p "$HOME/.config/ghostty"
-    cp "$HERE/ghostty/config" "$HOME/.config/ghostty/config"
-    say "installed the Ghostty config"
-  fi
-  # On macOS Ghostty reads BOTH paths and the Application Support one is applied
-  # last, so any key it sets silently beats ~/.config/ghostty/config. A stray
-  # `theme =` there is invisible to `+validate-config` — it resolves fine, it
-  # just is not the theme you asked for. Only warn if it actually sets keys.
-  if [ -f "$GHOSTTY_MAC_CONFIG" ] && grep -qE '^[[:space:]]*[a-z-]+[[:space:]]*=' "$GHOSTTY_MAC_CONFIG"; then
-    warn "$GHOSTTY_MAC_CONFIG also sets config keys and OVERRIDES ~/.config/ghostty/config:"
-    grep -nE '^[[:space:]]*[a-z-]+[[:space:]]*=' "$GHOSTTY_MAC_CONFIG" | sed 's/^/      /'
-    warn "comment those out, or move them into ~/.config/ghostty/config"
-  fi
-fi
-
 say "done"
 cat <<EOF
 
   Start a session:      claude
-  Open the board:       /board          (or Cmd+Shift+B in Ghostty)
+  Open the board:       /board
   Plan something:       /orchestrate <task>
   See the tree:         /tree
   Visual pass:          /look http://localhost:3000
@@ -98,7 +76,6 @@ cat <<EOF
 
     echo 'export MAESTRO_NTFY_TOPIC=maestro-<something-random>' >> ~/.zshrc
 
-  Terminal setup:               ghostty/SETUP.md
   Backup of your old settings:  $SETTINGS.maestro-backup.*
 
 EOF

@@ -1,6 +1,9 @@
 {
   "name": "maestro-marketplace",
-  "owner": { "name": "Griffin" },
+  "owner": {
+    "name": "Griffin Knock",
+    "url": "https://github.com/griffinknock"
+  },
   "description": "Orchestration and visualization tooling for Claude Code.",
   "plugins": [
     {

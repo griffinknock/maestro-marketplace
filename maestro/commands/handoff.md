@@ -1,5 +1,5 @@
 ---
-description: Close out this conductor session at a phase boundary — write a validated HANDOFF.md, then hand Griffin the /clear.
+description: Close out this conductor session at a phase boundary — write a validated HANDOFF.md, then hand the user the /clear.
 argument-hint: [optional note on where the next session should pick up]
 ---
 
@@ -25,9 +25,9 @@ and points at the right places. That is what you produce now.
 
    If that lists any candidates, run the `/maestro:lessons` review flow now,
    before writing the handoff — a candidate carries this session's id, and
-   this session is about to end. Skip only if Griffin says skip. The
+   this session is about to end. Skip only if the user says skip. The
    deadline never licenses an approval: run `accept` (or `publish`/`trust`)
-   only on Griffin's explicit yes to that exact entry — anything he has not
+   only on the user's explicit yes to that exact entry — anything they have not
    answered stays pending for the next session.
 
    If this session hit friction from Maestro itself — a wrong nudge, a hook

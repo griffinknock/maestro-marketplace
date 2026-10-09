@@ -36,8 +36,8 @@ when you start the loop, and every later wakeup, `stop`'s printed resume
 command, and the SessionStart anchor line (`Resume with /loop
 /maestro:sweep resume <slug>`) all resolve to the same slug and the same
 subcommand shape. If you are asked to `run`/`resume` outside a `/loop`
-turn, do one recover→check→pace round honestly, then tell Griffin the
-sleep/stop decision cannot self-schedule here and hand him the
+turn, do one recover→check→pace round honestly, then tell the user the
+sleep/stop decision cannot self-schedule here and hand them the
 `/loop /maestro:sweep run <slug>` line to paste.
 
 ## Every iteration ends in exactly one of two calls
@@ -76,7 +76,7 @@ hook JSON input" — and `sweep_state.py` reads it itself. So:
   `/loop`, and every turn after a compaction, is the same session and so
   the same owner; a second session is a different owner by construction.
 - If a command refuses with `no owner — $CLAUDE_CODE_SESSION_ID is unset`,
-  this Claude Code build doesn't export it: tell Griffin and END with
+  this Claude Code build doesn't export it: tell the user and END with
   `ScheduleWakeup(stop: true)` — do not work around it with a made-up
   `--owner`.
 - **`/clear` changes the session id** (the env-vars reference: it "is
@@ -84,7 +84,7 @@ hook JSON input" — and `sweep_state.py` reads it itself. So:
   lease held by the pre-`/clear` session belongs to "another session":
   `recover`/`next` exit 4 until it lapses, and the way through is
   `takeover` below — the pre-`/clear` loop is gone, so that is safe once
-  Griffin confirms it.
+  the user confirms it.
 
 ### The loop lease
 
@@ -109,7 +109,7 @@ While a lease is live, `recover`, `next` and `lease` from any other
 session exit 4 (`busy: sweep leased by <owner> until <iso> …`) — the same
 takeover path as an open chunk. A dead loop's lease lapses on its own 10
 minutes after its last scheduled wake. If `lease` itself exits 4, another
-session has taken the sweep over: tell Griffin and END with
+session has taken the sweep over: tell the user and END with
 `ScheduleWakeup(stop: true)` (skip the release — it isn't ours).
 
 The SessionStart anchor (on compaction or resume) reads the hook's own
@@ -120,7 +120,7 @@ The SessionStart anchor (on compaction or resume) reads the hook's own
 - to any other session: that the sweep is owned (open chunk, since
   `<time>`) or leased (sleeping loop, until `<time>`) by another session,
   ending `Take over with /maestro:sweep takeover <slug>` — do not resume
-  it; tell Griffin, and only take it over if he says the other session is
+  it; tell the user, and only take it over if they say the other session is
   dead.
 
 Trust the anchor's line over anything you remember from before the
@@ -150,8 +150,8 @@ compaction.
    in this order, before writing anything:
    - **Goal** — one line, what done looks like for the whole sweep.
    - **Item index** — how the index is produced (a scout enumerates it, or a
-     script does). Show Griffin the count and a 5-item sample before he
-     signs off; do not invent items yourself.
+     script does). Show the user the count and a 5-item sample before they
+     sign off; do not invent items yourself.
    - **Per-item method** — which agent type and model runs one item, and the
      exact one-line result shape it must return (e.g. `<id> done <result>` /
      `<id> fail <reason>`).
@@ -162,7 +162,7 @@ compaction.
      90 — only deviate on an explicit reason).
    - **Deviation level** — `locked` (findings only logged) / `additive`
      (findings may add items, never change the plan or drop items — this is
-     the default) / `adaptive` (may amend the plan after Griffin approves a
+     the default) / `adaptive` (may amend the plan after the user approves a
      non-blocking question) / `autonomous` (may amend freely, logged).
 
 3. **Write and register the sweep.** Draft `plan.md` (the frozen plan — goal,
@@ -200,7 +200,7 @@ Runs only under `/loop` (see above). Each turn:
      and report the reasons, then END with `ScheduleWakeup(stop: true)`.
    - **4** (`busy: chunk <n> owned by <owner> since <iso> …` or `busy: sweep
      leased by <owner> until <iso> …`) → another session holds an open chunk
-     or a live loop lease. Quote the busy line verbatim, tell Griffin how to
+     or a live loop lease. Quote the busy line verbatim, tell the user how to
      take over if that session is dead (`/maestro:sweep takeover <slug>`,
      then restart the loop), and END with `ScheduleWakeup(stop: true)` (no
      release — the lease isn't ours; no `check`, no `next`). A foreign
@@ -274,7 +274,7 @@ Runs only under `/loop` (see above). Each turn:
    ```bash
    python3 "$STATE" add <slug> --label "<one line>" --from-finding <finding-id>
    ```
-   Under `adaptive`, do not call `amend-plan` yet — ask Griffin first with a
+   Under `adaptive`, do not call `amend-plan` yet — ask the user first with a
    **non-blocking** (`"blocking": false`) ✋ question carrying the proposed
    diff; only on a yes:
    ```bash
@@ -311,7 +311,7 @@ Runs only under `/loop` (see above). Each turn:
    renewal** for the same delay — `python3 "$STATE" lease <slug> --in
    <delaySeconds>` — so no other session can start a loop on this sweep
    while this one sleeps. If that exits 4, another session took the sweep
-   over: tell Griffin and END with `ScheduleWakeup(stop: true)` instead of
+   over: tell the user and END with `ScheduleWakeup(stop: true)` instead of
    rescheduling. If it exits 5, retry it once; if it is still 5, reschedule
    at the 60 s floor rather than the pace delay — the lease that `next`,
    `done`/`fail` and `end-chunk` renewed runs 10 minutes past this turn's
@@ -344,12 +344,12 @@ Runs only under `/loop` (see above). Each turn:
      window resets (from the decision). Remedy: nothing to do but wait;
      resume after the reset with the line above.
    - **invalid policy** — reason: quote pace's error verbatim. Remedy:
-     Griffin changes the policy with `set-policy` (below); then resume.
+     The user changes the policy with `set-policy` (below); then resume.
      Never edit `policy.json` by hand — `check` and every command refuse an
      edited one.
    - **internal pace error** — reason: quote the error verbatim. Remedy:
      this is a bug in `pace.py` or its inputs, not a usage limit — do not
-     retry blindly; flag the exact error text to Griffin.
+     retry blindly; flag the exact error text to the user.
    - **no usage signal** (3+ chunks in a row with no fresh reading,
      `allow_blind` false) — reason: pacing is blind because no fresh
      statusline reading reached usage.json. Either Maestro's statusLine is
@@ -359,7 +359,7 @@ Runs only under `/loop` (see above). Each turn:
      background may go blind even with the statusLine installed. Remedy:
      "run install.sh to set Maestro's statusLine" — that is what produces
      the usage snapshot `pace.py` reads — and run the loop in a foreground
-     session; or, only if Griffin asks for it, `set-policy` with
+     session; or, only if the user asks for it, `set-policy` with
      `allow_blind`. Then resume with the line above.
 
 The conductor never reads an item's full output — one line per item, ever.
@@ -368,7 +368,7 @@ your transcript.
 
 ## Changing a sweep's policy — `set-policy`
 
-Only on Griffin's explicit request (a ceiling, the deviation level,
+Only on the user's explicit request (a ceiling, the deviation level,
 `chunk_size`, `allow_blind`, …) — never on your own initiative, and never to
 get past a refusal:
 
@@ -384,7 +384,7 @@ Exit 2 means the policy was invalid and nothing changed.
 
 ## `takeover <slug>`
 
-Only when Griffin says the session that owns the open chunk or holds the
+Only when the user says the session that owns the open chunk or holds the
 loop lease is dead (the anchor or a `busy:` line named it — including this
 same conversation before a `/clear`). Not a loop turn — run once:
 
@@ -396,7 +396,7 @@ It closes the other session's open chunk as interrupted, returns its
 unreported items to pending, moves the loop lease to this session, logs a
 `takeover` amendment, and makes this session the owner of the next chunk.
 If the old loop does wake up later, its `recover`/`next`/`done`/`fail`
-exit 4 and it ends itself. Then hand Griffin the
+exit 4 and it ends itself. Then hand the user the
 `/loop /maestro:sweep resume <slug>` line to restart the loop in this
 session.
 
@@ -404,7 +404,7 @@ session.
 
 No slug: `python3 "$STATE" list`. With a slug: `python3 "$STATE" status <slug>`
 plus the latest `pace.py` decision for that sweep (same `<sweep-dir>`
-resolution as above), so Griffin sees both where it is and what it would do
+resolution as above), so the user sees both where it is and what it would do
 next.
 
 ## `stop <slug>`

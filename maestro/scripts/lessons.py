@@ -8,18 +8,18 @@ API (`parse`, `fold`, `active_for`, `render_injection`, `evaluate`, the
 approvals-ledger helpers, and `repo_identity`):
 
   - CAPTURE: candidates fed automatically by re-orchestration findings
-    (`reorchestrate.py`) and manually by the conductor when Griffin corrects
+    (`reorchestrate.py`) and manually by the conductor when the user corrects
     it (`flag`). Capture never decides a candidate is a lesson.
   - INJECT: the SessionStart hook. Injects active, APPROVED lessons only. If
     the check fails it injects nothing but a one-line warning (fail closed),
     and its output is always hard-capped at the lesson budget.
   - ACCEPT: turns a candidate into an active personal-store lesson (`L-NNN`)
-    after Griffin's explicit yes: appends, validates, records the approval in
+    after the user's explicit yes: appends, validates, records the approval in
     the ledger, commits — and rolls every byte back if any step fails.
   - PUBLISH: copies an accepted, repo-scoped lesson into that repo's own
-    `.claude/maestro-lessons.md` (`R-NNN`), uncommitted — Griffin commits it.
-  - TRUST: records Griffin's approval of an `R-NNN` entry a teammate wrote,
-    bound to the exact bytes he was shown (its sha256).
+    `.claude/maestro-lessons.md` (`R-NNN`), uncommitted — the user commits it.
+  - TRUST: records the user's approval of an `R-NNN` entry a teammate wrote,
+    bound to the exact bytes they were shown (its sha256).
   - REPAIR: shows (and on --apply with the shown sha, removes) an
     uncommitted, unapproved tail left by an interrupted accept.
   - STATUS: budget and queue counters for `/maestro:lessons`.
@@ -334,7 +334,7 @@ def capture_finding(session_id, cwd, fingerprint, text, tool_use_id=None):
 
 
 def flag(session_id, text, cwd=None):
-    """Record a correction Griffin made to how Maestro orchestrated.
+    """Record a correction the user made to how Maestro orchestrated.
 
     Source is always "correction"; never deduped by fingerprint. Respects
     MAESTRO_LESSONS=0 like capture and inject. Never raises.
@@ -774,8 +774,8 @@ def accept_preview(rule, why, evidence, scope="global", supersedes=None, d=None)
     """The exact entry block `accept` would append right now — heading with
     id and scope, Rule, Why, Evidence, Supersedes, Accepted — and its
     sha256, without writing anything. Returns (info_or_None, reasons) with
-    info = {"id", "block", "sha"}. Show Griffin the block; pass the sha to
-    accept(expect_sha=...) so what lands is exactly what he approved."""
+    info = {"id", "block", "sha"}. Show the user the block; pass the sha to
+    accept(expect_sha=...) so what lands is exactly what they approved."""
     fields, scope, sup_ids, errs = _accept_inputs(rule, why, evidence, scope, supersedes)
     if errs:
         return None, errs
@@ -788,7 +788,7 @@ def accept_preview(rule, why, evidence, scope="global", supersedes=None, d=None)
 
 def accept(rule, why, evidence, scope="global", supersedes=None,
            candidates=None, d=None, cwd=None, expect_sha=None):
-    """Only after Griffin's explicit yes to this exact entry. Allocates the
+    """Only after the user's explicit yes to this exact entry. Allocates the
     next L-NNN, appends it, validates the post-state (every scope's budget,
     the approvals ledger, append-only history), records the approval, and
     commits. On ANY failure — validation, ledger write, or commit — the file
@@ -798,7 +798,7 @@ def accept(rule, why, evidence, scope="global", supersedes=None,
     and (lid, [], lid) is returned. `supersedes` is one id or a
     comma-separated list/sequence of them (consolidation). With
     `expect_sha` (from accept_preview), refuses unless the block about to be
-    appended is byte-for-byte the one Griffin was shown."""
+    appended is byte-for-byte the one the user was shown."""
     fields, scope, sup_ids, errs = _accept_inputs(rule, why, evidence, scope, supersedes)
     if expect_sha is not None and not (isinstance(expect_sha, str)
                                        and lc.SHA_RE.fullmatch(expect_sha)):
@@ -1073,7 +1073,7 @@ def list_untrusted(cwd=None, d=None):
 
 
 def trust(rid, sha, cwd=None, d=None):
-    """Only after Griffin was shown the entry verbatim and said yes to it.
+    """Only after the user was shown the entry verbatim and said yes to it.
     Records an approval for R-NNN bound to `sha` (the sha256 printed by
     `untrusted`); refuses if the entry's bytes no longer match. Returns
     (rid_or_None, message)."""
@@ -1208,7 +1208,7 @@ def repair_plan(d=None):
 
 
 def repair(apply=False, sha=None, d=None):
-    """Dry run by default. With apply=True (only after Griffin's explicit yes
+    """Dry run by default. With apply=True (only after the user's explicit yes
     to the plan it was shown) removes exactly the planned bytes, and only if
     the plan's sha still matches `sha`. Returns (ok, plan, message)."""
     d = Path(d) if d else store_dir()
@@ -1216,7 +1216,7 @@ def repair(apply=False, sha=None, d=None):
         plan = repair_plan(d)
         return plan["problem"] is None, plan, plan["problem"] or ""
     if not isinstance(sha, str) or not lc.SHA_RE.fullmatch(sha):
-        return False, None, "--apply needs --sha: the sha256 printed by the dry run Griffin approved"
+        return False, None, "--apply needs --sha: the sha256 printed by the dry run the user approved"
     with _flock(d / STORE_LOCK, REVIEW_LOCK_TRIES, REVIEW_LOCK_DELAY) as ok:
         if not ok:
             return False, None, LOCK_BUSY
@@ -1459,7 +1459,7 @@ def _cmd_repair(args):
     elif plan["cut"] is None:
         print("nothing to repair")
     else:
-        print("Apply only after Griffin's explicit yes to exactly this, with:")
+        print("Apply only after the user's explicit yes to exactly this, with:")
         print(f"  lessons.py repair --apply --sha {plan['sha']}")
     return 0
 

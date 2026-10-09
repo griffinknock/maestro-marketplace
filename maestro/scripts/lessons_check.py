@@ -3,7 +3,7 @@
 
 A lesson is a small, human-approved rule about how Maestro should orchestrate,
 learned in one session and meant to steer every session after it. Nothing
-becomes an active rule without Griffin's explicit yes, and a saved lesson is
+becomes an active rule without the user's explicit yes, and a saved lesson is
 never edited or removed — a stale rule is only ever superseded by a newer
 entry that names it. Those guarantees are only real if something enforces
 them, so this script is the gate. It:
@@ -19,7 +19,7 @@ them, so this script is the gate. It:
   - proves, byte-for-byte and across the full git history, that an existing
     committed entry was never edited, reordered, or deleted — only appended to
   - checks every entry against the APPROVALS LEDGER (below), which lives
-    outside the store's git repo and is the external anchor for "Griffin said
+    outside the store's git repo and is the external anchor for "the user said
     yes to exactly these bytes"
 
 Lesson file format (markdown, optional preamble before the first entry):

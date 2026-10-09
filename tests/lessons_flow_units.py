@@ -254,7 +254,7 @@ def accept_basic_case():
                                  "griffin corrected tiering assignment")
     lid, reasons, _ = lessons.accept(
         rule="Assign the cheapest agent tier that can do the job.",
-        why="Griffin corrected an over-tiered dispatch.",
+        why="The user corrected an over-tiered dispatch.",
         evidence='sess-a1 · c-abc123 · "assign cheapest tier"',
         scope="global", candidates=[cid], d=store)
     check("accept returns L-001", lid == "L-001", lid)
@@ -638,7 +638,7 @@ def concurrency_case():
 
 
 def trust_case():
-    print("\n=== trust: a teammate's R- entry is inert until Griffin trusts it ===")
+    print("\n=== trust: a teammate's R- entry is inert until the user trusts it ===")
     store, repo = tmp_store(), git_repo()
     rf = write_lessons_file(repo / ".claude" / "maestro-lessons.md", [
         entry("R-001", f"repo:{repo.name}", rule="Teammate rule one."),

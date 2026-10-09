@@ -20,7 +20,7 @@ What it no longer says, and why
 "Three one-agent dispatches in a row" and "N tool calls since the last
 dispatch" were style coaching, not news. In the field they fired on sweep
 chunks that are one agent each by design, on dispatches that each waited on
-Griffin's answer to the last, and on the conductor running its own gates —
+the user's answer to the last, and on the conductor running its own gates —
 and every lesson they produced was a rule telling the conductor to ignore
 them. The doctrine they enforced lives in the output style. The "agents in
 flight" header and the detached Haiku second opinion are gone too: the count

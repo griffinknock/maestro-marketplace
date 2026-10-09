@@ -28,57 +28,130 @@ What Maestro does about each:
 
 Everything below is the technical reference.
 
-Requires `python3` and `git`. Terminal spawning, notifications and the sleep
-assertion are macOS-only; everything else is portable. No pip packages.
-
 ---
 
 ## Install
 
+### Claude Code
+
 ```bash
+claude plugin marketplace add griffinknock/maestro-marketplace
+claude plugin install maestro@maestro-marketplace
+```
+
+Or from inside a session: `/plugin marketplace add griffinknock/maestro-marketplace`,
+then `/plugin install maestro@maestro-marketplace`, then `/reload-plugins`.
+
+That gives you the agents, hooks, commands, the sweep skill, the agent tree and
+the board. Two settings turn the rest on. Put them in `~/.claude/settings.json`:
+
+- `"outputStyle": "Maestro"` makes the session a conductor. Without it the
+  agents and hooks still work, but nothing plans waves or tiers dispatches.
+- `"statusLine"` set to `python3 "<plugin dir>/scripts/statusline.py"` with
+  `"refreshInterval": 3` gives you the two-row status line, and sweeps need it
+  for pacing (it records rate-limit usage). A marketplace install lives in
+  `~/.claude/plugins/cache/maestro-marketplace/maestro/<version>/`, so re-point
+  this after an update — or install from a clone, below, and it never moves.
+
+**Full setup from a clone.** `install.sh` does all of the above in one step. It
+validates the scripts, registers the marketplace, installs the plugin, and
+writes `statusLine`, `outputStyle`, agent-teams and a few read-only `git`
+permissions into `~/.claude/settings.json`. It backs up the old file first.
+
+```bash
+git clone https://github.com/griffinknock/maestro-marketplace.git
+cd maestro-marketplace
 ./install.sh
 ```
 
-Validates the scripts, registers the marketplace, installs the plugin, and
-writes `statusLine`, `outputStyle` and agent-teams settings into
-`~/.claude/settings.json` (backing up the old file first).
+Requires `python3` and `git`. Terminal spawning, notifications and the sleep
+assertion are macOS-only; everything else is portable. No pip packages.
+Optional: `brew install terminal-notifier` makes notifications clickable
+(they open the board). Without it `osascript` is used, which cannot carry a
+click action.
 
-Manual equivalent:
-
-```bash
-claude plugin marketplace add ./maestro-marketplace
-claude plugin install maestro@maestro-marketplace
-```
-
-Then set `statusLine` in `~/.claude/settings.json` to
-`python3 "<path>/maestro/scripts/statusline.py"` with `"refreshInterval": 3`.
-
-**Updating.** `claude plugin install` is a no-op when the plugin is already
-installed, regardless of version — it will not pick up source edits. To apply
-changes:
-
-```bash
-claude plugin uninstall maestro@maestro-marketplace
-claude plugin install maestro@maestro-marketplace
-```
-
-Hooks, agents and `subagentStatusLine` run from the installed copy under
-`~/.claude/plugins/cache/`. Only `statusLine` points at the source tree, so
-editing source changes the status line immediately and nothing else.
-
-**Updating to a new release.** After the marketplace source has a new
-version:
+**Updating.** Third-party marketplaces do not auto-update unless you turn it on
+in `/plugin` → Marketplaces. To take a new release:
 
 ```bash
 claude plugin marketplace update maestro-marketplace
 claude plugin update maestro@maestro-marketplace
 ```
 
-then restart Claude Code.
+then `/reload-plugins` or restart. `marketplace update` only refreshes the
+listing; `plugin update` is what installs the new version.
 
-Optional: `brew install terminal-notifier` makes notifications clickable
-(they open the board). Without it `osascript` is used, which cannot carry a
-click action.
+**Developing Maestro.** `claude plugin install` is a no-op when the plugin is
+already installed, so it will not pick up source edits. Uninstall and install
+again. Hooks, agents and `subagentStatusLine` run from the installed copy under
+`~/.claude/plugins/cache/`; only `statusLine` points at the source tree.
+
+### Codex
+
+There are two ways to combine them, and only the first gives you Maestro.
+
+- **Codex as a Maestro agent (recommended).** The `codex` agent hands a
+  well-specified change or a review to the Codex CLI in its own worktree, then
+  verifies and commits the result. Install Maestro in Claude Code as above,
+  install and log in to `codex`, and dispatch `codex` like any other agent.
+  See *Codex lane*.
+- **Maestro inside Codex.** Codex reads this marketplace as-is:
+
+  ```bash
+  codex plugin marketplace add griffinknock/maestro-marketplace
+  codex plugin add maestro@maestro-marketplace
+  ```
+
+  But a Codex plugin carries skills, MCP servers and apps, not hooks, agents or
+  output styles. Codex sees only the `sweep` skill, and that skill depends on
+  Claude Code's `/loop` and status line. The conductor, the re-check, the
+  ledger, the tree and the board are Claude Code features.
+
+### Ollama, gateways and cloud providers
+
+Maestro's hooks are local `python3` scripts and do not care which model
+answers. The agents ask for tiers by alias (`haiku`, `sonnet`, `opus`), so on
+any backend other than the Anthropic API, **map every alias to a real model**:
+
+```bash
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=<model for scout, scribe, codex>
+export ANTHROPIC_DEFAULT_SONNET_MODEL=<model for builder, adversary, section-lead, visual-reviewer>
+export ANTHROPIC_DEFAULT_OPUS_MODEL=<model for surgeon>
+```
+
+To put every subagent on one model instead, set
+`CLAUDE_CODE_SUBAGENT_MODEL=<model>` and `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1`.
+
+- **Ollama (local or Ollama Cloud).** `ollama launch claude` starts Claude Code
+  against Ollama, or set it up by hand
+  ([Ollama's guide](https://docs.ollama.com/integrations/claude-code)):
+
+  ```bash
+  export ANTHROPIC_BASE_URL=http://localhost:11434
+  export ANTHROPIC_AUTH_TOKEN=ollama
+  export ANTHROPIC_API_KEY=""
+  claude --model <model>
+  ```
+
+  Pick models that support tool calling and give local ones a 64K+ context
+  window. Ollama's API has no prompt caching, so a long conductor session
+  re-pays its whole context every turn — hand off at phase boundaries early.
+  If requests fail with 400s, try `CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1`
+  or `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`.
+- **Other gateways (LiteLLM, OpenRouter, a company proxy).** Anything that
+  serves the Anthropic Messages API: `ANTHROPIC_BASE_URL=<gateway>` plus
+  `ANTHROPIC_AUTH_TOKEN` (sent as a Bearer token) or `ANTHROPIC_API_KEY`
+  ([gateway docs](https://code.claude.com/docs/en/llm-gateway)).
+- **Amazon Bedrock, Google Vertex, Microsoft Foundry.** `CLAUDE_CODE_USE_BEDROCK=1`,
+  `CLAUDE_CODE_USE_VERTEX=1` (plus `CLOUD_ML_REGION`) or
+  `CLAUDE_CODE_USE_FOUNDRY=1`, with that provider's credentials. Pin the three
+  aliases here too: unpinned, they resolve to built-in defaults that can lag
+  the newest models (on Foundry `haiku` is still Haiku 4.5).
+
+Anthropic does not support routing Claude Code to non-Claude models, and
+Maestro is developed and tested against the Anthropic API. Expect a smaller
+model to follow the conductor doctrine and the agents' report contract less
+reliably than a Claude model does.
 
 ---
 
@@ -97,7 +170,6 @@ click action.
 | Re-check | Speaks only with news — an undelivered report, a silent agent, a repeated failure, a file collision, depth 5. Re-delivers swallowed reports as digest + pointer |
 | Mailbox prune | Drops stale teammate idle pings before the conductor is ever woken by them |
 | Sleep assertion | Holds `caffeinate` while agents are in flight |
-| Ghostty config | `ghostty/config` — keybinds, theme pairing, shell integration |
 | Cross-session lessons | Human-approved rules captured in one session, injected at the start of every later one — see *Lessons* |
 | Usage-aware sweep | Checkpointed long runs paced against real rate-limit usage instead of a fixed interval — see *Sweeps* |
 
@@ -422,13 +494,13 @@ Asking does not stop the orchestra — unblocked lanes keep running.
 A lesson is a small, human-approved rule about how Maestro should
 **orchestrate** — subagent tiering, dispatch/batching, briefs, how reports and
 messages pass back, questions, handoffs — never a project fact. Nothing
-becomes an active rule without Griffin's explicit yes to the exact bytes, and
+becomes an active rule without the user's explicit yes to the exact bytes, and
 a saved lesson is never edited or removed: a stale rule is only ever
 superseded by a newer entry that names it.
 
 **Capture.** Candidates arrive two ways. Automatically, when the re-check's
 findings point at the conductor's own behaviour: a file collision, a repeated
-failure, or depth 5. Only those three kinds are queued. Manually, when Griffin
+failure, or depth 5. Only those three kinds are queued. Manually, when the user
 corrects the conductor mid-session: `lessons.py flag --session <id> "<one line>"`.
 Capture never decides a candidate is a lesson; it only queues it. It skips a
 kind whose candidate was rejected, and keeps one pending candidate per kind
@@ -471,13 +543,13 @@ Ids are `L-NNN` in the personal store, `R-NNN` in a repo file. Scope is
   in.
 - **Per-repo file** — `<repo>/.claude/maestro-lessons.md`. `publish <id>`
   copies an accepted, repo-scoped personal lesson into it (uncommitted —
-  Griffin commits it with his work), so a team can share a rule. A repo
-  file's entry a teammate wrote is **untrusted** until Griffin runs `trust
+  the user commits it with their work), so a team can share a rule. A repo
+  file's entry a teammate wrote is **untrusted** until the user runs `trust
   <R-NNN> --sha <sha256>`, binding the approval to the exact bytes shown.
 
 **The approvals ledger** (`lessons-approved.jsonl`, next to the store
 directory, or `$MAESTRO_LESSONS_APPROVALS`) is the external anchor for
-"Griffin said yes to exactly these bytes": one JSON line per approval, each
+"the user said yes to exactly these bytes": one JSON line per approval, each
 carrying the sha256 of the entry it covers and a hash chain over every
 record, so editing, reordering, or cutting a line out of the middle is
 detectable. It is **tamper-evident** against accidental or naive edits — a
@@ -485,7 +557,7 @@ hand edit, a script rewriting a file, a git history rewrite — and it is
 **not** a defense against deliberate forgery by code that already has write
 access to `~/.claude`: there is no secret, so such code could append a
 forged entry and a matching chain. The real guard against that is never
-running `accept`/`publish`/`trust` except immediately after Griffin's
+running `accept`/`publish`/`trust` except immediately after the user's
 explicit yes to the exact bytes shown.
 
 **Injection.** The `SessionStart` hook (`lessons.py inject`) prints an active,
@@ -548,7 +620,7 @@ kept as `policy.vN.json`), `findings.jsonl`, `amendments.jsonl`, and
 |---|---|
 | `locked` | log only — `add` refuses |
 | `additive` (default) | add a new item, never edit the plan or drop items |
-| `adaptive` | amend the plan after Griffin approves a non-blocking question |
+| `adaptive` | amend the plan after the user approves a non-blocking question |
 | `autonomous` | amend the plan freely, logged |
 
 **Pacing.** `pace.py` reads `usage.json` (written by the statusLine's own
@@ -568,7 +640,7 @@ a minted token. A `/loop` also holds a lease so a sleeping loop still owns
 the sweep between chunks; `/clear` changes the session id, so a chunk or
 lease left by the pre-`/clear` session needs `takeover`. `set-policy` changes
 a running sweep's policy (a ceiling, `chunk_size`, deviation, `allow_blind`)
-only on Griffin's explicit request.
+only on the user's explicit request.
 
 **Exit codes** (`sweep_state.py`):
 
@@ -674,7 +746,7 @@ so one orphaned by a deleted session dir dies on its own.
                            pace.py/sweep_state.py
 
 <repo>/.claude/maestro-lessons.md   published, repo-scoped lessons (R-NNN) —
-                                    uncommitted by `publish`; Griffin commits it
+                                    uncommitted by `publish`; the user commits it
 ```
 
 Add `.claude/maestro/` to `.gitignore`; commit `baselines/` if you want visual
@@ -736,12 +808,6 @@ echo '{"columns":100,"tasks":[{"id":"1","type":"scout","status":"running","descr
 
 **Board says "no session yet".** The ledger writes on the first hook. Run one
 turn, then reload.
-
-**Ghostty theme is wrong.** On macOS Ghostty reads both
-`~/.config/ghostty/config` and
-`~/Library/Application Support/com.mitchellh.ghostty/config`, applying the
-latter last. A `theme =` there silently overrides. `+validate-config` will not
-catch it — compare `+show-config` against the file.
 
 **Ghostty tab opens and dies.** Ghostty runs `command` under
 `bash --noprofile --norc` with the app's GUI PATH, so a binary in `~/.local/bin`

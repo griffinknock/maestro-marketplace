@@ -2,7 +2,18 @@
   "name": "maestro",
   "version": "0.6.0",
   "description": "Conductor-first orchestration for Claude Code. Model-tiered subagents, depth-5 nesting, worktree isolation, per-agent token accounting, validated phase-boundary handoffs (/handoff), a live indented agent tree in the terminal, and a local board with fan-out DAGs, token spend, clickable links, copyable commands, and screenshot review.",
-  "author": { "name": "Griffin" },
+  "author": {
+    "name": "Griffin Knock",
+    "url": "https://github.com/griffinknock"
+  },
   "license": "MIT",
-  "keywords": ["orchestration", "subagents", "worktrees", "dashboard", "visualization"]
+  "keywords": [
+    "orchestration",
+    "subagents",
+    "worktrees",
+    "dashboard",
+    "visualization"
+  ],
+  "homepage": "https://github.com/griffinknock/maestro-marketplace",
+  "repository": "https://github.com/griffinknock/maestro-marketplace"
 }
