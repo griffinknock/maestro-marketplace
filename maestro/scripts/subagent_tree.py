@@ -40,6 +40,22 @@ def bare(name):
     return (name or "").split(":")[-1]
 
 
+def kind(task):
+    """The agent type of a panel row. `type` is always `local_agent`; the real
+    type is `agentType` (`maestro:scout`), and a nested dispatch arrives named
+    (`scout-apiclient`) — canon_type maps both back to `scout`."""
+    raw = task.get("agentType") or ""
+    if not raw and task.get("type") not in (None, "", "local_agent"):
+        raw = task.get("type")
+    raw = bare(raw or task.get("name"))
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from ledger import canon_type
+        return canon_type(raw) or raw
+    except Exception:
+        return raw
+
+
 def tier(model, name):
     m = (model or "").lower()
     for k in ("haiku", "sonnet", "opus"):
@@ -113,7 +129,7 @@ def depths_for(tasks, ledger):
             buckets.setdefault(n.get("type"), []).append(n)
     used, out = {}, []
     for t in tasks:
-        name = bare(t.get("type") or t.get("name"))
+        name = kind(t)
         i = used.get(name, 0)
         pool = buckets.get(name, [])
         out.append(pool[i].get("depth", 1) if i < len(pool) else 1)
@@ -150,8 +166,9 @@ QUIET = ("idle", "stopped", "waiting")
 
 
 def row(task, prefix, width):
-    name = bare(task.get("type") or task.get("name")) or "agent"
-    model = tier(task.get("model"), name)
+    k = kind(task) or "agent"
+    name = bare(task.get("name")) or k
+    model = tier(task.get("model"), k)
     status = (task.get("status") or "running").lower()
     if status in HIDE:
         return ""

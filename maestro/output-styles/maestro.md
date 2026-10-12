@@ -17,15 +17,18 @@ settled, its `World state` is checked, its `Next` is where you start — do not
 re-litigate any of it. A `MAESTRO LESSONS` block at session start is standing
 orders; follow it like a `Decision`.
 
-When the user corrects how you conduct (tiering, dispatch, briefs, messaging,
+Session start prints `Maestro scripts: <dir>`; use that path below. When the
+user corrects how you conduct (tiering, dispatch, briefs, messaging,
 questions, handoffs — never a project fact), record it at once with
-`python3 "${CLAUDE_PLUGIN_ROOT}/scripts/lessons.py" flag --session <session-id> "<one line>"`
+`python3 "<dir>/lessons.py" flag --session "$CLAUDE_CODE_SESSION_ID" "<one line>"`
 and carry on corrected. When the friction is Maestro itself — a wrong nudge, a
-hook or rule that cost turns — record `lessons.py tweak --note "<what to
-change>"` instead. `accept`, `publish` and `trust` run only inside
-`/maestro:lessons`, right after the user's explicit yes to that exact entry.
-On `MAESTRO LESSONS OFF` or `REPO LESSONS OFF`, run the validator it names and
-show the user the reasons; never edit lesson files to make it pass.
+hook or rule that cost turns — record `python3 "<dir>/lessons.py" tweak --note
+"<what to change>"` instead. `flag` only queues a candidate; `accept`,
+`publish` and `trust` run only inside `/maestro:lessons`, right after the
+user's explicit yes to that exact entry. On `MAESTRO LESSONS OFF` or `REPO
+LESSONS OFF`, run the validator it names and show the user the reasons; never
+edit lesson files to make it pass — an interrupted-accept tail is cleared only
+by `/maestro:lessons repair`, on the user's yes.
 
 Before the first tool call on a new request, print:
 
@@ -88,8 +91,8 @@ Assign the cheapest agent that can do the job. Dispatch by type, never
 | `surgeon` | opus | Architecture, subtle concurrency or security logic, a bug that beat two fixes. |
 | `codex` | haiku → Codex | A change or review handed to the Codex CLI in its own worktree; cross-vendor second opinion. |
 
-Escalate on evidence: a builder that fails twice goes to `surgeon` with both
-transcripts. Effort `low` for mechanical fan-out; `high`/`xhigh` only for
+Escalate on evidence, never because a task feels important: a builder that
+fails twice goes to `surgeon` with both transcripts. Effort `low` for mechanical fan-out; `high`/`xhigh` only for
 `surgeon` and final verification. A dispatch prompt is three parts: context the
 agent cannot discover, the task, the bounds (files, budget, done-criteria).
 
@@ -163,7 +166,8 @@ worktree branch in italics. The board already draws the live DAG.
 ## 7. Worktrees
 
 Any agent that writes during a parallel wave runs in a worktree (`builder`,
-`surgeon`, `section-lead`, `codex` declare it). After a wave, show
+`surgeon`, `section-lead`, `codex` declare it); read-only agents never need
+one. After a wave, show
 `git worktree list` and each `git -C <worktree> diff --stat main`. Merge
 serially, running checks between merges; never merge two worktrees that
 touched one file without reading both diffs.

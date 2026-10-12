@@ -416,6 +416,18 @@ class _Lock:
         return False
 
 
+def ended_on_report(n):
+    """True when the agent's last word is a RETURN report (full copy first;
+    `result` keeps only the tail, which can miss the RETURN: header)."""
+    txt = ""
+    if n.get("report_path"):
+        try:
+            txt = Path(n["report_path"]).read_text()
+        except OSError:
+            txt = ""
+    return looks_like_report(txt or n.get("result") or "")
+
+
 def who_named(n, payload):
     return (n or {}).get("name") or payload.get("teammate_name") or "teammate"
 
@@ -505,6 +517,12 @@ def prune_inbox(state, payload, deadline=0.0):
             if not frame or frame.get("type") not in PRUNABLE:
                 keep.append(m)
                 continue
+            # A teammate's report travels *inside* its idle frame (`result`),
+            # and so does a failure. Pruning those deleted the report itself:
+            # one field session lost three of seven evaluations this way.
+            if frame.get("result") or frame.get("failureReason"):
+                keep.append(m)
+                continue
             if retired(by_name.get(m.get("from"))):
                 dropped.append({"from": m.get("from"), "at": time.time(),
                                 "reason": frame.get("idleReason") or "available"})
@@ -570,19 +588,23 @@ def project_root(cwd):
     return p
 
 
-def rel_path(path, root):
-    """A written file as a key two checkouts of one repo agree on.
-
-    `R/.claude/worktrees/<name>/src/x.py` and `R/src/x.py` are the same file
-    at merge time, so both become `src/x.py` relative to `root`. Comparing
-    absolute paths meant two builders in their own worktrees never collided.
+def merge_key(path):
+    """The file a write lands on at merge time: its real path with every
+    `.claude/worktrees/<name>` segment removed. Two checkouts of one repo —
+    and two sessions rooted at different levels of one workspace — agree on
+    it. Comparing raw paths meant builders in their own worktrees never
+    collided. Symlinks are resolved (macOS /var and /tmp live in /private).
     """
-    # Resolve both sides: on macOS /var and /tmp are symlinks into /private,
-    # and a root resolved one way never prefixes a path written the other.
     p = os.path.realpath(str(path)).replace("\\", "/")
-    if "/.claude/worktrees/" in p:
+    while "/.claude/worktrees/" in p:
         base, rest = p.split("/.claude/worktrees/", 1)
         p = base.rstrip("/") + "/" + (rest.split("/", 1)[1] if "/" in rest else "")
+    return p
+
+
+def rel_path(path, root):
+    """`merge_key` shown relative to `root`, for messages."""
+    p = merge_key(path)
     r = os.path.realpath(str(root)).replace("\\", "/").rstrip("/") + "/"
     return p[len(r):] if p.startswith(r) else p
 
@@ -1227,7 +1249,9 @@ def main():
                      if v.get("name") == payload.get("teammate_name")), None)
                 if retired(mate):
                     wait = time.time() + IDLE_CATCH
-                    if not KEEP_TEAMMATES:
+                    # Stop only a teammate whose last word was a RETURN report.
+                    # One that ended on a question is waiting for an answer.
+                    if not KEEP_TEAMMATES and ended_on_report(mate):
                         retire = who_named(mate, payload)
             prune_inbox(state, payload, wait)
             tmp = sf.with_suffix(".tmp")
@@ -1236,6 +1260,13 @@ def main():
             caffeinate(d, state, payload.get("hook_event_name") or "")
         finally:
             fcntl.flock(lf, fcntl.LOCK_UN)
+    if payload.get("hook_event_name") == "SessionStart" and not payload.get("agent_id"):
+        # Output styles get no ${CLAUDE_PLUGIN_ROOT} and the Bash tool has no
+        # such variable, so the conductor learns the scripts' real path here.
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": f"Maestro scripts: {Path(__file__).resolve().parent}"},
+            "suppressOutput": True}))
     if retire:
         # Idle teammates kept their context and process until the session
         # ended — about three alive at every stop across the field ledgers —

@@ -61,7 +61,7 @@ try:
 except Exception:
     _lessons = None
 try:
-    from ledger import last_alive, project_root, rel_path, session_ledger
+    from ledger import last_alive, merge_key, project_root, rel_path, session_ledger, sessions_dir
 except Exception:
     def last_alive(state, n):
         return float(n.get("last_activity") or n.get("started") or 0)
@@ -74,6 +74,12 @@ except Exception:
 
     def rel_path(path, root):
         return str(path)
+
+    def merge_key(path):
+        return str(path)
+
+    def sessions_dir():
+        return Path("/nonexistent")
 
 DEBUG = os.environ.get("MAESTRO_DEBUG") == "1"
 OFF = os.environ.get("MAESTRO_REORCH") == "0"
@@ -244,12 +250,13 @@ def check(state, now):
     root = project_root(state.get("cwd"))
     seen = {}
     for n in live:
-        for key in {rel_path(p, root) for p in (n.get("writes") or [])}:
+        for key in {merge_key(p) for p in (n.get("writes") or [])}:
             owner = seen.get(key)
             if owner and owner[0] != n.get("id"):
-                f.append((f"collide:{key}",
+                shown = rel_path(key, root)
+                f.append((f"collide:{shown}",
                           f"{owner[1]} and {who(n)} are both live on "
-                          f"{key} — serialize them or the merge conflicts."))
+                          f"{shown} — serialize them or the merge conflicts."))
             seen.setdefault(key, (n.get("id"), who(n)))
 
     # Depth ceiling. Only the hard stop is news.
@@ -262,8 +269,10 @@ def check(state, now):
 def peer_findings(d, state, now):
     """Another conductor's live agent writing a file this session's are.
 
-    Only sessions sharing this project's ledger directory, and only when this
-    session has live writers — so a quiet session pays one dict lookup.
+    Every live registered session counts, not only ones sharing this ledger
+    directory — a conductor at a workspace root and one inside a repo of it
+    write the same files. Runs only while this session has live writers, so a
+    quiet session pays one dict lookup. One finding per peer, listing files.
     """
     live = [n for n in state.get("nodes", {}).values()
             if n.get("id") != ROOT and n.get("status") in LIVE and n.get("writes")]
@@ -273,33 +282,42 @@ def peer_findings(d, state, now):
     mine = {}
     for n in live:
         for p in n["writes"]:
-            mine.setdefault(rel_path(p, root), who(n))
+            mine.setdefault(merge_key(p), who(n))
     out = []
     try:
-        siblings = [x for x in d.parent.iterdir() if x.is_dir() and x != d]
+        entries = [f for f in sessions_dir().iterdir() if not f.name.startswith(".")]
     except OSError:
         return out
-    for sib in siblings:
-        sf = sib / "state.json"
+    for f in entries:
         try:
+            sib = Path(f.read_text().strip())
+            if not str(sib) or sib == d:
+                continue
+            sf = sib / "state.json"
             if now - sf.stat().st_mtime > PEER_WINDOW:
                 continue
             other = json.loads(sf.read_text())
         except (OSError, json.JSONDecodeError):
             continue
-        peer = other.get("peer_name")
-        name = f'"{peer}"' if peer else f"session {sib.name} (run ListAgents to find its name)"
-        oroot = project_root(other.get("cwd"))
+        hits = {}
         for n in other.get("nodes", {}).values():
             if n.get("id") == ROOT or n.get("status") not in LIVE:
                 continue
-            for key in {rel_path(p, oroot) for p in (n.get("writes") or [])}:
-                if key in mine:
-                    out.append((f"peer:{sib.name}:{key}",
-                                f"{key} is also being written by another conductor's "
-                                f"{who(n)} ({name}), while your {mine[key]} writes it. "
-                                f"Agree who goes first before either side merges — "
-                                f"SendMessage to {name}."))
+            for p in (n.get("writes") or []):
+                k = merge_key(p)
+                if k in mine:
+                    hits.setdefault(rel_path(k, root), (who(n), mine[k]))
+        if not hits:
+            continue
+        peer = other.get("peer_name")
+        name = f'"{peer}"' if peer else f"session {f.name} (run ListAgents to find its name)"
+        files = sorted(hits)
+        theirs = sorted({v[0] for v in hits.values()})
+        out.append((f"peer:{f.name}:{','.join(files)}",
+                    f"another conductor ({name}) has {', '.join(theirs)} writing "
+                    f"{', '.join(files[:6])}{' …' if len(files) > 6 else ''} — files your "
+                    f"agents are writing too. Agree who goes first before either side "
+                    f"merges: SendMessage to {name}."))
     return out
 
 
@@ -357,10 +375,11 @@ def main():
         if not fresh:
             return
         capture_lessons(payload, fresh)
-        reports = [t for fp, t in fresh if fp.startswith("report:")]
-        shape = [t for fp, t in fresh if not fp.startswith("report:")]
-        out = "\n".join(reports + [f"MAESTRO — {t}" for t in shape[:5]])
-        save_said(d, said | seen)
+        reports = [(fp, t) for fp, t in fresh if fp.startswith("report:")]
+        shape = [(fp, t) for fp, t in fresh if not fp.startswith("report:")][:5]
+        out = "\n".join([t for _, t in reports] + [f"MAESTRO — {t}" for _, t in shape])
+        # Only what was shown counts as said; the rest surfaces next call.
+        save_said(d, said | {fp for fp, _ in reports + shape})
 
     print(json.dumps({
         "hookSpecificOutput": {

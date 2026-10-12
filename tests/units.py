@@ -586,6 +586,111 @@ def panel_case():
     check("idle row has no context bar or clock",
           "idle" in rows.get("3", "") and "%" not in rows.get("3", ""), rows.get("3"))
     check("running row still drawn", "reading" in rows.get("1", ""), rows.get("1"))
+    r = subprocess.run([sys.executable, str(PLUGIN / "subagent_tree.py")],
+                       input=json.dumps({"columns": 100, "tasks": [
+                           {"id": "9", "type": "local_agent", "agentType": "maestro:surgeon",
+                            "status": "running", "description": "fix"}]}),
+                       capture_output=True, text=True, env=ENV)
+    check("rows are labelled by agentType, not local_agent",
+          "surgeon" in r.stdout and "local_agent" not in r.stdout, r.stdout)
+
+
+def report_frame_case():
+    """An idle frame carrying a teammate's report is the report: never pruned."""
+    print("\n=== idle frames carrying a report survive pruning ===")
+    sid = "bbbb0005-0000-0000-0000-00000000000a"
+    team = Path.home() / ".claude" / "teams" / f"session-{sid[:8]}"
+    shutil.rmtree(team, ignore_errors=True)
+    (team / "inboxes").mkdir(parents=True)
+    (team / "config.json").write_text(json.dumps({
+        "leadAgentId": "lead@x", "members": [{"agentId": "lead@x", "name": "team-lead"}]}))
+
+    def frame(who, **kw):
+        return {"from": who, "timestamp": "t", "text": json.dumps(
+            {"type": "idle_notification", "from": who, "timestamp": "t", **kw})}
+
+    box = team / "inboxes" / "team-lead.json"
+    box.write_text(json.dumps([frame("eval-a"),
+                               frame("eval-b", result="RETURN:\n  answer: grafana scored 7/10"),
+                               frame("eval-c", failureReason="API error")]))
+    try:
+        ws = ws_git()
+        c = Conductor(PLUGIN, ws, sid)
+        c.fire(hook_event_name="SessionStart", source="startup")
+        ids = c.dispatch(3, names=["eval-a", "eval-b", "eval-c"])
+        for n in ("eval-a", "eval-b", "eval-c"):
+            c.finish(ids[n], n)
+        c.tool_call()
+        left = [m["from"] for m in json.loads(box.read_text())]
+        check("a bare ping from a reported agent is pruned", "eval-a" not in left, left)
+        check("a frame carrying result is kept", "eval-b" in left, left)
+        check("a frame carrying failureReason is kept", "eval-c" in left, left)
+    finally:
+        shutil.rmtree(team, ignore_errors=True)
+
+
+def question_not_retired_case():
+    """A teammate whose last word is a question is waiting, not done."""
+    print("\n=== a teammate that asked a question is not stopped ===")
+    ws = ws_git()
+    c = Conductor(PLUGIN, ws, "bbbb0006-0000-0000-0000-00000000000a")
+    c.fire(hook_event_name="SessionStart", source="startup")
+    ids = c.dispatch(1, names=["impl-q"])
+    c.finish(ids["impl-q"], "impl-q", last="Should the migration also backfill old rows?")
+    p = {"session_id": c.sid, "cwd": str(ws), "hook_event_name": "TeammateIdle",
+         "teammate_name": "impl-q", "agent_id": ids["impl-q"]}
+    r = subprocess.run([sys.executable, str(PLUGIN / "ledger.py")], input=json.dumps(p),
+                       capture_output=True, text=True, env=ENV)
+    check("no continue:false for a question", "continue" not in r.stdout, r.stdout)
+
+
+def merge_key_case():
+    """One file, however it is reached, is one key."""
+    print("\n=== merge keys ===")
+    sys.path.insert(0, str(PLUGIN))
+    import ledger
+    ws = ws_git()
+    a = ledger.merge_key(ws / "infra" / "src" / "x.ts")
+    b = ledger.merge_key(ws / "infra" / ".claude" / "worktrees" / "w1" / "src" / "x.ts")
+    c = ledger.merge_key(ws / ".claude" / "worktrees" / "a" / ".claude" / "worktrees" / "b" / "y.py")
+    check("main checkout and a worktree agree", a == b, (a, b))
+    check("nested worktrees strip fully", c == ledger.merge_key(ws / "y.py"), c)
+    check("display is relative to the given root",
+          ledger.rel_path(a, ws) == "infra/src/x.ts" and ledger.rel_path(a, ws / "infra") == "src/x.ts")
+
+
+def cross_root_peer_case():
+    """A conductor at a workspace root and one inside a repo of it collide."""
+    print("\n=== peers at different roots of one workspace ===")
+    ws = workspace()                                   # workspace root: .claude, no .git
+    repo = ws / "infra"
+    (repo / ".git").mkdir(parents=True)
+    top = Conductor(PLUGIN, ws, "bbbb0007-0000-0000-0000-00000000000a")
+    inner = Conductor(PLUGIN, repo, "bbbb0008-0000-0000-0000-00000000000b")
+    for c in (top, inner):
+        c.fire(hook_event_name="SessionStart", source="startup")
+    it = top.dispatch(1, kind="builder", names=["builder-top"])
+    ii = inner.dispatch(1, kind="builder", names=["builder-in"])
+    top.fire(hook_event_name="PostToolUse", tool_name="Edit", agent_id=it["builder-top"],
+             agent_type="builder-top", tool_input={"file_path": str(repo / "src" / "x.ts")},
+             tool_response={"ok": True})
+    wt_edit(inner, ii["builder-in"], "builder-in", repo, "agent-in", "src/x.ts")
+    top.tool_call()
+    check("the workspace-root conductor hears about the repo conductor",
+          any("another conductor" in m and "infra/src/x.ts" in m for m in top.msgs), top.msgs)
+
+
+def scripts_dir_case():
+    """Session start tells the conductor where the scripts really are."""
+    print("\n=== session start names the scripts directory ===")
+    ws = ws_git()
+    p = {"session_id": "bbbb0009-0000-0000-0000-00000000000a", "cwd": str(ws),
+         "hook_event_name": "SessionStart", "source": "startup"}
+    r = subprocess.run([sys.executable, str(PLUGIN / "ledger.py")], input=json.dumps(p),
+                       capture_output=True, text=True, env=ENV)
+    ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"] if r.stdout else ""
+    check("an absolute path to lessons.py's directory",
+          ctx.startswith("Maestro scripts: ") and Path(ctx.split(": ", 1)[1], "lessons.py").is_file(), ctx)
 
 
 def main():
@@ -607,6 +712,11 @@ def main():
     peers_case()
     teammate_retire_case()
     panel_case()
+    report_frame_case()
+    question_not_retired_case()
+    merge_key_case()
+    cross_root_peer_case()
+    scripts_dir_case()
     print("\n  " + ("PASS" if not FAILURES else f"FAIL ({len(FAILURES)})"))
     return 1 if FAILURES else 0
 
