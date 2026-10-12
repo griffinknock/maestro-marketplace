@@ -281,7 +281,7 @@ def collide_case():
     said = "\n".join(c.msgs)
     check("two readers of one file are not a collision",
           "reviewer-contract.md" not in said, said[-200:])
-    check("two writers of one file still are", "both live on WaveTabs.tsx" in said,
+    check("two writers of one file still are", "both live on" in said and "WaveTabs.tsx" in said,
           said[-200:])
 
 
@@ -489,6 +489,105 @@ def untyped_failure_case():
     check("builder's two failures still reported", "fail:builder:2" in found, found)
 
 
+def ws_git():
+    ws = workspace()
+    (ws / ".git").mkdir()
+    return ws
+
+
+def wt_edit(c, aid, name, ws, wt, rel):
+    path = ws / ".claude" / "worktrees" / wt / rel
+    c.fire(hook_event_name="PostToolUse", tool_name="Edit", agent_id=aid, agent_type=name,
+           cwd=str(ws / ".claude" / "worktrees" / wt), tool_input={"file_path": str(path)},
+           tool_response={"ok": True})
+
+
+def worktree_collide_case():
+    """Two builders editing one repo file in their own worktrees collide."""
+    print("\n=== collisions across worktrees ===")
+    ws = ws_git()
+    c = Conductor(PLUGIN, ws, "bbbb0001-0000-0000-0000-00000000000a")
+    c.fire(hook_event_name="SessionStart", source="startup")
+    ids = c.dispatch(2, kind="builder", names=["builder-l", "builder-r"])
+    wt_edit(c, ids["builder-l"], "builder-l", ws, "agent-l", "src/x.py")
+    wt_edit(c, ids["builder-r"], "builder-r", ws, "agent-r", "src/x.py")
+    c.tool_call()
+    check("same repo file in two worktrees is a collision",
+          any("both live on src/x.py" in m for m in c.msgs), c.msgs)
+
+
+def peers_case():
+    """Conductor addresses are captured, listed by peers.py, and a peer's
+    agent writing the same file is reported to the other conductor."""
+    print("\n=== conductors see each other ===")
+    ws = ws_git()
+    a = Conductor(PLUGIN, ws, "bbbb0002-0000-0000-0000-00000000000a")
+    b = Conductor(PLUGIN, ws, "bbbb0003-0000-0000-0000-00000000000b")
+    for c, name in ((a, "proj-aa"), (b, "proj-bb")):
+        c.fire(hook_event_name="SessionStart", source="startup")
+        c.fire(hook_event_name="PostToolUse", tool_name="ListAgents", tool_input={},
+               tool_response={"listing": f"This session is {name} [abc123] — the name"})
+    check("own address captured", a.state().get("peer_name") == "proj-aa", a.state().get("peer_name"))
+    ia = a.dispatch(1, kind="builder", names=["builder-a"])
+    ib = b.dispatch(1, kind="builder", names=["builder-b"])
+    wt_edit(b, ib["builder-b"], "builder-b", ws, "agent-b", "api/handler.ts")
+    r = subprocess.run([sys.executable, str(PLUGIN / "peers.py"), "--json"], cwd=ws,
+                       capture_output=True, text=True,
+                       env={**ENV, "CLAUDE_CODE_SESSION_ID": a.sid})
+    here = os.path.realpath(ws)
+    rows = [x for x in json.loads(r.stdout or "[]") if os.path.realpath(x["repo"]) == here]
+    check("peers.py lists the other conductor, not itself",
+          [x["address"] for x in rows] == ["proj-bb"], r.stdout + r.stderr)
+    check("with the file its agent is writing",
+          rows and rows[0]["writing"] == ["api/handler.ts"], rows)
+    wt_edit(a, ia["builder-a"], "builder-a", ws, "agent-a", "api/handler.ts")
+    a.tool_call()
+    hits = [m for m in a.msgs if "another conductor" in m and '"proj-bb"' in m]
+    check("the overlap is reported once, naming the peer's address", len(hits) == 1, a.msgs)
+    a.tool_call()
+    check("and not repeated", len([m for m in a.msgs if "another conductor" in m]) == 1)
+
+
+def teammate_retire_case():
+    """A teammate that has reported is stopped when it goes idle."""
+    print("\n=== reported teammates are retired, not left idling ===")
+    ws = ws_git()
+    c = Conductor(PLUGIN, ws, "bbbb0004-0000-0000-0000-00000000000a")
+    c.fire(hook_event_name="SessionStart", source="startup")
+    ids = c.dispatch(2, names=["scout-done", "scout-busy"])
+    c.finish(ids["scout-done"], "scout-done")
+
+    def idle(name, aid, extra=None):
+        p = {"session_id": c.sid, "cwd": str(ws), "hook_event_name": "TeammateIdle",
+             "teammate_name": name, "agent_id": aid}
+        r = subprocess.run([sys.executable, str(PLUGIN / "ledger.py")], input=json.dumps(p),
+                           capture_output=True, text=True, env={**ENV, **(extra or {})})
+        return r.stdout.strip()
+
+    out = idle("scout-done", ids["scout-done"])
+    check("stopped with continue:false",
+          out and json.loads(out).get("continue") is False and "Message it" in out, out)
+    check("a teammate still working is left alone", idle("scout-busy", ids["scout-busy"]) == "")
+    check("MAESTRO_KEEP_TEAMMATES=1 keeps it",
+          idle("scout-done", ids["scout-done"], {"MAESTRO_KEEP_TEAMMATES": "1"}) == "")
+
+
+def panel_case():
+    """Finished agents leave the panel; idle ones are one quiet line."""
+    print("\n=== agent panel hides finished rows ===")
+    tasks = [{"id": "1", "type": "scout", "status": "running", "description": "reading"},
+             {"id": "2", "type": "builder", "status": "completed", "description": "done"},
+             {"id": "3", "type": "builder", "status": "idle", "description": "waiting"}]
+    r = subprocess.run([sys.executable, str(PLUGIN / "subagent_tree.py")],
+                       input=json.dumps({"columns": 100, "tasks": tasks}),
+                       capture_output=True, text=True, env=ENV)
+    rows = {x["id"]: x["content"] for x in map(json.loads, r.stdout.splitlines())}
+    check("completed row hidden", rows.get("2") == "", rows)
+    check("idle row has no context bar or clock",
+          "idle" in rows.get("3", "") and "%" not in rows.get("3", ""), rows.get("3"))
+    check("running row still drawn", "reading" in rows.get("1", ""), rows.get("1"))
+
+
 def main():
     tokens_case()
     digest_case()
@@ -504,6 +603,10 @@ def main():
     cd_up_case()
     long_tool_case()
     untyped_failure_case()
+    worktree_collide_case()
+    peers_case()
+    teammate_retire_case()
+    panel_case()
     print("\n  " + ("PASS" if not FAILURES else f"FAIL ({len(FAILURES)})"))
     return 1 if FAILURES else 0
 

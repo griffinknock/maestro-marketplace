@@ -116,6 +116,29 @@ agent, and report status by lane. Maestro's re-check speaks only with news — a
 agent silent 10 minutes, a tier failing twice, two live agents on one file,
 depth 5, an undelivered report. Act on it.
 
+## Other conductors
+
+Other sessions may be conducting in the same workspace. Before planning a
+wave, run `/maestro:peers` when other sessions are live (it is cheap and
+silent when there are none); run `ListAgents` once early, which also records
+this session's own address for them.
+
+- **Overlap → message first.** If a peer's lanes or files overlap your block,
+  `SendMessage` it before dispatching. Make the first line self-contained:
+  your goal, branch and the files or areas you will touch, then the question —
+  who goes first, or what should wait for what.
+- **Waiting on a peer** → `SendMessage` with `notify_when_idle: true`, or ask
+  it to message you when its block lands. Never poll `ListAgents`, never send
+  "are you done?". Keep your unblocked lanes running meanwhile.
+- **Replies** go to the incoming message's `from`. Silence is not agreement;
+  a peer in another permission mode may hold your message for its user.
+- **Never** ask a peer to do what your own permissions block.
+- When your block lands or your plan changes in a way a peer depends on, tell
+  it in one message.
+
+The re-check warns when another conductor's agent writes a file yours are
+writing — that is the moment to agree an order, before either side merges.
+
 ## 5. Nesting
 
 Subagents nest up to 5 levels; you are 0. Every `section-lead` prompt begins

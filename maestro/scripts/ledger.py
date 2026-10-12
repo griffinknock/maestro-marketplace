@@ -48,6 +48,9 @@ RETURN_BLOCK = re.compile(r"(?:^|\n)\s*RETURN:\s*(?:\n|$)")
 REPORT_MAX = int(os.environ.get("MAESTRO_REPORT_MAX", "40000"))
 REPORT_TAIL_BYTES = 512_000
 SAFE_ID = re.compile(r"[^A-Za-z0-9._-]")
+# The first line of a ListAgents result names this session's own address —
+# what other conductors pass as SendMessage `to`. No hook payload carries it.
+PEER_NAME = re.compile(r"This session is (.+?) \[([0-9a-f]+)\]")
 
 
 def is_protocol_frame(txt):
@@ -353,6 +356,9 @@ PRUNABLE = ("idle_notification",)
 # bounded, and only when the agent is already retired so there is definitely
 # something to take back out.
 IDLE_CATCH = float(os.environ.get("MAESTRO_IDLE_CATCH", "1.5"))
+# A teammate that has reported is stopped when it goes idle. It stays
+# addressable: a message by name revives it with its conversation intact.
+KEEP_TEAMMATES = os.environ.get("MAESTRO_KEEP_TEAMMATES") == "1"
 
 
 def team_dir(payload):
@@ -408,6 +414,10 @@ class _Lock:
             except OSError:
                 pass
         return False
+
+
+def who_named(n, payload):
+    return (n or {}).get("name") or payload.get("teammate_name") or "teammate"
 
 
 def retired(n):
@@ -558,6 +568,23 @@ def project_root(cwd):
         if (parent / ".git").exists() or (parent / ".claude").is_dir():
             return parent
     return p
+
+
+def rel_path(path, root):
+    """A written file as a key two checkouts of one repo agree on.
+
+    `R/.claude/worktrees/<name>/src/x.py` and `R/src/x.py` are the same file
+    at merge time, so both become `src/x.py` relative to `root`. Comparing
+    absolute paths meant two builders in their own worktrees never collided.
+    """
+    # Resolve both sides: on macOS /var and /tmp are symlinks into /private,
+    # and a root resolved one way never prefixes a path written the other.
+    p = os.path.realpath(str(path)).replace("\\", "/")
+    if "/.claude/worktrees/" in p:
+        base, rest = p.split("/.claude/worktrees/", 1)
+        p = base.rstrip("/") + "/" + (rest.split("/", 1)[1] if "/" in rest else "")
+    r = os.path.realpath(str(root)).replace("\\", "/").rstrip("/") + "/"
+    return p[len(r):] if p.startswith(r) else p
 
 
 def outside_worktrees(cwd):
@@ -906,6 +933,12 @@ def apply(state, payload, d=None):
                    wrote=tool in WRITE_TOOLS and ev == "PostToolUse")
         if ev == "PostToolUseFailure":
             n["tools"]["!failed"] = n["tools"].get("!failed", 0) + 1
+        elif tool == "ListAgents" and me == ROOT:
+            resp = payload.get("tool_response")
+            text = resp.get("listing", "") if isinstance(resp, dict) else str(resp or "")
+            m = PEER_NAME.search(text)
+            if m:
+                state["peer_name"], state["peer_ref"] = m.group(1), m.group(2)
 
     elif ev == "SubagentStart":
         aid = payload.get("agent_id")
@@ -1172,6 +1205,7 @@ def main():
 
     d = home(payload)
     lock = d / ".lock"
+    retire = None
     with open(lock, "w") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
         try:
@@ -1187,10 +1221,14 @@ def main():
             state.setdefault("nodes", {}).setdefault(ROOT, blank(payload)["nodes"][ROOT])
             state = apply(state, payload, d)
             wait = 0.0
-            if (payload.get("hook_event_name") == "TeammateIdle"
-                    and retired(next((v for v in state["nodes"].values()
-                                      if v.get("name") == payload.get("teammate_name")), None))):
-                wait = time.time() + IDLE_CATCH
+            if payload.get("hook_event_name") == "TeammateIdle":
+                mate = state["nodes"].get(payload.get("agent_id") or "") or next(
+                    (v for v in state["nodes"].values()
+                     if v.get("name") == payload.get("teammate_name")), None)
+                if retired(mate):
+                    wait = time.time() + IDLE_CATCH
+                    if not KEEP_TEAMMATES:
+                        retire = who_named(mate, payload)
             prune_inbox(state, payload, wait)
             tmp = sf.with_suffix(".tmp")
             tmp.write_text(json.dumps(state, default=str))
@@ -1198,6 +1236,14 @@ def main():
             caffeinate(d, state, payload.get("hook_event_name") or "")
         finally:
             fcntl.flock(lf, fcntl.LOCK_UN)
+    if retire:
+        # Idle teammates kept their context and process until the session
+        # ended — about three alive at every stop across the field ledgers —
+        # and each one pinged the lead after every turn.
+        print(json.dumps({"continue": False,
+                          "stopReason": f"Maestro: {retire} already reported, so it was "
+                                        f"stopped instead of idling. Message it by name "
+                                        f"to resume it."}))
 
 
 if __name__ == "__main__":

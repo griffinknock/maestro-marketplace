@@ -328,7 +328,7 @@ def integration_case():
     check("the triggering call produced output",
           all(bool(s.strip()) for s in stdouts.values()))
     check("REPORT RECOVERED shows up", "REPORT RECOVERED" in stdouts["capture-on"])
-    check("the collision shows up", "both live on shared.py" in stdouts["capture-on"])
+    check("the collision shows up", "both live on" in stdouts["capture-on"] and "shared.py" in stdouts["capture-on"])
     check("stdout is byte-identical: on vs disabled",
           stdouts["capture-on"] == stdouts["capture-disabled"])
     check("stdout is byte-identical: on vs unwritable",

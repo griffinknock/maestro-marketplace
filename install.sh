@@ -43,9 +43,9 @@ d["statusLine"] = {
     "refreshInterval": 3,
     "padding": 0,
 }
-d.setdefault("env", {})
-d["env"].setdefault("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1")
-d.setdefault("teammateMode", "in-process")
+# Agent teams stay off: they turn every named dispatch into a long-lived
+# teammate that idles, pings the lead after each turn and holds its context.
+# Named subagents stay addressable without them (a message resumes one).
 d.setdefault("outputStyle", "Maestro")
 d.setdefault("alwaysThinkingEnabled", True)
 # Clickable badges in the footer for PR/issue refs the agents mention.
@@ -59,7 +59,7 @@ for rule in ["Bash(git worktree list)", "Bash(git status:*)", "Bash(git diff:*)"
         allow.append(rule)
 
 json.dump(d, open(p, "w"), indent=2)
-print("  statusLine, outputStyle, agent teams, worktree perms")
+print("  statusLine, outputStyle, worktree perms")
 PY
 
 say "done"

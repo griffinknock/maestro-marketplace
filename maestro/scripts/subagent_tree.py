@@ -81,8 +81,17 @@ def elapsed(start):
     return f"{s}s" if s < 60 else f"{s // 60}m{s % 60:02d}s"
 
 
-def load_ledger(cwd):
-    """Depth/parent map from the ledger, keyed by agent type in start order."""
+def load_ledger(cwd, session_id=None):
+    """Depth/parent map from this session's ledger (the workspace `current`
+    pointer belongs to whichever session fired last)."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from ledger import session_ledger
+        d = session_ledger((session_id or "")[:8]) if session_id else None
+        if d is not None:
+            return json.loads((d / "state.json").read_text())
+    except Exception:
+        pass
     p = Path(cwd or ".").resolve()
     for parent in [p, *p.parents]:
         ptr = parent / ".claude" / "maestro" / "current"
@@ -133,11 +142,22 @@ def prefixes(depths):
     return out
 
 
+# Rows for agents that are not working. A finished agent is hidden (an empty
+# row tells Claude Code to drop it); an idle or stopped one gets a single dim
+# line with no context bar or ticking clock, so the panel stops looking busy.
+HIDE = ("done", "completed", "success", "killed", "cancelled")
+QUIET = ("idle", "stopped", "waiting")
+
+
 def row(task, prefix, width):
     name = bare(task.get("type") or task.get("name")) or "agent"
     model = tier(task.get("model"), name)
     status = (task.get("status") or "running").lower()
+    if status in HIDE:
+        return ""
     icon, icol = ICON.get(status, ("·", "grey"))
+    if status in QUIET:
+        return f"{DIM}{prefix}· {name[:16]:<17}{status}{R}"
     desc = (task.get("description") or task.get("label") or "").replace("\n", " ").strip()
 
     left = (f"{DIM}{prefix}{R}"
@@ -175,10 +195,12 @@ def main():
     if not tasks:
         return
     width = int(payload.get("columns") or 100)
-    ledger = load_ledger(payload.get("cwd"))
-    ds = depths_for(tasks, ledger)
-    pfx = prefixes(ds)
-    for t, p in zip(tasks, pfx):
+    ledger = load_ledger(payload.get("cwd"), payload.get("session_id"))
+    shown = [t for t in tasks if (t.get("status") or "running").lower() not in HIDE]
+    for t in tasks:
+        if t not in shown:
+            print(json.dumps({"id": t.get("id"), "content": ""}))
+    for t, p in zip(shown, prefixes(depths_for(shown, ledger))):
         print(json.dumps({"id": t.get("id"), "content": row(t, p, width)}))
 
 
