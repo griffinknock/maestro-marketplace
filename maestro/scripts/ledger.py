@@ -442,17 +442,21 @@ def retired(n):
     return n.get("status") in ("done", "failed", "orphaned")
 
 
-# A subagent is never woken when a background command it started finishes: the
+# A subagent is never woken when background work it started finishes: the
 # completion notice queues until something else wakes it. One teammate sat idle
 # 51 minutes on a test run that had passed; the notice, stamped 15:43, reached
-# its transcript only when the lead messaged it at 16:34. So inside a subagent a
-# background Bash is denied, and a teammate about to idle on one it started
-# anyway is sent back to wait for it.
+# its transcript only when the lead messaged it at 16:34. Monitor events and a
+# background agent's handback queue the same way. So inside a subagent all three
+# are denied, and a teammate about to idle on one it started anyway is sent back
+# to wait for it.
 BG_GUARD = os.environ.get("MAESTRO_BG_GUARD", "1") != "0"
 LONG_LIVED = re.compile(r"#\s*maestro:\s*long-lived", re.I)
 BG_BLOCK_CAP = 3
 BG_LAUNCH = re.compile(r"\s*Command running in background with ID: ([A-Za-z0-9_-]+)")
 BG_OUTPUT = re.compile(r"Output is being written to: (\S+?\.output)")
+MONITOR_LAUNCH = re.compile(r"\s*Monitor started \(task ([A-Za-z0-9_-]+)")
+BG_MARKS = ("backgroundTaskId", "running in background with ID", "async_launched",
+            "Monitor started (task")
 # The trailer the harness appends to a task's output file when it ends.
 BG_DONE = r"\[exited with code -?[0-9]+\]|\[killed\]"
 BG_STOP = ("TaskStop", "KillShell", "KillBash")
@@ -461,75 +465,137 @@ BG_DENY = (
     "woken when a background command finishes, so ending your turn to wait on one "
     "stalls you until someone messages you. Run it in the foreground instead: Bash "
     "with timeout up to 600000 (10 minutes), and split a longer suite into parts "
-    "that each fit. To run several at once, background them inside one foreground "
-    "command: (cmd_a & cmd_b & wait). For a long-lived process you will NOT wait on "
-    "(a dev server, Metro, a log tail), end the command with the comment "
+    "that each fit. To wait for a condition, run the until-loop itself in the "
+    "foreground: until grep -q 'Ready' app.log; do sleep 5; done. To run several "
+    "commands at once, background them inside one foreground command: "
+    "(cmd_a & cmd_b & wait). For a long-lived process you will NOT wait on (a dev "
+    "server, Metro, a log tail), end the command with the comment "
     "# maestro: long-lived")
+MONITOR_DENY = (
+    "Maestro: Monitor is blocked inside subagents. A subagent is not woken by "
+    "Monitor events, so ending your turn to wait on one stalls you until someone "
+    "messages you. Wait in the foreground instead: one Bash call with an until-loop "
+    "on the condition and timeout up to 600000 (10 minutes), for example "
+    "until grep -q 'Ready' app.log; do sleep 5; done. Run it again if the wait "
+    "needs longer.")
+# Current harnesses launch every Agent call async whatever the flag says, so
+# the reason cannot promise a foreground dispatch; it says how to wait instead.
+AGENT_DENY = (
+    "Maestro: background agents are blocked inside subagents. A subagent is not "
+    "woken when a background agent finishes, so ending your turn to wait on one "
+    "stalls you until someone messages you. Dispatch without run_in_background; "
+    "several Agent calls in one message run in parallel. If a dispatch still comes "
+    "back as launched, do not end your turn until each child has handed back: wait "
+    "in the foreground with one Bash call, timeout up to 600000, "
+    "until grep -q '\"name\":\"SubagentHandback\"' <the output_file its launch "
+    "result names>; do sleep 5; done")
 
 
 def bg_guard(payload):
-    """The PreToolUse deny for a subagent's background Bash, or None.
+    """The PreToolUse deny for a subagent's background work, or None.
 
     Only a subagent's call carries `agent_id`; the conductor's never does and
-    is never touched. Payload checks only: this runs on every tool call.
+    is never touched. Payload checks only: this runs on every tool call. The
+    long-lived marker frees a Bash command only — a Monitor or a background
+    agent always reports back through a notice that will not wake the caller.
     """
     if not BG_GUARD or payload.get("hook_event_name") != "PreToolUse":
         return None
-    if payload.get("tool_name") != "Bash" or not payload.get("agent_id"):
+    tool = payload.get("tool_name")
+    if tool not in ("Bash", "Monitor", "Agent", "Task") or not payload.get("agent_id"):
         return None
     ti = payload.get("tool_input")
-    if not isinstance(ti, dict) or ti.get("run_in_background") not in (True, "true"):
-        return None
-    if LONG_LIVED.search(str(ti.get("command") or "")):
+    ti = ti if isinstance(ti, dict) else {}
+    bg = ti.get("run_in_background") in (True, "true")
+    if tool == "Monitor":
+        reason = MONITOR_DENY
+    elif tool == "Bash" and bg and not LONG_LIVED.search(str(ti.get("command") or "")):
+        reason = BG_DENY
+    elif tool in ("Agent", "Task") and bg:
+        reason = AGENT_DENY
+    else:
         return None
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
                                    "permissionDecision": "deny",
-                                   "permissionDecisionReason": BG_DENY}}
+                                   "permissionDecisionReason": reason}}
+
+
+def _content(rec):
+    msg = rec.get("message") if isinstance(rec, dict) else None
+    body = msg.get("content") if isinstance(msg, dict) else None
+    return body if isinstance(body, list) else None
+
+
+def bg_launch(text, tur):
+    """The background work one tool result started, or None."""
+    m = BG_LAUNCH.match(text)
+    if m or tur.get("backgroundTaskId"):
+        out = BG_OUTPUT.search(text)
+        return {"kind": "bash", "id": m.group(1) if m else str(tur["backgroundTaskId"]),
+                "output": out.group(1) if out else None}
+    # Only the structured result counts for an agent: its launch text also
+    # turns up in the output of anything that reads a transcript.
+    if tur.get("status") == "async_launched" and tur.get("agentId"):
+        return {"kind": "agent", "id": str(tur["agentId"]), "output": tur.get("outputFile")}
+    m = MONITOR_LAUNCH.match(text)
+    if m or ("taskId" in tur and "timeoutMs" in tur):
+        return {"kind": "monitor", "id": m.group(1) if m else str(tur["taskId"]),
+                "output": None}
+    return None
 
 
 def pending_background(path):
-    """Background commands a transcript started and never heard back from.
+    """Background work a transcript started and never heard back from.
 
-    A launch is a tool result naming a background task: `backgroundTaskId` on
-    the result, or the harness's "Command running in background with ID:"
-    text (a command the user pushed to the background lands the same way). It
-    is settled once `<task-id>ID</task-id>` appears anywhere in the transcript,
-    as a queued notification or a prompt, or once the agent stopped it with
-    TaskStop. A command marked long-lived was never meant to be waited on.
-    Returns [{"id", "what", "output"}], oldest first.
+    Each launch is a tool result:
+      bash     "Command running in background with ID: X", or a
+               `backgroundTaskId` (a command the user pushed to the background
+               lands the same way). Settled by any `<task-id>X</task-id>`.
+      agent    `status: async_launched` with an `agentId`. Settled the same way;
+               its notice carries the agent id.
+      monitor  "Monitor started (task X". Every event is a notice with that id
+               too, so only one carrying a `<status>` (the stream ended, expired
+               or was stopped) settles it.
+    TaskStop settles any of them. A Bash command marked long-lived was never
+    meant to be waited on. Returns [{"kind", "id", "what", "output",
+    "command"}], oldest first.
     """
     try:
         blob = Path(path).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return []
-    marks = ("backgroundTaskId", "running in background with ID")
-    if not any(m in blob for m in marks):
+    if not any(m in blob for m in BG_MARKS):
         return []                         # the common case: one substring scan
     lines = blob.splitlines()
     launched = []
     for line in lines:
-        if not any(m in line for m in marks):
+        if not any(m in line for m in BG_MARKS):
             continue
         try:
             rec = json.loads(line)
         except ValueError:
             continue
-        body = (rec.get("message") or {}).get("content") if isinstance(rec, dict) else None
-        if not isinstance(body, list) or rec.get("type") != "user":
+        body = _content(rec)
+        if body is None or rec.get("type") != "user":
             continue
         results = [b for b in body if isinstance(b, dict) and b.get("type") == "tool_result"]
         tur = rec.get("toolUseResult") if len(results) == 1 else None
+        tur = tur if isinstance(tur, dict) else {}
         for b in results:
             text = b.get("content")
-            text = text if isinstance(text, str) else json.dumps(text)
-            m = BG_LAUNCH.match(text)
-            tid = (m.group(1) if m else None) or (
-                tur.get("backgroundTaskId") if isinstance(tur, dict) else None)
-            if tid:
-                out = BG_OUTPUT.search(text)
-                launched.append({"id": str(tid), "use": b.get("tool_use_id"),
-                                 "output": out.group(1) if out else None})
-    pending = [t for t in launched if f"<task-id>{t['id']}</task-id>" not in blob]
+            launch = bg_launch(text if isinstance(text, str) else json.dumps(text), tur)
+            if launch:
+                launch["use"] = b.get("tool_use_id")
+                launched.append(launch)
+
+    def settled(t):
+        tag = f"<task-id>{t['id']}</task-id>"
+        if t["kind"] != "monitor":
+            return tag in blob
+        return re.search(re.escape(tag) + r"(?:(?!</task-notification>).)*?<status>",
+                         blob, re.S) is not None
+
+    pending = [t for t in launched if not settled(t)]
     if not pending:
         return []
     # What each one ran, and whether the agent stopped it since.
@@ -543,8 +609,7 @@ def pending_background(path):
             rec = json.loads(line)
         except ValueError:
             continue
-        body = (rec.get("message") or {}).get("content") if isinstance(rec, dict) else None
-        for b in body if isinstance(body, list) else []:
+        for b in _content(rec) or []:
             if not isinstance(b, dict) or b.get("type") != "tool_use":
                 continue
             ti = b.get("input") if isinstance(b.get("input"), dict) else {}
@@ -556,10 +621,12 @@ def pending_background(path):
     for t in pending:
         ti = t.get("input") or {}
         cmd = str(ti.get("command") or "")
-        if t["id"] in stopped or LONG_LIVED.search(cmd):
+        if t["id"] in stopped or ti.get("name") in stopped:
             continue
-        out.append({"id": t["id"], "output": t["output"],
-                    "what": str(ti.get("description") or cmd[:120] or "a background command")})
+        if t["kind"] == "bash" and LONG_LIVED.search(cmd):
+            continue
+        out.append({"kind": t["kind"], "id": t["id"], "output": t["output"], "command": cmd,
+                    "what": str(ti.get("description") or cmd[:120] or "background work")})
     return out
 
 
@@ -585,8 +652,45 @@ def bg_finished(out):
         return False
 
 
+def bg_item(t, scratch, tpath):
+    """Feedback lines that settle one piece of pending background work."""
+    q = shlex.quote
+    wait = "one Bash call with timeout 600000 (if the wait times out, run it again)"
+    if t["kind"] == "agent":
+        # A background agent's output file links to its transcript, which ends
+        # in a SubagentHandback call when it reports (362 of 372 unnamed ones in
+        # the field). A named one reports by message instead, and a message does
+        # wake an idle teammate.
+        out = t["output"] or str(Path(tpath).parent / f"agent-{t['id']}.jsonl")
+        return [f'- background agent "{t["what"]}" ({t["id"]}), output_file: {out}',
+                f"  Wait for its handback in the foreground, {wait}; its report then "
+                "arrives as a notification:",
+                f"  until grep -q '\"name\":\"SubagentHandback\"' {q(out)}; do sleep 5; done",
+                "  A named agent reports by message instead: ask it with SendMessage to "
+                "message you when it is done (a message wakes you; a notification does "
+                "not). If it never finishes, stop it with TaskStop."]
+    if t["kind"] == "monitor":
+        return [f'- Monitor "{t["what"]}" (task {t["id"]})',
+                "  Its events do not wake you either. Stop it with TaskStop, then wait "
+                f"for what it watches in the foreground with an until-loop, {wait}. "
+                f"It watched: {(t['command'] or t['what'])[:200]}"]
+    out = t["output"]
+    if not out and scratch:
+        guess = Path(scratch).parent / "tasks" / f"{t['id']}.output"
+        out = str(guess) if guess.is_file() else None
+    if not out:
+        return [f'- "{t["what"]}" (task {t["id"]}), output: unknown',
+                "  Stop it with TaskStop and rerun the command in the foreground, "
+                "Bash timeout up to 600000."]
+    state = "finished" if bg_finished(out) else "still running"
+    return [f'- "{t["what"]}" (task {t["id"]}), {state}, output: {out}',
+            f"  Wait for it in the foreground, {wait}:",
+            f"  until grep -qE '{BG_DONE}' {q(out)}; do sleep 5; done; tail -40 {q(out)}",
+            "  Or stop it with TaskStop and rerun the command in the foreground."]
+
+
 def bg_backstop(state, payload, mate):
-    """Feedback that keeps a teammate from idling on a background command, or None.
+    """Feedback that keeps a teammate from idling on background work, or None.
 
     Judged on the teammate's own last words, not on `retired`: the SubagentStop
     that precedes TeammateIdle marks any final message delivered, "Waiting for
@@ -618,29 +722,11 @@ def bg_backstop(state, payload, mate):
     while len(blocks) > 200:
         blocks.pop(next(iter(blocks)))
     scratch = payload.get("scratchpad_dir")
-    rows, waits = [], []
-    for t in due:
-        out = t["output"]
-        if not out and scratch:
-            guess = Path(scratch).parent / "tasks" / f"{t['id']}.output"
-            out = str(guess) if guess.is_file() else None
-        done = bool(out) and bg_finished(out)
-        rows.append(f'- "{t["what"]}" (task {t["id"]}), '
-                    f'{"finished" if done else "still running"}, output: {out or "unknown"}')
-        if out:
-            q = shlex.quote(out)
-            waits.append(f"until grep -qE '{BG_DONE}' {q}; do sleep 5; done; tail -40 {q}")
-    it = "it" if len(due) == 1 else "each"
-    how = (f"Wait for {it} in the foreground with one Bash call, timeout 600000 (if the "
-           "wait times out, run it again):\n" + "\n".join(waits) + "\n"
-           f"Or stop {it} with TaskStop and rerun the command in the foreground."
-           if waits else
-           "Stop it with TaskStop and rerun the command in the foreground, Bash "
-           "timeout up to 600000.")
-    return ("Maestro: do not go idle yet. You started a background command and its "
-            "completion notice has not reached you. A background command that "
-            "finishes never wakes an idle teammate, so you would sit stalled until "
-            "someone messages you.\n" + "\n".join(rows) + "\n" + how + "\n"
+    rows = [line for t in due for line in bg_item(t, scratch, path)]
+    return ("Maestro: do not go idle yet. You started background work and its "
+            "completion notice has not reached you. Nothing that finishes in the "
+            "background wakes an idle teammate, so you would sit stalled until "
+            "someone messages you.\n" + "\n".join(rows) + "\n"
             "Then read the result, finish the work and report.")
 
 
@@ -1451,6 +1537,8 @@ def main():
             state = apply(state, payload, d)
             if deny:                      # the call never runs
                 (state["nodes"].get(payload.get("agent_id")) or {}).pop("in_tool_since", None)
+                if payload.get("tool_name") in ("Agent", "Task") and state["pending"]:
+                    state["pending"].pop()     # nor does the dispatch it recorded
             wait = 0.0
             if payload.get("hook_event_name") == "TeammateIdle":
                 mate = state["nodes"].get(payload.get("agent_id") or "") or next(

@@ -77,6 +77,43 @@ def notice(tid, tu, out):
                   f"</status>\n</task-notification>"}}
 
 
+def agent_launch(aid, tu, out, desc="Run the gate"):
+    return [
+        {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": tu, "name": "Agent",
+             "input": {"subagent_type": "general-purpose", "description": desc,
+                       "prompt": "run the gate", "run_in_background": True}}]}},
+        {"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": tu, "content": [
+                {"type": "text", "text": f"Async agent launched successfully.\nagentId: {aid}"}]}]},
+         "toolUseResult": {"isAsync": True, "status": "async_launched", "agentId": aid,
+                           "description": desc, "outputFile": str(out)}},
+    ]
+
+
+def monitor_launch(tid, tu, desc="dev server ready",
+                   command="tail -f dev.log | grep --line-buffered Ready"):
+    return [
+        {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": tu, "name": "Monitor",
+             "input": {"command": command, "description": desc, "timeout_ms": 1800000}}]}},
+        {"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": tu,
+             "content": f"Monitor started (task {tid}, expires in 30m unless the source "
+                        f"ends first). You will be notified on each event."}]},
+         "toolUseResult": {"taskId": tid, "timeoutMs": 1800000, "persistent": False}},
+    ]
+
+
+def monitor_event(tid):
+    """A Monitor event: a notice with the task id and no status."""
+    return {"type": "attachment", "attachment": {
+        "type": "queued_command", "commandMode": "task-notification",
+        "prompt": f"<task-notification>\n<task-id>{tid}</task-id>\n<summary>Monitor event: "
+                  f"\"dev server ready\"</summary>\n<event>Ready in 2.1s</event>\n"
+                  f"</task-notification>"}}
+
+
 def stop_call(tid):
     return {"type": "assistant", "message": {"role": "assistant", "content": [
         {"type": "tool_use", "id": "toolu_stop", "name": "TaskStop", "input": {"task_id": tid}}]}}
@@ -159,9 +196,66 @@ def guard_case():
     r = bash("npx jest", extra={"MAESTRO_BG_GUARD": "0"})
     check("MAESTRO_BG_GUARD=0 turns it off", r.stdout.strip() == "", r.stdout)
     p = {"session_id": c.sid, "cwd": str(ws), "hook_event_name": "PreToolUse",
-         "tool_name": "Monitor", "agent_id": "abuilder000001",
-         "tool_input": {"command": "tail -f x.log", "run_in_background": True}}
-    check("only Bash is guarded", run(p).stdout.strip() == "")
+         "tool_name": "Read", "agent_id": "abuilder000001",
+         "tool_input": {"file_path": "/x", "run_in_background": True}}
+    check("other tools are not guarded", run(p).stdout.strip() == "")
+    check("the Bash reason is self-sufficient against Monitor's own advice",
+          "until grep" in reason and "in the foreground" in reason, reason)
+
+
+def reason_of(r):
+    try:
+        return json.loads(r.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+    except (ValueError, KeyError, TypeError):
+        return ""
+
+
+def monitor_agent_guard_case():
+    print("\n=== a subagent's Monitor and background Agent are denied ===")
+    c, ws = session("cccc0020-0000-0000-0000-00000000000a")
+
+    def call(tool, ti, agent=True, extra=None):
+        p = {"session_id": c.sid, "cwd": str(ws), "hook_event_name": "PreToolUse",
+             "tool_name": tool, "tool_use_id": f"toolu_{tool}", "tool_input": ti}
+        if agent:
+            p.update(agent_id="alead00000001", agent_type="section-lead")
+        return run(p, extra)
+
+    mon = {"command": "tail -f dev.log | grep --line-buffered Ready",
+           "description": "dev server ready", "timeout_ms": 1800000}
+    r = call("Monitor", mon)
+    reason = reason_of(r)
+    check("Monitor denied", decision(r) == "deny" and r.returncode == 0, r.stdout + r.stderr)
+    check("the reason says Monitor events do not wake a subagent",
+          "not woken by Monitor events" in reason, reason)
+    check("the reason says wait in the foreground with an until-loop up to 600000",
+          "foreground" in reason and "until" in reason and "600000" in reason, reason)
+    r = call("Monitor", {**mon, "command": mon["command"] + "  # maestro: long-lived"})
+    check("the long-lived marker does not free a Monitor", decision(r) == "deny", r.stdout)
+    check("the conductor's Monitor is allowed", call("Monitor", mon, agent=False).stdout == "")
+
+    disp = {"subagent_type": "maestro:builder", "description": "build the lane",
+            "prompt": "do it  # maestro: long-lived", "run_in_background": True}
+    r = call("Agent", disp)
+    reason = reason_of(r)
+    check("background Agent denied", decision(r) == "deny" and r.returncode == 0, r.stdout)
+    check("the reason says dispatch in the foreground, in parallel in one message",
+          "not woken" in reason and "foreground" in reason
+          and "several Agent calls in one message run in parallel" in reason, reason)
+    check("and, since a dispatch can come back launched anyway, how to wait on it",
+          "SubagentHandback" in reason and "output_file" in reason
+          and "600000" in reason, reason)
+    check("a denied dispatch is not left pending for a later start to adopt",
+          not any(x.get("description") == "build the lane"
+                  for x in c.state().get("pending", [])), c.state().get("pending"))
+    check("background Task (the old name) denied", decision(call("Task", disp)) == "deny")
+    check("a foreground Agent is allowed",
+          call("Agent", {**disp, "run_in_background": False}).stdout == "")
+    check("the conductor's background Agent is allowed",
+          call("Agent", disp, agent=False).stdout == "")
+    check("MAESTRO_BG_GUARD=0 allows both",
+          call("Monitor", mon, extra={"MAESTRO_BG_GUARD": "0"}).stdout == ""
+          and call("Agent", disp, extra={"MAESTRO_BG_GUARD": "0"}).stdout == "")
 
 
 # --- TeammateIdle ------------------------------------------------------------
@@ -245,6 +339,42 @@ def settled_case():
           .idle({"MAESTRO_BG_GUARD": "0"}).returncode == 0)
 
 
+def other_kinds_case():
+    print("\n=== background agents and monitors started before the guard ===")
+    m = Mate("cccc0021-0000-0000-0000-00000000000a")
+    out = m.tr.parent / "agent-agate0000001.jsonl"
+    out.write_text("")
+    m.add(*agent_launch("agate0000001", "toolu_ag1", out), said("Waiting on the gate agent."))
+    r = m.idle()
+    check("a pending background agent holds", r.returncode == 2
+          and 'background agent "Run the gate"' in r.stderr and "agate0000001" in r.stderr,
+          r.stderr)
+    check("with a foreground wait on its handback and a fallback for a named agent",
+          "SubagentHandback" in r.stderr and str(out) in r.stderr
+          and "SendMessage" in r.stderr and "TaskStop" in r.stderr, r.stderr)
+    m.add(notice("agate0000001", "toolu_ag1", out))
+    check("its notice settles it", m.idle().returncode == 0)
+
+    m = Mate("cccc0022-0000-0000-0000-00000000000a")
+    m.add(*monitor_launch("bmon0001", "toolu_m1"), said("Watching for the server."))
+    r = m.idle()
+    check("a pending Monitor holds", r.returncode == 2 and 'Monitor "dev server ready"' in r.stderr
+          and "TaskStop" in r.stderr and "tail -f dev.log" in r.stderr, r.stderr)
+    m.add(monitor_event("bmon0001"), said("One event in; still watching."))
+    check("an event without a status does not settle a Monitor", m.idle().returncode == 2)
+    m.add(notice("bmon0001", "toolu_m1", "/tmp/bmon0001.output"))
+    check("a notice with a status settles it", m.idle().returncode == 0)
+
+    m = Mate("cccc0023-0000-0000-0000-00000000000a")
+    m.add({"type": "user", "message": {"role": "user", "content": [
+              {"type": "tool_result", "tool_use_id": "toolu_read",
+               "content": "Async agent launched successfully.\nagentId: afake000001\n"
+                          "Monitor started? no: grep output quoting a transcript"}]},
+           "toolUseResult": {"stdout": "Async agent launched successfully. async_launched"}},
+          said("Read the old transcript; nothing pending."))
+    check("launch text quoted in a tool's output is not a launch", m.idle().returncode == 0)
+
+
 def retire_case():
     print("\n=== a reported teammate is still retired ===")
     m = Mate("cccc0010-0000-0000-0000-00000000000a", name="impl-done")
@@ -314,9 +444,11 @@ def fail_open_case():
 
 def main():
     guard_case()
+    monitor_agent_guard_case()
     idle_pending_case()
     cap_case()
     settled_case()
+    other_kinds_case()
     retire_case()
     fail_open_case()
     print("\n  " + ("PASS" if not FAILURES else f"FAIL ({len(FAILURES)})"))

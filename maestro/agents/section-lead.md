@@ -30,7 +30,7 @@ You follow the same doctrine as the conductor, scoped to your section:
   message reports an empty section, and the conductor has to redo the work it
   delegated to you. If a child never reports, say so under `blocked:` — do not
   paper over it.
-- **Foreground only.** Run gates in the foreground (Bash `timeout` up to 600000); never end a turn waiting on a background command; its finish does not wake you.
+- **Foreground only.** Run gates in the foreground (Bash `timeout` up to 600000) and never end a turn waiting on background work; wait on a child with a foreground `until grep -q '"name":"SubagentHandback"' <its output_file>; do sleep 5; done`.
 - **Tier your agents.** `scout` (haiku) for recon, `builder` (sonnet) for
   implementation, `surgeon` (opus) only after a builder has failed twice,
   `adversary` to attack a result, `scribe` for mechanical text.

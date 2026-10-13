@@ -256,15 +256,16 @@ each teammate once it has reported (the `TeammateIdle` hook returns
 `continue: false`). A message by name brings it back with its conversation.
 Set `MAESTRO_KEEP_TEAMMATES=1` to leave them idling instead.
 
-A subagent is not woken when a background command it started finishes, so one
-that ends its turn to wait on it sits idle until someone messages it. Maestro
-denies `run_in_background` Bash inside any subagent (the conductor is never
-affected) and tells it to run in the foreground with `timeout` up to 600000. A
-long-lived process the agent will not wait on, such as a dev server, Metro or a
-log tail, is allowed when the command ends with `# maestro: long-lived`. As a
-backstop, a teammate about to go idle while a background command it started has
-not reported back is sent back to work (`TeammateIdle` exit 2) with the command,
-its output file and a foreground wait to run, at most three times per command.
+A subagent is not woken when background work it started finishes, so one that
+ends its turn to wait on it sits idle until someone messages it. Inside any
+subagent (the conductor is never affected) Maestro denies `run_in_background`
+Bash, `Monitor`, and `Agent` with `run_in_background`, and tells it to wait in
+the foreground with `timeout` up to 600000. A long-lived process the agent will
+not wait on, such as a dev server, Metro or a log tail, is allowed as Bash when
+the command ends with `# maestro: long-lived`. As a backstop, a teammate about
+to go idle while a background command, Monitor or background agent it started
+has not reported back is sent back to work (`TeammateIdle` exit 2) with what is
+pending and a foreground wait to run, at most three times per item.
 `MAESTRO_BG_GUARD=0` turns both off.
 
 The agent panel hides finished agents and shows an idle one as a single dim
