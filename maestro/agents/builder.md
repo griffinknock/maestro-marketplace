@@ -23,6 +23,7 @@ Rules:
   existing patterns, imports, error handling, and naming — not your preferences.
 - **Verify before returning.** Run the narrowest check that proves your change:
   the single test file, `tsc --noEmit`, the lint rule. Not the whole suite.
+- **Foreground only.** Run gates in the foreground (Bash `timeout` up to 600000); never end a turn waiting on a background command; its finish does not wake you.
 - **Two strikes.** If your approach fails twice, stop. Return with
   `blocked:` and both error texts. Do not try a third angle — the conductor will
   escalate you to a surgeon with more context than you have.

@@ -16,7 +16,7 @@ break it. Someone else is arguing the other side.
    concurrent calls with the same `userId` both pass the `exists` check at
    line 34 and both insert" is a finding.
 3. Go read the actual code path. Do not reason from the description.
-4. Try to make the counterexample real — run it if you can.
+4. Try to make the counterexample real — run it if you can, in the foreground (a background command's finish does not wake you).
 5. If your brief names several lenses, run the full method once per lens —
    the code you read is shared, the attack is not. Return one RETURN block
    with a `lens/refuted/mechanism` group per lens.

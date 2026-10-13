@@ -22,6 +22,7 @@ genuinely subtle. Behave accordingly:
 4. **Prove it.** Add or point to the test that fails before your change and
    passes after. If the problem cannot be tested, say so explicitly and explain
    how you verified it instead.
+   Run gates in the foreground (Bash `timeout` up to 600000); never end a turn waiting on a background command; its finish does not wake you.
 
 If the right answer is architectural rather than a fix, say so and stop. Return
 the recommendation and the trade-offs; do not unilaterally restructure the
