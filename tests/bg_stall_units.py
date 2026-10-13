@@ -120,12 +120,20 @@ def stop_call(tid):
 
 
 class Mate:
-    """One teammate in its own session, with a transcript beside the session's."""
+    """One teammate (or, with teammate=False, a plain subagent) in its own
+    session, with a transcript beside the session's."""
 
-    def __init__(self, sid, name="impl-bg"):
+    def __init__(self, sid, name="impl-bg", teammate=True):
         self.c, self.ws = session(sid)
         self.name = name
         self.aid = self.c.dispatch(1, kind="builder", names=[name])[name]
+        if teammate:
+            # The conductor's spawn result, which is how the ledger knows.
+            self.c.fire(hook_event_name="PostToolUse", tool_name="Agent",
+                        tool_use_id=f"tu-spawn-{self.aid}",
+                        tool_input={"subagent_type": "general-purpose", "name": name},
+                        tool_response={"status": "teammate_spawned", "agent_id": self.aid,
+                                       "name": name, "team_name": "session-test"})
         self.session_tr = self.ws / "tr" / f"{sid}.jsonl"
         self.tr = self.ws / "tr" / sid / "subagents" / f"agent-{self.aid}.jsonl"
         self.tr.parent.mkdir(parents=True, exist_ok=True)
@@ -144,8 +152,16 @@ class Mate:
 
     def stop(self, last):
         """The SubagentStop that lands just before TeammateIdle, as in the field."""
-        self.c.finish(self.aid, self.name, last=last)
+        self.c.finish(self.aid, self.name, last=last, transcript=self.tr)
         return self
+
+    def subagent_stop(self, last="Done.", active=False, extra=None):
+        return run({"session_id": self.c.sid, "cwd": str(self.ws),
+                    "hook_event_name": "SubagentStop", "agent_id": self.aid,
+                    "agent_type": self.name, "stop_hook_active": active,
+                    "agent_transcript_path": str(self.tr), "last_assistant_message": last,
+                    "transcript_path": str(self.session_tr),
+                    "scratchpad_dir": str(self.ws / "scratchpad")}, extra)
 
     def idle(self, extra=None, agent_id=True):
         p = {"session_id": self.c.sid, "cwd": str(self.ws), "hook_event_name": "TeammateIdle",
@@ -375,6 +391,94 @@ def other_kinds_case():
     check("launch text quoted in a tool's output is not a launch", m.idle().returncode == 0)
 
 
+def blocked(r):
+    try:
+        o = json.loads(r.stdout)
+    except ValueError:
+        return None
+    return o.get("reason") if o.get("decision") == "block" else None
+
+
+def subagent_stop_case():
+    print("\n=== a subagent cannot return while its background work is pending ===")
+    m = Mate("cccc0030-0000-0000-0000-00000000000a", name="lead-sec", teammate=False)
+    out = m.out("bs30")
+    m.add(*launch("bs30", out, "toolu_s30"), said(report_text("lead-sec")))
+    r = m.subagent_stop(report_text("lead-sec"))
+    reason = blocked(r) or ""
+    check("a pending child blocks the stop, even under a RETURN report",
+          r.returncode == 0 and reason.startswith("Maestro: do not stop yet"), r.stdout + r.stderr)
+    check("with the same foreground-wait instructions",
+          "bs30" in reason and str(out) in reason and "until grep -qE" in reason
+          and "timeout 600000" in reason and "TaskStop" in reason, reason)
+    check("the ledger shows it running, not finished",
+          m.node().get("status") == "running", m.node().get("status"))
+    m.add(notice("bs30", "toolu_s30", out))
+    r = m.subagent_stop(report_text("lead-sec"))
+    check("a settled child allows the stop", r.returncode == 0 and r.stdout == "", r.stdout)
+
+    print("=== stop_hook_active and the cap end the loop ===")
+    m = Mate("cccc0031-0000-0000-0000-00000000000a", name="lead-loop", teammate=False)
+    out = m.out("bs31")
+    m.add(*launch("bs31", out, "toolu_s31"), said("Waiting on the suite."))
+    seq = [False, True, False, False, False]
+    got = ["block" if blocked(m.subagent_stop(active=a)) else "allow" for a in seq]
+    check("block, then a continuation is let stop, then the cap of 3 holds",
+          got == ["block", "allow", "block", "block", "allow"], got)
+    check("stop_hook_active as the string 'true' is honoured",
+          blocked(Mate("cccc0032-0000-0000-0000-00000000000a", name="lead-s", teammate=False)
+                  .add(*launch("bs32", "/nope/bs32.output", "toolu_s32"), said("w"))
+                  .subagent_stop(active="true")) is None)
+
+    print("=== a background agent or Monitor a section-lead left running ===")
+    m = Mate("cccc0033-0000-0000-0000-00000000000a", name="lead-kids", teammate=False)
+    kid = m.tr.parent / "agent-akid00000001.jsonl"
+    kid.write_text("")
+    m.add(*agent_launch("akid00000001", "toolu_k1", kid, desc="Scout the API"),
+          *monitor_launch("bmon33", "toolu_k2"), said("RETURN:\n  did: dispatched"))
+    reason = blocked(m.subagent_stop()) or ""
+    check("both are named with how to wait on each",
+          "akid00000001" in reason and "SubagentHandback" in reason
+          and 'Monitor "dev server ready"' in reason, reason)
+
+    print("=== teammates have one owner: TeammateIdle ===")
+    m = Mate("cccc0034-0000-0000-0000-00000000000a", name="mate-own")
+    out = m.out("bs34")
+    m.add(*launch("bs34", out, "toolu_s34"), said("Waiting for the full-suite summary."))
+    r = m.subagent_stop("Waiting for the full-suite summary.")
+    check("a spawned teammate's SubagentStop does not block", r.stdout == "", r.stdout)
+    r = m.idle()
+    check("its TeammateIdle holds, once", r.returncode == 2 and r.stderr.count("bs34") >= 1,
+          f"rc={r.returncode}")
+    check("and the cap was spent once, not twice",
+          m.c.state().get("bg_blocks", {}).get(f"{m.aid}/bs34") == 1, m.c.state().get("bg_blocks"))
+    m = Mate("cccc0035-0000-0000-0000-00000000000a", name="mate-late", teammate=False)
+    out = m.out("bs35")
+    m.add(*launch("bs35", out, "toolu_s35"), said("Waiting."))
+    m.idle()                                     # a TeammateIdle marks it too
+    check("an agent seen idling as a teammate is not blocked at SubagentStop",
+          m.subagent_stop().stdout == "")
+
+    print("=== the SubagentStop backstop fails open ===")
+    m = Mate("cccc0036-0000-0000-0000-00000000000a", name="lead-off", teammate=False)
+    m.add(*launch("bs36", m.out("bs36"), "toolu_s36"), said("w"))
+    check("MAESTRO_BG_GUARD=0 allows the stop",
+          m.subagent_stop(extra={"MAESTRO_BG_GUARD": "0"}).stdout == "")
+    m = Mate("cccc0037-0000-0000-0000-00000000000a", name="lead-dir", teammate=False)
+    m.tr.mkdir()
+    r = m.subagent_stop()
+    check("a transcript path that is a directory", r.returncode == 0 and r.stdout == "", r.stdout)
+    m = Mate("cccc0038-0000-0000-0000-00000000000a", name="lead-bad", teammate=False)
+    m.add(*launch("bs38", m.out("bs38"), "toolu_s38"), said("w"))
+    sf = m.c.dir / "state.json"
+    st = json.loads(sf.read_text())
+    st["bg_blocks"] = "corrupt"
+    sf.write_text(json.dumps(st))
+    r = m.subagent_stop()
+    check("a corrupt block counter allows the stop", r.returncode == 0 and r.stdout == "",
+          r.stdout + r.stderr)
+
+
 def retire_case():
     print("\n=== a reported teammate is still retired ===")
     m = Mate("cccc0010-0000-0000-0000-00000000000a", name="impl-done")
@@ -449,6 +553,7 @@ def main():
     cap_case()
     settled_case()
     other_kinds_case()
+    subagent_stop_case()
     retire_case()
     fail_open_case()
     print("\n  " + ("PASS" if not FAILURES else f"FAIL ({len(FAILURES)})"))

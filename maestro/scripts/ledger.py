@@ -689,28 +689,15 @@ def bg_item(t, scratch, tpath):
             "  Or stop it with TaskStop and rerun the command in the foreground."]
 
 
-def bg_backstop(state, payload, mate):
-    """Feedback that keeps a teammate from idling on background work, or None.
+def bg_hold(state, payload, aid, path, lead, exempt=None):
+    """Instructions that settle `aid`'s pending background work, or None.
 
-    Judged on the teammate's own last words, not on `retired`: the SubagentStop
-    that precedes TeammateIdle marks any final message delivered, "Waiting for
-    the full-suite summary." included. A last word that is a RETURN report is
-    left to the retire path; one that is a question is woken by the answer,
-    which drains the queued notice with it. Each pending task holds a teammate
-    back at most BG_BLOCK_CAP times, so a wait that cannot finish is let go
-    rather than looped.
+    Each pending task holds an agent back at most BG_BLOCK_CAP times, counted
+    across both hooks that hold, so a wait that cannot finish is let go rather
+    than looped.
     """
-    if not BG_GUARD:
-        return None
-    aid = payload.get("agent_id") or (mate or {}).get("id")
-    if not aid or aid == ROOT:
-        return None
-    path = teammate_transcript(state, payload, aid)
     pending = pending_background(path) if path else []
-    if not pending:
-        return None
-    last = next(iter(transcript_texts(path, limit=1)), "")
-    if looks_like_report(last) or last.rstrip(" \t\n\"'`)*_]").endswith("?"):
+    if not pending or (exempt and exempt(path)):
         return None
     blocks = state.setdefault("bg_blocks", {})
     due = [t for t in pending if blocks.get(f"{aid}/{t['id']}", 0) < BG_BLOCK_CAP]
@@ -723,11 +710,70 @@ def bg_backstop(state, payload, mate):
         blocks.pop(next(iter(blocks)))
     scratch = payload.get("scratchpad_dir")
     rows = [line for t in due for line in bg_item(t, scratch, path)]
-    return ("Maestro: do not go idle yet. You started background work and its "
-            "completion notice has not reached you. Nothing that finishes in the "
-            "background wakes an idle teammate, so you would sit stalled until "
-            "someone messages you.\n" + "\n".join(rows) + "\n"
+    return (lead + "\n" + "\n".join(rows) + "\n"
             "Then read the result, finish the work and report.")
+
+
+def bg_backstop(state, payload, mate):
+    """TeammateIdle: feedback that keeps a teammate from idling on background
+    work, or None.
+
+    Judged on the teammate's own last words, not on `retired`: the SubagentStop
+    that precedes TeammateIdle marks any final message delivered, "Waiting for
+    the full-suite summary." included. A last word that is a RETURN report is
+    left to the retire path; one that is a question is woken by the answer,
+    which drains the queued notice with it.
+    """
+    if not BG_GUARD:
+        return None
+    aid = payload.get("agent_id") or (mate or {}).get("id")
+    if not aid or aid == ROOT:
+        return None
+
+    def answered(path):
+        last = next(iter(transcript_texts(path, limit=1)), "")
+        return looks_like_report(last) or last.rstrip(" \t\n\"'`)*_]").endswith("?")
+
+    return bg_hold(state, payload, aid, teammate_transcript(state, payload, aid),
+                   "Maestro: do not go idle yet. You started background work and its "
+                   "completion notice has not reached you. Nothing that finishes in the "
+                   "background wakes an idle teammate, so you would sit stalled until "
+                   "someone messages you.", exempt=answered)
+
+
+def mark_teammate(state, aid, team):
+    if not aid:
+        return
+    mates = state.setdefault("teammates", {})
+    mates[str(aid)] = team or ""
+    while len(mates) > 200:
+        mates.pop(next(iter(mates)))
+
+
+def stop_backstop(state, payload):
+    """SubagentStop: the block reason that keeps a subagent from returning while
+    background work it started is pending, or None.
+
+    A teammate is TeammateIdle's: SubagentStop fires on every teammate turn end
+    too, just before TeammateIdle, and two hooks holding one stop would spend
+    the cap twice. Teammates are known from the spawn result
+    (`teammate_spawned`) and from any TeammateIdle. No exemption for last
+    words here: a plain subagent's last word is its report, and a report sent
+    while its children still run is the failure itself. `stop_hook_active`
+    means this stop is already a continuation a stop hook asked for.
+    """
+    if not BG_GUARD or payload.get("stop_hook_active") in (True, "true"):
+        return None
+    aid = payload.get("agent_id")
+    if not aid or aid == ROOT or aid in (state.get("teammates") or {}):
+        return None
+    tp = payload.get("agent_transcript_path")
+    path = Path(tp) if tp and Path(tp).is_file() else teammate_transcript(state, payload, aid)
+    return bg_hold(state, payload, aid, path,
+                   "Maestro: do not stop yet. You started background work and its "
+                   "completion notice has not reached you. Once you stop, nothing that "
+                   "finishes in the background reaches you, so its result is lost and "
+                   "your report is incomplete.")
 
 
 def prune_inbox(state, payload, deadline=0.0):
@@ -1242,6 +1288,13 @@ def apply(state, payload, d=None):
         ti = payload.get("tool_input") or {}
         touch_file(n, ti.get("file_path") or ti.get("notebook_path"),
                    wrote=tool in WRITE_TOOLS and ev == "PostToolUse")
+        resp = payload.get("tool_response")
+        if (tool in ("Agent", "Task") and isinstance(resp, dict)
+                and resp.get("status") == "teammate_spawned"):
+            # The one payload that says an agent is a teammate before its
+            # first stop; the SubagentStop backstop leaves those to TeammateIdle.
+            mark_teammate(state, resp.get("agent_id") or resp.get("agentId"),
+                          resp.get("team_name"))
         if ev == "PostToolUseFailure":
             n["tools"]["!failed"] = n["tools"].get("!failed", 0) + 1
         elif tool == "ListAgents" and me == ROOT:
@@ -1321,6 +1374,7 @@ def apply(state, payload, d=None):
         # the moment the idle frame is written, so it is the earliest point at
         # which a stale one can be taken back out.
         who = payload.get("teammate_name")
+        mark_teammate(state, payload.get("agent_id"), payload.get("team_name"))
         n = next((v for v in state["nodes"].values() if v.get("name") == who), None)
         if n:
             n["idle_at"] = now
@@ -1520,7 +1574,7 @@ def main():
 
     d = home(payload)
     lock = d / ".lock"
-    retire = hold = None
+    retire = hold = block = None
     with open(lock, "w") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
         try:
@@ -1540,6 +1594,15 @@ def main():
                 if payload.get("tool_name") in ("Agent", "Task") and state["pending"]:
                     state["pending"].pop()     # nor does the dispatch it recorded
             wait = 0.0
+            if payload.get("hook_event_name") == "SubagentStop":
+                try:
+                    block = stop_backstop(state, payload)
+                except Exception:         # the backstop fails open
+                    block = None
+                me = state["nodes"].get(payload.get("agent_id") or "")
+                if block and me:
+                    # Kept working, so not finished: no report is owed yet.
+                    me.update(status="running", ended=None, last_activity=time.time())
             if payload.get("hook_event_name") == "TeammateIdle":
                 mate = state["nodes"].get(payload.get("agent_id") or "") or next(
                     (v for v in state["nodes"].values()
@@ -1585,6 +1648,10 @@ def main():
                                         f"to resume it."}))
     if deny:
         print(json.dumps(deny))
+    if block:
+        # SubagentStop `decision: block` keeps the subagent running and hands
+        # it `reason` as its next instruction.
+        print(json.dumps({"decision": "block", "reason": block}))
     if hold:
         # TeammateIdle exit 2: the teammate gets stderr as feedback and keeps
         # working instead of going idle.

@@ -265,8 +265,11 @@ not wait on, such as a dev server, Metro or a log tail, is allowed as Bash when
 the command ends with `# maestro: long-lived`. As a backstop, a teammate about
 to go idle while a background command, Monitor or background agent it started
 has not reported back is sent back to work (`TeammateIdle` exit 2) with what is
-pending and a foreground wait to run, at most three times per item.
-`MAESTRO_BG_GUARD=0` turns both off.
+pending and a foreground wait to run. Any other subagent that tries to return
+with work still pending is kept working the same way (`SubagentStop`
+`decision: block`, once per stop chain). A teammate is held only by
+`TeammateIdle`, and each item is held at most three times across both.
+`MAESTRO_BG_GUARD=0` turns all of it off.
 
 The agent panel hides finished agents and shows an idle one as a single dim
 line, without a context bar or a running clock.
