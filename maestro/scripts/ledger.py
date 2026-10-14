@@ -11,6 +11,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -48,6 +49,9 @@ RETURN_BLOCK = re.compile(r"(?:^|\n)\s*RETURN:\s*(?:\n|$)")
 REPORT_MAX = int(os.environ.get("MAESTRO_REPORT_MAX", "40000"))
 REPORT_TAIL_BYTES = 512_000
 SAFE_ID = re.compile(r"[^A-Za-z0-9._-]")
+# The first line of a ListAgents result names this session's own address —
+# what other conductors pass as SendMessage `to`. No hook payload carries it.
+PEER_NAME = re.compile(r"This session is (.+?) \[([0-9a-f]+)\]")
 
 
 def is_protocol_frame(txt):
@@ -353,6 +357,9 @@ PRUNABLE = ("idle_notification",)
 # bounded, and only when the agent is already retired so there is definitely
 # something to take back out.
 IDLE_CATCH = float(os.environ.get("MAESTRO_IDLE_CATCH", "1.5"))
+# A teammate that has reported is stopped when it goes idle. It stays
+# addressable: a message by name revives it with its conversation intact.
+KEEP_TEAMMATES = os.environ.get("MAESTRO_KEEP_TEAMMATES") == "1"
 
 
 def team_dir(payload):
@@ -410,6 +417,22 @@ class _Lock:
         return False
 
 
+def ended_on_report(n):
+    """True when the agent's last word is a RETURN report (full copy first;
+    `result` keeps only the tail, which can miss the RETURN: header)."""
+    txt = ""
+    if n.get("report_path"):
+        try:
+            txt = Path(n["report_path"]).read_text()
+        except OSError:
+            txt = ""
+    return looks_like_report(txt or n.get("result") or "")
+
+
+def who_named(n, payload):
+    return (n or {}).get("name") or payload.get("teammate_name") or "teammate"
+
+
 def retired(n):
     """Has this agent already said what it came to say, or already stopped?"""
     if not n:
@@ -417,6 +440,340 @@ def retired(n):
     if n.get("report_status") in ("delivered", "recovered"):
         return True
     return n.get("status") in ("done", "failed", "orphaned")
+
+
+# A subagent is never woken when background work it started finishes: the
+# completion notice queues until something else wakes it. One teammate sat idle
+# 51 minutes on a test run that had passed; the notice, stamped 15:43, reached
+# its transcript only when the lead messaged it at 16:34. Monitor events and a
+# background agent's handback queue the same way. So inside a subagent all three
+# are denied, and a teammate about to idle on one it started anyway is sent back
+# to wait for it.
+BG_GUARD = os.environ.get("MAESTRO_BG_GUARD", "1") != "0"
+LONG_LIVED = re.compile(r"#\s*maestro:\s*long-lived", re.I)
+BG_BLOCK_CAP = 3
+BG_LAUNCH = re.compile(r"\s*Command running in background with ID: ([A-Za-z0-9_-]+)")
+BG_OUTPUT = re.compile(r"Output is being written to: (\S+?\.output)")
+MONITOR_LAUNCH = re.compile(r"\s*Monitor started \(task ([A-Za-z0-9_-]+)")
+BG_MARKS = ("backgroundTaskId", "running in background with ID", "async_launched",
+            "Monitor started (task")
+# The trailer the harness appends to a task's output file when it ends.
+BG_DONE = r"\[exited with code -?[0-9]+\]|\[killed\]"
+BG_STOP = ("TaskStop", "KillShell", "KillBash")
+BG_DENY = (
+    "Maestro: background commands are blocked inside subagents. A subagent is not "
+    "woken when a background command finishes, so ending your turn to wait on one "
+    "stalls you until someone messages you. Run it in the foreground instead: Bash "
+    "with timeout up to 600000 (10 minutes), and split a longer suite into parts "
+    "that each fit. To wait for a condition, run the until-loop itself in the "
+    "foreground: until grep -q 'Ready' app.log; do sleep 5; done. To run several "
+    "commands at once, background them inside one foreground command: "
+    "(cmd_a & cmd_b & wait). For a long-lived process you will NOT wait on (a dev "
+    "server, Metro, a log tail), end the command with the comment "
+    "# maestro: long-lived")
+MONITOR_DENY = (
+    "Maestro: Monitor is blocked inside subagents. A subagent is not woken by "
+    "Monitor events, so ending your turn to wait on one stalls you until someone "
+    "messages you. Wait in the foreground instead: one Bash call with an until-loop "
+    "on the condition and timeout up to 600000 (10 minutes), for example "
+    "until grep -q 'Ready' app.log; do sleep 5; done. Run it again if the wait "
+    "needs longer.")
+# Current harnesses launch every Agent call async whatever the flag says, so
+# the reason cannot promise a foreground dispatch; it says how to wait instead.
+AGENT_DENY = (
+    "Maestro: background agents are blocked inside subagents. A subagent is not "
+    "woken when a background agent finishes, so ending your turn to wait on one "
+    "stalls you until someone messages you. Dispatch without run_in_background; "
+    "several Agent calls in one message run in parallel. If a dispatch still comes "
+    "back as launched, do not end your turn until each child has handed back: wait "
+    "in the foreground with one Bash call, timeout up to 600000, "
+    "until grep -q '\"name\":\"SubagentHandback\"' <the output_file its launch "
+    "result names>; do sleep 5; done")
+
+
+def bg_guard(payload):
+    """The PreToolUse deny for a subagent's background work, or None.
+
+    Only a subagent's call carries `agent_id`; the conductor's never does and
+    is never touched. Payload checks only: this runs on every tool call. The
+    long-lived marker frees a Bash command only — a Monitor or a background
+    agent always reports back through a notice that will not wake the caller.
+    """
+    if not BG_GUARD or payload.get("hook_event_name") != "PreToolUse":
+        return None
+    tool = payload.get("tool_name")
+    if tool not in ("Bash", "Monitor", "Agent", "Task") or not payload.get("agent_id"):
+        return None
+    ti = payload.get("tool_input")
+    ti = ti if isinstance(ti, dict) else {}
+    bg = ti.get("run_in_background") in (True, "true")
+    if tool == "Monitor":
+        reason = MONITOR_DENY
+    elif tool == "Bash" and bg and not LONG_LIVED.search(str(ti.get("command") or "")):
+        reason = BG_DENY
+    elif tool in ("Agent", "Task") and bg:
+        reason = AGENT_DENY
+    else:
+        return None
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                   "permissionDecision": "deny",
+                                   "permissionDecisionReason": reason}}
+
+
+def _content(rec):
+    msg = rec.get("message") if isinstance(rec, dict) else None
+    body = msg.get("content") if isinstance(msg, dict) else None
+    return body if isinstance(body, list) else None
+
+
+def bg_launch(text, tur):
+    """The background work one tool result started, or None."""
+    m = BG_LAUNCH.match(text)
+    if m or tur.get("backgroundTaskId"):
+        out = BG_OUTPUT.search(text)
+        return {"kind": "bash", "id": m.group(1) if m else str(tur["backgroundTaskId"]),
+                "output": out.group(1) if out else None}
+    # Only the structured result counts for an agent: its launch text also
+    # turns up in the output of anything that reads a transcript.
+    if tur.get("status") == "async_launched" and tur.get("agentId"):
+        return {"kind": "agent", "id": str(tur["agentId"]), "output": tur.get("outputFile")}
+    m = MONITOR_LAUNCH.match(text)
+    if m or ("taskId" in tur and "timeoutMs" in tur):
+        return {"kind": "monitor", "id": m.group(1) if m else str(tur["taskId"]),
+                "output": None}
+    return None
+
+
+def pending_background(path):
+    """Background work a transcript started and never heard back from.
+
+    Each launch is a tool result:
+      bash     "Command running in background with ID: X", or a
+               `backgroundTaskId` (a command the user pushed to the background
+               lands the same way). Settled by any `<task-id>X</task-id>`.
+      agent    `status: async_launched` with an `agentId`. Settled the same way;
+               its notice carries the agent id.
+      monitor  "Monitor started (task X". Every event is a notice with that id
+               too, so only one carrying a `<status>` (the stream ended, expired
+               or was stopped) settles it.
+    TaskStop settles any of them. A Bash command marked long-lived was never
+    meant to be waited on. Returns [{"kind", "id", "what", "output",
+    "command"}], oldest first.
+    """
+    try:
+        blob = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    if not any(m in blob for m in BG_MARKS):
+        return []                         # the common case: one substring scan
+    lines = blob.splitlines()
+    launched = []
+    for line in lines:
+        if not any(m in line for m in BG_MARKS):
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        body = _content(rec)
+        if body is None or rec.get("type") != "user":
+            continue
+        results = [b for b in body if isinstance(b, dict) and b.get("type") == "tool_result"]
+        tur = rec.get("toolUseResult") if len(results) == 1 else None
+        tur = tur if isinstance(tur, dict) else {}
+        for b in results:
+            text = b.get("content")
+            launch = bg_launch(text if isinstance(text, str) else json.dumps(text), tur)
+            if launch:
+                launch["use"] = b.get("tool_use_id")
+                launched.append(launch)
+
+    def settled(t):
+        tag = f"<task-id>{t['id']}</task-id>"
+        if t["kind"] != "monitor":
+            return tag in blob
+        return re.search(re.escape(tag) + r"(?:(?!</task-notification>).)*?<status>",
+                         blob, re.S) is not None
+
+    pending = [t for t in launched if not settled(t)]
+    if not pending:
+        return []
+    # What each one ran, and whether the agent stopped it since.
+    want = {t["use"]: t for t in pending if t["use"]}
+    stopped = set()
+    for line in lines:
+        if '"tool_use"' not in line or not (any(u in line for u in want)
+                                            or any(s in line for s in BG_STOP)):
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        for b in _content(rec) or []:
+            if not isinstance(b, dict) or b.get("type") != "tool_use":
+                continue
+            ti = b.get("input") if isinstance(b.get("input"), dict) else {}
+            if b.get("name") in BG_STOP:
+                stopped.update(str(v) for v in ti.values())
+            elif b.get("id") in want:
+                want[b["id"]]["input"] = ti
+    out = []
+    for t in pending:
+        ti = t.get("input") or {}
+        cmd = str(ti.get("command") or "")
+        if t["id"] in stopped or ti.get("name") in stopped:
+            continue
+        if t["kind"] == "bash" and LONG_LIVED.search(cmd):
+            continue
+        out.append({"kind": t["kind"], "id": t["id"], "output": t["output"], "command": cmd,
+                    "what": str(ti.get("description") or cmd[:120] or "background work")})
+    return out
+
+
+def teammate_transcript(state, payload, aid):
+    """A teammate's own transcript. TeammateIdle's `transcript_path` is the
+    session's, so the teammate's sits beside it, as for any subagent."""
+    cands = [agent_transcript(state, aid)]
+    tp = payload.get("transcript_path")
+    if tp:
+        p = Path(tp)
+        cands.append(p if p.name == f"agent-{aid}.jsonl"
+                     else p.with_suffix("") / "subagents" / f"agent-{aid}.jsonl")
+    return next((c for c in cands if c and c.is_file()), None)
+
+
+def bg_finished(out):
+    try:
+        with open(out, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - 256))
+            return bool(re.search(BG_DONE, fh.read().decode("utf-8", "replace")))
+    except OSError:
+        return False
+
+
+def bg_item(t, scratch, tpath):
+    """Feedback lines that settle one piece of pending background work."""
+    q = shlex.quote
+    wait = "one Bash call with timeout 600000 (if the wait times out, run it again)"
+    if t["kind"] == "agent":
+        # A background agent's output file links to its transcript, which ends
+        # in a SubagentHandback call when it reports (362 of 372 unnamed ones in
+        # the field). A named one reports by message instead, and a message does
+        # wake an idle teammate.
+        out = t["output"] or str(Path(tpath).parent / f"agent-{t['id']}.jsonl")
+        return [f'- background agent "{t["what"]}" ({t["id"]}), output_file: {out}',
+                f"  Wait for its handback in the foreground, {wait}; its report then "
+                "arrives as a notification:",
+                f"  until grep -q '\"name\":\"SubagentHandback\"' {q(out)}; do sleep 5; done",
+                "  A named agent reports by message instead: ask it with SendMessage to "
+                "message you when it is done (a message wakes you; a notification does "
+                "not). If it never finishes, stop it with TaskStop."]
+    if t["kind"] == "monitor":
+        return [f'- Monitor "{t["what"]}" (task {t["id"]})',
+                "  Its events do not wake you either. Stop it with TaskStop, then wait "
+                f"for what it watches in the foreground with an until-loop, {wait}. "
+                f"It watched: {(t['command'] or t['what'])[:200]}"]
+    out = t["output"]
+    if not out and scratch:
+        guess = Path(scratch).parent / "tasks" / f"{t['id']}.output"
+        out = str(guess) if guess.is_file() else None
+    if not out:
+        return [f'- "{t["what"]}" (task {t["id"]}), output: unknown',
+                "  Stop it with TaskStop and rerun the command in the foreground, "
+                "Bash timeout up to 600000."]
+    state = "finished" if bg_finished(out) else "still running"
+    return [f'- "{t["what"]}" (task {t["id"]}), {state}, output: {out}',
+            f"  Wait for it in the foreground, {wait}:",
+            f"  until grep -qE '{BG_DONE}' {q(out)}; do sleep 5; done; tail -40 {q(out)}",
+            "  Or stop it with TaskStop and rerun the command in the foreground."]
+
+
+def bg_hold(state, payload, aid, path, lead, exempt=None):
+    """Instructions that settle `aid`'s pending background work, or None.
+
+    Each pending task holds an agent back at most BG_BLOCK_CAP times, counted
+    across both hooks that hold, so a wait that cannot finish is let go rather
+    than looped.
+    """
+    pending = pending_background(path) if path else []
+    if not pending or (exempt and exempt(path)):
+        return None
+    blocks = state.setdefault("bg_blocks", {})
+    due = [t for t in pending if blocks.get(f"{aid}/{t['id']}", 0) < BG_BLOCK_CAP]
+    if not due:
+        return None
+    for t in due:
+        k = f"{aid}/{t['id']}"
+        blocks[k] = blocks.pop(k, 0) + 1          # re-inserted: newest last
+    while len(blocks) > 200:
+        blocks.pop(next(iter(blocks)))
+    scratch = payload.get("scratchpad_dir")
+    rows = [line for t in due for line in bg_item(t, scratch, path)]
+    return (lead + "\n" + "\n".join(rows) + "\n"
+            "Then read the result, finish the work and report.")
+
+
+def bg_backstop(state, payload, mate):
+    """TeammateIdle: feedback that keeps a teammate from idling on background
+    work, or None.
+
+    Judged on the teammate's own last words, not on `retired`: the SubagentStop
+    that precedes TeammateIdle marks any final message delivered, "Waiting for
+    the full-suite summary." included. A last word that is a RETURN report is
+    left to the retire path; one that is a question is woken by the answer,
+    which drains the queued notice with it.
+    """
+    if not BG_GUARD:
+        return None
+    aid = payload.get("agent_id") or (mate or {}).get("id")
+    if not aid or aid == ROOT:
+        return None
+
+    def answered(path):
+        last = next(iter(transcript_texts(path, limit=1)), "")
+        return looks_like_report(last) or last.rstrip(" \t\n\"'`)*_]").endswith("?")
+
+    return bg_hold(state, payload, aid, teammate_transcript(state, payload, aid),
+                   "Maestro: do not go idle yet. You started background work and its "
+                   "completion notice has not reached you. Nothing that finishes in the "
+                   "background wakes an idle teammate, so you would sit stalled until "
+                   "someone messages you.", exempt=answered)
+
+
+def mark_teammate(state, aid, team):
+    if not aid:
+        return
+    mates = state.setdefault("teammates", {})
+    mates[str(aid)] = team or ""
+    while len(mates) > 200:
+        mates.pop(next(iter(mates)))
+
+
+def stop_backstop(state, payload):
+    """SubagentStop: the block reason that keeps a subagent from returning while
+    background work it started is pending, or None.
+
+    A teammate is TeammateIdle's: SubagentStop fires on every teammate turn end
+    too, just before TeammateIdle, and two hooks holding one stop would spend
+    the cap twice. Teammates are known from the spawn result
+    (`teammate_spawned`) and from any TeammateIdle. No exemption for last
+    words here: a plain subagent's last word is its report, and a report sent
+    while its children still run is the failure itself. `stop_hook_active`
+    means this stop is already a continuation a stop hook asked for.
+    """
+    if not BG_GUARD or payload.get("stop_hook_active") in (True, "true"):
+        return None
+    aid = payload.get("agent_id")
+    if not aid or aid == ROOT or aid in (state.get("teammates") or {}):
+        return None
+    tp = payload.get("agent_transcript_path")
+    path = Path(tp) if tp and Path(tp).is_file() else teammate_transcript(state, payload, aid)
+    return bg_hold(state, payload, aid, path,
+                   "Maestro: do not stop yet. You started background work and its "
+                   "completion notice has not reached you. Once you stop, nothing that "
+                   "finishes in the background reaches you, so its result is lost and "
+                   "your report is incomplete.")
 
 
 def prune_inbox(state, payload, deadline=0.0):
@@ -495,6 +852,12 @@ def prune_inbox(state, payload, deadline=0.0):
             if not frame or frame.get("type") not in PRUNABLE:
                 keep.append(m)
                 continue
+            # A teammate's report travels *inside* its idle frame (`result`),
+            # and so does a failure. Pruning those deleted the report itself:
+            # one field session lost three of seven evaluations this way.
+            if frame.get("result") or frame.get("failureReason"):
+                keep.append(m)
+                continue
             if retired(by_name.get(m.get("from"))):
                 dropped.append({"from": m.get("from"), "at": time.time(),
                                 "reason": frame.get("idleReason") or "available"})
@@ -558,6 +921,27 @@ def project_root(cwd):
         if (parent / ".git").exists() or (parent / ".claude").is_dir():
             return parent
     return p
+
+
+def merge_key(path):
+    """The file a write lands on at merge time: its real path with every
+    `.claude/worktrees/<name>` segment removed. Two checkouts of one repo —
+    and two sessions rooted at different levels of one workspace — agree on
+    it. Comparing raw paths meant builders in their own worktrees never
+    collided. Symlinks are resolved (macOS /var and /tmp live in /private).
+    """
+    p = os.path.realpath(str(path)).replace("\\", "/")
+    while "/.claude/worktrees/" in p:
+        base, rest = p.split("/.claude/worktrees/", 1)
+        p = base.rstrip("/") + "/" + (rest.split("/", 1)[1] if "/" in rest else "")
+    return p
+
+
+def rel_path(path, root):
+    """`merge_key` shown relative to `root`, for messages."""
+    p = merge_key(path)
+    r = os.path.realpath(str(root)).replace("\\", "/").rstrip("/") + "/"
+    return p[len(r):] if p.startswith(r) else p
 
 
 def outside_worktrees(cwd):
@@ -904,8 +1288,21 @@ def apply(state, payload, d=None):
         ti = payload.get("tool_input") or {}
         touch_file(n, ti.get("file_path") or ti.get("notebook_path"),
                    wrote=tool in WRITE_TOOLS and ev == "PostToolUse")
+        resp = payload.get("tool_response")
+        if (tool in ("Agent", "Task") and isinstance(resp, dict)
+                and resp.get("status") == "teammate_spawned"):
+            # The one payload that says an agent is a teammate before its
+            # first stop; the SubagentStop backstop leaves those to TeammateIdle.
+            mark_teammate(state, resp.get("agent_id") or resp.get("agentId"),
+                          resp.get("team_name"))
         if ev == "PostToolUseFailure":
             n["tools"]["!failed"] = n["tools"].get("!failed", 0) + 1
+        elif tool == "ListAgents" and me == ROOT:
+            resp = payload.get("tool_response")
+            text = resp.get("listing", "") if isinstance(resp, dict) else str(resp or "")
+            m = PEER_NAME.search(text)
+            if m:
+                state["peer_name"], state["peer_ref"] = m.group(1), m.group(2)
 
     elif ev == "SubagentStart":
         aid = payload.get("agent_id")
@@ -977,6 +1374,7 @@ def apply(state, payload, d=None):
         # the moment the idle frame is written, so it is the earliest point at
         # which a stale one can be taken back out.
         who = payload.get("teammate_name")
+        mark_teammate(state, payload.get("agent_id"), payload.get("team_name"))
         n = next((v for v in state["nodes"].values() if v.get("name") == who), None)
         if n:
             n["idle_at"] = now
@@ -1169,9 +1567,14 @@ def main():
         return
     if not isinstance(payload, dict):
         return
+    try:
+        deny = bg_guard(payload)
+    except Exception:                     # the guard fails open
+        deny = None
 
     d = home(payload)
     lock = d / ".lock"
+    retire = hold = block = None
     with open(lock, "w") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
         try:
@@ -1186,11 +1589,41 @@ def main():
                     pass
             state.setdefault("nodes", {}).setdefault(ROOT, blank(payload)["nodes"][ROOT])
             state = apply(state, payload, d)
+            if deny:                      # the call never runs
+                (state["nodes"].get(payload.get("agent_id")) or {}).pop("in_tool_since", None)
+                if payload.get("tool_name") in ("Agent", "Task") and state["pending"]:
+                    state["pending"].pop()     # nor does the dispatch it recorded
             wait = 0.0
-            if (payload.get("hook_event_name") == "TeammateIdle"
-                    and retired(next((v for v in state["nodes"].values()
-                                      if v.get("name") == payload.get("teammate_name")), None))):
-                wait = time.time() + IDLE_CATCH
+            if payload.get("hook_event_name") == "SubagentStop":
+                try:
+                    block = stop_backstop(state, payload)
+                except Exception:         # the backstop fails open
+                    block = None
+                me = state["nodes"].get(payload.get("agent_id") or "")
+                if block and me:
+                    # Kept working, so not finished: no report is owed yet.
+                    me.update(status="running", ended=None, last_activity=time.time())
+            if payload.get("hook_event_name") == "TeammateIdle":
+                mate = state["nodes"].get(payload.get("agent_id") or "") or next(
+                    (v for v in state["nodes"].values()
+                     if v.get("name") == payload.get("teammate_name")), None)
+                try:
+                    hold = bg_backstop(state, payload, mate)
+                except Exception:         # the backstop fails open
+                    hold = None
+                if hold:
+                    # Sent back to work, so it is running again, not idle, and
+                    # the re-check's stall rule (which skips idle teammates)
+                    # watches it.
+                    if mate:
+                        mate.pop("idle_at", None)
+                        mate.update(status="running", ended=None, last_activity=time.time())
+                elif retired(mate):
+                    wait = time.time() + IDLE_CATCH
+                    # Stop only a teammate whose last word was a RETURN report.
+                    # One that ended on a question is waiting for an answer.
+                    if not KEEP_TEAMMATES and ended_on_report(mate):
+                        retire = who_named(mate, payload)
             prune_inbox(state, payload, wait)
             tmp = sf.with_suffix(".tmp")
             tmp.write_text(json.dumps(state, default=str))
@@ -1198,12 +1631,41 @@ def main():
             caffeinate(d, state, payload.get("hook_event_name") or "")
         finally:
             fcntl.flock(lf, fcntl.LOCK_UN)
+    if payload.get("hook_event_name") == "SessionStart" and not payload.get("agent_id"):
+        # Output styles get no ${CLAUDE_PLUGIN_ROOT} and the Bash tool has no
+        # such variable, so the conductor learns the scripts' real path here.
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": f"Maestro scripts: {Path(__file__).resolve().parent}"},
+            "suppressOutput": True}))
+    if retire:
+        # Idle teammates kept their context and process until the session
+        # ended — about three alive at every stop across the field ledgers —
+        # and each one pinged the lead after every turn.
+        print(json.dumps({"continue": False,
+                          "stopReason": f"Maestro: {retire} already reported, so it was "
+                                        f"stopped instead of idling. Message it by name "
+                                        f"to resume it."}))
+    if deny:
+        print(json.dumps(deny))
+    if block:
+        # SubagentStop `decision: block` keeps the subagent running and hands
+        # it `reason` as its next instruction.
+        print(json.dumps({"decision": "block", "reason": block}))
+    if hold:
+        # TeammateIdle exit 2: the teammate gets stderr as feedback and keeps
+        # working instead of going idle.
+        print(hold, file=sys.stderr)
+        return 2
+    return 0
 
 
 if __name__ == "__main__":
+    code = 0
     try:
-        main()
-    except Exception as e:  # never break the session
+        code = main() or 0
+    except Exception as e:  # never break the session: any error allows, exit 0
+        code = 0
         if DEBUG:
             print(f"maestro ledger: {e}", file=sys.stderr)
-    sys.exit(0)
+    sys.exit(code)

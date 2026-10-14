@@ -40,6 +40,22 @@ def bare(name):
     return (name or "").split(":")[-1]
 
 
+def kind(task):
+    """The agent type of a panel row. `type` is always `local_agent`; the real
+    type is `agentType` (`maestro:scout`), and a nested dispatch arrives named
+    (`scout-apiclient`) — canon_type maps both back to `scout`."""
+    raw = task.get("agentType") or ""
+    if not raw and task.get("type") not in (None, "", "local_agent"):
+        raw = task.get("type")
+    raw = bare(raw or task.get("name"))
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from ledger import canon_type
+        return canon_type(raw) or raw
+    except Exception:
+        return raw
+
+
 def tier(model, name):
     m = (model or "").lower()
     for k in ("haiku", "sonnet", "opus"):
@@ -81,8 +97,17 @@ def elapsed(start):
     return f"{s}s" if s < 60 else f"{s // 60}m{s % 60:02d}s"
 
 
-def load_ledger(cwd):
-    """Depth/parent map from the ledger, keyed by agent type in start order."""
+def load_ledger(cwd, session_id=None):
+    """Depth/parent map from this session's ledger (the workspace `current`
+    pointer belongs to whichever session fired last)."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from ledger import session_ledger
+        d = session_ledger((session_id or "")[:8]) if session_id else None
+        if d is not None:
+            return json.loads((d / "state.json").read_text())
+    except Exception:
+        pass
     p = Path(cwd or ".").resolve()
     for parent in [p, *p.parents]:
         ptr = parent / ".claude" / "maestro" / "current"
@@ -104,7 +129,7 @@ def depths_for(tasks, ledger):
             buckets.setdefault(n.get("type"), []).append(n)
     used, out = {}, []
     for t in tasks:
-        name = bare(t.get("type") or t.get("name"))
+        name = kind(t)
         i = used.get(name, 0)
         pool = buckets.get(name, [])
         out.append(pool[i].get("depth", 1) if i < len(pool) else 1)
@@ -133,11 +158,23 @@ def prefixes(depths):
     return out
 
 
+# Rows for agents that are not working. A finished agent is hidden (an empty
+# row tells Claude Code to drop it); an idle or stopped one gets a single dim
+# line with no context bar or ticking clock, so the panel stops looking busy.
+HIDE = ("done", "completed", "success", "killed", "cancelled")
+QUIET = ("idle", "stopped", "waiting")
+
+
 def row(task, prefix, width):
-    name = bare(task.get("type") or task.get("name")) or "agent"
-    model = tier(task.get("model"), name)
+    k = kind(task) or "agent"
+    name = bare(task.get("name")) or k
+    model = tier(task.get("model"), k)
     status = (task.get("status") or "running").lower()
+    if status in HIDE:
+        return ""
     icon, icol = ICON.get(status, ("·", "grey"))
+    if status in QUIET:
+        return f"{DIM}{prefix}· {name[:16]:<17}{status}{R}"
     desc = (task.get("description") or task.get("label") or "").replace("\n", " ").strip()
 
     left = (f"{DIM}{prefix}{R}"
@@ -175,10 +212,12 @@ def main():
     if not tasks:
         return
     width = int(payload.get("columns") or 100)
-    ledger = load_ledger(payload.get("cwd"))
-    ds = depths_for(tasks, ledger)
-    pfx = prefixes(ds)
-    for t, p in zip(tasks, pfx):
+    ledger = load_ledger(payload.get("cwd"), payload.get("session_id"))
+    shown = [t for t in tasks if (t.get("status") or "running").lower() not in HIDE]
+    for t in tasks:
+        if t not in shown:
+            print(json.dumps({"id": t.get("id"), "content": ""}))
+    for t, p in zip(shown, prefixes(depths_for(shown, ledger))):
         print(json.dumps({"id": t.get("id"), "content": row(t, p, width)}))
 
 

@@ -55,7 +55,7 @@ the board. Two settings turn the rest on. Put them in `~/.claude/settings.json`:
 
 **Full setup from a clone.** `install.sh` does all of the above in one step. It
 validates the scripts, registers the marketplace, installs the plugin, and
-writes `statusLine`, `outputStyle`, agent-teams and a few read-only `git`
+writes `statusLine`, `outputStyle` and a few read-only `git`
 permissions into `~/.claude/settings.json`. It backs up the old file first.
 
 ```bash
@@ -214,11 +214,65 @@ in the token accounting.
 | `/handoff [note]` | Closes a conductor session at a phase boundary: updates `PLAN.md`, writes `HANDOFF.md`, validates it with `handoff_check.py`, hands over the `/clear` |
 | `/board` | Starts the board, returns the link. `--lan` also binds to the network |
 | `/tree` | Prints the tree, waves, worktrees and a mermaid diagram as text |
+| `/maestro:peers` | Lists the other live conductors on this machine — the address to message each by, repo, branch, lanes in flight, files being written — see *Coordinating conductors* |
 | `/look <url>` | Screenshot pass across viewports, compared against a mock or baseline |
 | `/maestro:lessons [review\|status\|publish <id>\|trust\|repair]` | Reviews pending lesson candidates, checks the lesson budget, publishes a repo-scoped lesson, or trusts/repairs one — see *Lessons* |
 | `/maestro:sweep <new\|run\|resume\|status\|stop\|takeover> <slug>` | Runs or manages a usage-paced sweep — see *Sweeps* |
 
 ---
+
+## Coordinating conductors
+
+Several sessions often conduct in one workspace at once. Claude Code already
+lets them talk — `ListAgents` shows the live sessions, `SendMessage` reaches one
+by name, and `SendMessage` with `notify_when_idle: true` sends you one notice
+when that session finishes. Maestro adds what they could not see:
+
+- **Addresses.** When a conductor runs `ListAgents`, the ledger records the
+  name other sessions use to message it.
+- **`/maestro:peers`** lists the other live conductors: address, repo and
+  branch, lanes in flight, and the repo files their agents are writing.
+- **Cross-session collisions.** When another conductor's live agent writes a
+  file your agents are writing (same project), the re-check says so once and
+  names the conductor to message, before either side merges.
+- **Doctrine.** The output style tells a conductor to check peers before a
+  wave, message an overlapping peer first (goal, branch, files, then the
+  question of order), wait with `notify_when_idle` rather than polling, and
+  tell a peer when a block it depends on has landed.
+
+Collisions compare repo-relative paths, so two builders editing `src/x.py` in
+their own worktrees count as the same file — within one session too.
+
+## Teammates and idle agents
+
+Maestro no longer turns on Claude Code's experimental agent teams. With teams
+on, every named dispatch becomes a long-lived teammate that idles after it
+reports, pings the lead after every turn and keeps its context until the
+session ends. Named subagents stay addressable without teams — a message by
+name resumes one.
+
+If you run with `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` anyway, Maestro stops
+each teammate once it has reported (the `TeammateIdle` hook returns
+`continue: false`). A message by name brings it back with its conversation.
+Set `MAESTRO_KEEP_TEAMMATES=1` to leave them idling instead.
+
+A subagent is not woken when background work it started finishes, so one that
+ends its turn to wait on it sits idle until someone messages it. Inside any
+subagent (the conductor is never affected) Maestro denies `run_in_background`
+Bash, `Monitor`, and `Agent` with `run_in_background`, and tells it to wait in
+the foreground with `timeout` up to 600000. A long-lived process the agent will
+not wait on, such as a dev server, Metro or a log tail, is allowed as Bash when
+the command ends with `# maestro: long-lived`. As a backstop, a teammate about
+to go idle while a background command, Monitor or background agent it started
+has not reported back is sent back to work (`TeammateIdle` exit 2) with what is
+pending and a foreground wait to run. Any other subagent that tries to return
+with work still pending is kept working the same way (`SubagentStop`
+`decision: block`, once per stop chain). A teammate is held only by
+`TeammateIdle`, and each item is held at most three times across both.
+`MAESTRO_BG_GUARD=0` turns all of it off.
+
+The agent panel hides finished agents and shows an idle one as a single dim
+line, without a context bar or a running clock.
 
 ## The board
 
@@ -312,7 +366,10 @@ context, so the budget is **silence, unless there is a finding**.
   Bash, a Codex run) the limit doubles. It fires once per agent. Idle
   teammates are skipped.
 - **The same agent type failing twice.**
-- **Two live agents writing the same file.**
+- **Two live agents writing the same file** — the same repo file, whichever
+  worktree each one writes it in.
+- **Another conductor's agent writing a file yours are writing** — see
+  *Coordinating conductors*.
 - **Depth 5.**
 
 Every finding is fingerprinted and delivered at most once. It never speaks on
@@ -370,17 +427,18 @@ gets the same `RETURN:` block again, verbatim.
 
 ### Stale idle pings never reach the conductor
 
-When a named teammate goes idle it sends the lead a four-field JSON frame:
+When a named teammate goes idle it sends the lead a JSON frame:
 
 ```json
 {"type":"idle_notification","from":"scout-surfaces","timestamp":"…","idleReason":"available"}
 ```
 
 which arrives wrapped in the ~120-word cross-session security preamble that
-exists for peer prose. Zero information, maximum ceremony, and a whole
-main-loop turn on a very large context to read it — usually *after* that agent's
-report had already landed, and sometimes after the conductor had already
-stopped it.
+exists for peer prose. A bare one carries nothing, but it costs a whole
+main-loop turn on a very large context — usually *after* that agent's report
+had already landed. **A frame can also carry `result` (the teammate's final
+answer) or `failureReason`.** For a teammate that frame *is* the report, so it
+is never removed.
 
 That frame is not generated by the harness's notification path — it is written
 by a `Stop` hook running inside the *teammate's own session*
@@ -394,8 +452,9 @@ The ledger already knows which agents have delivered and which have stopped, so
 it can answer the only question worth a turn: **would this ping tell the
 conductor something it does not already know?**
 
-- Agent already delivered its report, or already done/failed/orphaned → the
-  frame is removed and no turn is spent.
+- A bare frame from an agent that already delivered its report, or is already
+  done/failed/orphaned → removed, and no turn is spent.
+- A frame carrying `result` or `failureReason` → always kept.
 - Agent went idle **without** reporting → the frame is left alone. That is a
   real state change, and it is the one case the conductor must act on.
 
@@ -686,6 +745,8 @@ so one orphaned by a deleted session dir dies on its own.
 | `MAESTRO_NTFY_TOPIC` | unset | ntfy.sh topic for phone push |
 | `MAESTRO_NTFY_SERVER` | `https://ntfy.sh` | Self-hosted ntfy |
 | `MAESTRO_REORCH` | on | `0` disables the re-check entirely |
+| `MAESTRO_KEEP_TEAMMATES` | unset | `1` leaves reported teammates idling instead of stopping them |
+| `MAESTRO_BG_GUARD` | on | `0` lets subagents run background Bash and stops holding teammates that idle on one |
 | `MAESTRO_STALL_SECONDS` | `600` | Silence (no tool call, no transcript write) before an agent counts as stalled |
 | `MAESTRO_REPORT_GRACE` | `5` | Seconds to let a resend land before reporting loss |
 | `MAESTRO_REPORT_MAX` | `40000` | Characters of a report kept on disk |

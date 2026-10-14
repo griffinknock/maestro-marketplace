@@ -19,6 +19,8 @@ If the repo already has a Playwright setup, use it. Otherwise drive it directly:
 npx playwright screenshot --viewport-size=1440,900 --wait-for-timeout=1200 "<URL>" ".claude/maestro/shots/<slug>-desktop.png"
 ```
 
+Run commands in the foreground and never end a turn waiting on a background command; its finish does not wake you. A dev server you start and will not wait on ends with `# maestro: long-lived`.
+
 Wait for the app to be actually idle before shooting — a screenshot of a
 skeleton loader is worse than no screenshot. Prefer `--wait-for-selector` over a
 fixed timeout when you know a stable selector.

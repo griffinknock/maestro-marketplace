@@ -281,7 +281,7 @@ def collide_case():
     said = "\n".join(c.msgs)
     check("two readers of one file are not a collision",
           "reviewer-contract.md" not in said, said[-200:])
-    check("two writers of one file still are", "both live on WaveTabs.tsx" in said,
+    check("two writers of one file still are", "both live on" in said and "WaveTabs.tsx" in said,
           said[-200:])
 
 
@@ -489,6 +489,210 @@ def untyped_failure_case():
     check("builder's two failures still reported", "fail:builder:2" in found, found)
 
 
+def ws_git():
+    ws = workspace()
+    (ws / ".git").mkdir()
+    return ws
+
+
+def wt_edit(c, aid, name, ws, wt, rel):
+    path = ws / ".claude" / "worktrees" / wt / rel
+    c.fire(hook_event_name="PostToolUse", tool_name="Edit", agent_id=aid, agent_type=name,
+           cwd=str(ws / ".claude" / "worktrees" / wt), tool_input={"file_path": str(path)},
+           tool_response={"ok": True})
+
+
+def worktree_collide_case():
+    """Two builders editing one repo file in their own worktrees collide."""
+    print("\n=== collisions across worktrees ===")
+    ws = ws_git()
+    c = Conductor(PLUGIN, ws, "bbbb0001-0000-0000-0000-00000000000a")
+    c.fire(hook_event_name="SessionStart", source="startup")
+    ids = c.dispatch(2, kind="builder", names=["builder-l", "builder-r"])
+    wt_edit(c, ids["builder-l"], "builder-l", ws, "agent-l", "src/x.py")
+    wt_edit(c, ids["builder-r"], "builder-r", ws, "agent-r", "src/x.py")
+    c.tool_call()
+    check("same repo file in two worktrees is a collision",
+          any("both live on src/x.py" in m for m in c.msgs), c.msgs)
+
+
+def peers_case():
+    """Conductor addresses are captured, listed by peers.py, and a peer's
+    agent writing the same file is reported to the other conductor."""
+    print("\n=== conductors see each other ===")
+    ws = ws_git()
+    a = Conductor(PLUGIN, ws, "bbbb0002-0000-0000-0000-00000000000a")
+    b = Conductor(PLUGIN, ws, "bbbb0003-0000-0000-0000-00000000000b")
+    for c, name in ((a, "proj-aa"), (b, "proj-bb")):
+        c.fire(hook_event_name="SessionStart", source="startup")
+        c.fire(hook_event_name="PostToolUse", tool_name="ListAgents", tool_input={},
+               tool_response={"listing": f"This session is {name} [abc123] — the name"})
+    check("own address captured", a.state().get("peer_name") == "proj-aa", a.state().get("peer_name"))
+    ia = a.dispatch(1, kind="builder", names=["builder-a"])
+    ib = b.dispatch(1, kind="builder", names=["builder-b"])
+    wt_edit(b, ib["builder-b"], "builder-b", ws, "agent-b", "api/handler.ts")
+    r = subprocess.run([sys.executable, str(PLUGIN / "peers.py"), "--json"], cwd=ws,
+                       capture_output=True, text=True,
+                       env={**ENV, "CLAUDE_CODE_SESSION_ID": a.sid})
+    here = os.path.realpath(ws)
+    rows = [x for x in json.loads(r.stdout or "[]") if os.path.realpath(x["repo"]) == here]
+    check("peers.py lists the other conductor, not itself",
+          [x["address"] for x in rows] == ["proj-bb"], r.stdout + r.stderr)
+    check("with the file its agent is writing",
+          rows and rows[0]["writing"] == ["api/handler.ts"], rows)
+    wt_edit(a, ia["builder-a"], "builder-a", ws, "agent-a", "api/handler.ts")
+    a.tool_call()
+    hits = [m for m in a.msgs if "another conductor" in m and '"proj-bb"' in m]
+    check("the overlap is reported once, naming the peer's address", len(hits) == 1, a.msgs)
+    a.tool_call()
+    check("and not repeated", len([m for m in a.msgs if "another conductor" in m]) == 1)
+
+
+def teammate_retire_case():
+    """A teammate that has reported is stopped when it goes idle."""
+    print("\n=== reported teammates are retired, not left idling ===")
+    ws = ws_git()
+    c = Conductor(PLUGIN, ws, "bbbb0004-0000-0000-0000-00000000000a")
+    c.fire(hook_event_name="SessionStart", source="startup")
+    ids = c.dispatch(2, names=["scout-done", "scout-busy"])
+    c.finish(ids["scout-done"], "scout-done")
+
+    def idle(name, aid, extra=None):
+        p = {"session_id": c.sid, "cwd": str(ws), "hook_event_name": "TeammateIdle",
+             "teammate_name": name, "agent_id": aid}
+        r = subprocess.run([sys.executable, str(PLUGIN / "ledger.py")], input=json.dumps(p),
+                           capture_output=True, text=True, env={**ENV, **(extra or {})})
+        return r.stdout.strip()
+
+    out = idle("scout-done", ids["scout-done"])
+    check("stopped with continue:false",
+          out and json.loads(out).get("continue") is False and "Message it" in out, out)
+    check("a teammate still working is left alone", idle("scout-busy", ids["scout-busy"]) == "")
+    check("MAESTRO_KEEP_TEAMMATES=1 keeps it",
+          idle("scout-done", ids["scout-done"], {"MAESTRO_KEEP_TEAMMATES": "1"}) == "")
+
+
+def panel_case():
+    """Finished agents leave the panel; idle ones are one quiet line."""
+    print("\n=== agent panel hides finished rows ===")
+    tasks = [{"id": "1", "type": "scout", "status": "running", "description": "reading"},
+             {"id": "2", "type": "builder", "status": "completed", "description": "done"},
+             {"id": "3", "type": "builder", "status": "idle", "description": "waiting"}]
+    r = subprocess.run([sys.executable, str(PLUGIN / "subagent_tree.py")],
+                       input=json.dumps({"columns": 100, "tasks": tasks}),
+                       capture_output=True, text=True, env=ENV)
+    rows = {x["id"]: x["content"] for x in map(json.loads, r.stdout.splitlines())}
+    check("completed row hidden", rows.get("2") == "", rows)
+    check("idle row has no context bar or clock",
+          "idle" in rows.get("3", "") and "%" not in rows.get("3", ""), rows.get("3"))
+    check("running row still drawn", "reading" in rows.get("1", ""), rows.get("1"))
+    r = subprocess.run([sys.executable, str(PLUGIN / "subagent_tree.py")],
+                       input=json.dumps({"columns": 100, "tasks": [
+                           {"id": "9", "type": "local_agent", "agentType": "maestro:surgeon",
+                            "status": "running", "description": "fix"}]}),
+                       capture_output=True, text=True, env=ENV)
+    check("rows are labelled by agentType, not local_agent",
+          "surgeon" in r.stdout and "local_agent" not in r.stdout, r.stdout)
+
+
+def report_frame_case():
+    """An idle frame carrying a teammate's report is the report: never pruned."""
+    print("\n=== idle frames carrying a report survive pruning ===")
+    sid = "bbbb0005-0000-0000-0000-00000000000a"
+    team = Path.home() / ".claude" / "teams" / f"session-{sid[:8]}"
+    shutil.rmtree(team, ignore_errors=True)
+    (team / "inboxes").mkdir(parents=True)
+    (team / "config.json").write_text(json.dumps({
+        "leadAgentId": "lead@x", "members": [{"agentId": "lead@x", "name": "team-lead"}]}))
+
+    def frame(who, **kw):
+        return {"from": who, "timestamp": "t", "text": json.dumps(
+            {"type": "idle_notification", "from": who, "timestamp": "t", **kw})}
+
+    box = team / "inboxes" / "team-lead.json"
+    box.write_text(json.dumps([frame("eval-a"),
+                               frame("eval-b", result="RETURN:\n  answer: grafana scored 7/10"),
+                               frame("eval-c", failureReason="API error")]))
+    try:
+        ws = ws_git()
+        c = Conductor(PLUGIN, ws, sid)
+        c.fire(hook_event_name="SessionStart", source="startup")
+        ids = c.dispatch(3, names=["eval-a", "eval-b", "eval-c"])
+        for n in ("eval-a", "eval-b", "eval-c"):
+            c.finish(ids[n], n)
+        c.tool_call()
+        left = [m["from"] for m in json.loads(box.read_text())]
+        check("a bare ping from a reported agent is pruned", "eval-a" not in left, left)
+        check("a frame carrying result is kept", "eval-b" in left, left)
+        check("a frame carrying failureReason is kept", "eval-c" in left, left)
+    finally:
+        shutil.rmtree(team, ignore_errors=True)
+
+
+def question_not_retired_case():
+    """A teammate whose last word is a question is waiting, not done."""
+    print("\n=== a teammate that asked a question is not stopped ===")
+    ws = ws_git()
+    c = Conductor(PLUGIN, ws, "bbbb0006-0000-0000-0000-00000000000a")
+    c.fire(hook_event_name="SessionStart", source="startup")
+    ids = c.dispatch(1, names=["impl-q"])
+    c.finish(ids["impl-q"], "impl-q", last="Should the migration also backfill old rows?")
+    p = {"session_id": c.sid, "cwd": str(ws), "hook_event_name": "TeammateIdle",
+         "teammate_name": "impl-q", "agent_id": ids["impl-q"]}
+    r = subprocess.run([sys.executable, str(PLUGIN / "ledger.py")], input=json.dumps(p),
+                       capture_output=True, text=True, env=ENV)
+    check("no continue:false for a question", "continue" not in r.stdout, r.stdout)
+
+
+def merge_key_case():
+    """One file, however it is reached, is one key."""
+    print("\n=== merge keys ===")
+    sys.path.insert(0, str(PLUGIN))
+    import ledger
+    ws = ws_git()
+    a = ledger.merge_key(ws / "infra" / "src" / "x.ts")
+    b = ledger.merge_key(ws / "infra" / ".claude" / "worktrees" / "w1" / "src" / "x.ts")
+    c = ledger.merge_key(ws / ".claude" / "worktrees" / "a" / ".claude" / "worktrees" / "b" / "y.py")
+    check("main checkout and a worktree agree", a == b, (a, b))
+    check("nested worktrees strip fully", c == ledger.merge_key(ws / "y.py"), c)
+    check("display is relative to the given root",
+          ledger.rel_path(a, ws) == "infra/src/x.ts" and ledger.rel_path(a, ws / "infra") == "src/x.ts")
+
+
+def cross_root_peer_case():
+    """A conductor at a workspace root and one inside a repo of it collide."""
+    print("\n=== peers at different roots of one workspace ===")
+    ws = workspace()                                   # workspace root: .claude, no .git
+    repo = ws / "infra"
+    (repo / ".git").mkdir(parents=True)
+    top = Conductor(PLUGIN, ws, "bbbb0007-0000-0000-0000-00000000000a")
+    inner = Conductor(PLUGIN, repo, "bbbb0008-0000-0000-0000-00000000000b")
+    for c in (top, inner):
+        c.fire(hook_event_name="SessionStart", source="startup")
+    it = top.dispatch(1, kind="builder", names=["builder-top"])
+    ii = inner.dispatch(1, kind="builder", names=["builder-in"])
+    top.fire(hook_event_name="PostToolUse", tool_name="Edit", agent_id=it["builder-top"],
+             agent_type="builder-top", tool_input={"file_path": str(repo / "src" / "x.ts")},
+             tool_response={"ok": True})
+    wt_edit(inner, ii["builder-in"], "builder-in", repo, "agent-in", "src/x.ts")
+    top.tool_call()
+    check("the workspace-root conductor hears about the repo conductor",
+          any("another conductor" in m and "infra/src/x.ts" in m for m in top.msgs), top.msgs)
+
+
+def scripts_dir_case():
+    """Session start tells the conductor where the scripts really are."""
+    print("\n=== session start names the scripts directory ===")
+    ws = ws_git()
+    p = {"session_id": "bbbb0009-0000-0000-0000-00000000000a", "cwd": str(ws),
+         "hook_event_name": "SessionStart", "source": "startup"}
+    r = subprocess.run([sys.executable, str(PLUGIN / "ledger.py")], input=json.dumps(p),
+                       capture_output=True, text=True, env=ENV)
+    ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"] if r.stdout else ""
+    check("an absolute path to lessons.py's directory",
+          ctx.startswith("Maestro scripts: ") and Path(ctx.split(": ", 1)[1], "lessons.py").is_file(), ctx)
+
+
 def main():
     tokens_case()
     digest_case()
@@ -504,6 +708,15 @@ def main():
     cd_up_case()
     long_tool_case()
     untyped_failure_case()
+    worktree_collide_case()
+    peers_case()
+    teammate_retire_case()
+    panel_case()
+    report_frame_case()
+    question_not_retired_case()
+    merge_key_case()
+    cross_root_peer_case()
+    scripts_dir_case()
     print("\n  " + ("PASS" if not FAILURES else f"FAIL ({len(FAILURES)})"))
     return 1 if FAILURES else 0
 

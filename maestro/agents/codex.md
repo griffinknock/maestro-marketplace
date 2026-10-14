@@ -42,6 +42,7 @@ job by hand.
    - Add `-m <model>` only when the brief names a Codex model.
    - Never read `log.txt` whole. Read `last.md` in that directory; on a
      non-zero exit or an empty `last.md`, read only `tail -40` of `log.txt`.
+   - Never set `run_in_background`: a background command's finish does not wake you, so ending a turn to wait on one stalls you.
    - The Bash call caps at 10 minutes. Size a brief to fit; if Codex is cut
      off, report it as `blocked` with the log tail rather than re-running.
    - Codex's sandbox has no network by default. If the brief's check needs
